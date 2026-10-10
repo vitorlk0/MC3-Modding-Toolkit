@@ -1,3 +1,5 @@
+import { readExhaustSetup, type ExhaustSetup } from "./exhausts";
+
 export type Vec3 = [number, number, number];
 
 export type Piece = {
@@ -77,6 +79,13 @@ export type LodMeshEntry = {
   meshBlockOffset: number | null;
 };
 
+/** One tool block moved by compaction: `used` bytes copied from `from` to `to`, then reserving
+ *  `reserved` bytes there (more than `used` only for the last block placed in a hole). */
+type CompactionMove = { from: number; payloadOffset: number; used: number; to: number; reserved: number; oldReserved: number };
+/** `clear` lists the ranges rewritten from scratch (holes that take blocks, the new tail), which
+ *  are zeroed before the blocks land so no stale bytes survive between them. */
+type CompactionPlan = { moves: CompactionMove[]; clear: [number, number][]; finalSize: number; stuckBytes: number };
+
 /** One relocatable pointer slot inside a standalone mesh piece: where the u32 lives within the
  *  piece, and the piece-relative offset it has to point at once the piece moves. */
 export type MeshReloc = { slotOffset: number; targetOffset: number };
@@ -140,6 +149,21 @@ const sameVec = (a: Vec3, b: Vec3) => a.every((n, i) => Object.is(n, b[i]));
  * malformed or non-mesh file throws here rather than producing a corrupt car PCK later.
  */
 export function scanMeshRelocs(piece: Uint8Array): MeshReloc[] {
+  return walkMeshPiece(piece).relocs;
+}
+
+/**
+ * How many bytes of a standalone piece (or a tool block, which has the same layout) the mesh
+ * actually uses: the furthest end of anything its pointer graph reaches, rounded up to 16. On
+ * 10,039 of the 10,052 loose mesh.pck files in the HostFS + VIP corpus this is exactly the file
+ * size; the other 13 (VIP) only add zero padding past it. Anything beyond is space a tool reserved,
+ * which is safe to give back because nothing the game reads points there.
+ */
+export function meshPieceExtent(piece: Uint8Array): number {
+  return walkMeshPiece(piece).extent;
+}
+
+function walkMeshPiece(piece: Uint8Array): { relocs: MeshReloc[]; extent: number } {
   const view = new DataView(piece.buffer, piece.byteOffset, piece.byteLength);
   const size = piece.byteLength;
   if (size < MESH_PAYLOAD_OFFSET + 0x14) throw new Error("The mesh file is too small to contain a standalone piece header.");
@@ -151,8 +175,10 @@ export function scanMeshRelocs(piece: Uint8Array): MeshReloc[] {
   if (!isMeshPayloadMagic(magic)) throw new Error(`The mesh file has an unsupported payload magic (${hex(magic)}).`);
 
   const relocs = new Map<number, MeshReloc>();
+  let extent = MESH_PAYLOAD_OFFSET + 0x14;
   const requireRange = (offset: number, length: number, label: string) => {
     if (!inside(offset, length, size)) throw new Error(`The mesh file's ${label} is out of bounds.`);
+    extent = Math.max(extent, offset + length);
   };
   const addPointer = (slotOffset: number, label: string) => {
     requireRange(slotOffset, 4, `${label} pointer`);
@@ -188,7 +214,7 @@ export function scanMeshRelocs(piece: Uint8Array): MeshReloc[] {
       requireRange(geometryOffset, blockSize, `group ${group} geometry block ${block}`);
     }
   }
-  return [...relocs.values()].sort((a, b) => a.slotOffset - b.slotOffset);
+  return { relocs: [...relocs.values()].sort((a, b) => a.slotOffset - b.slotOffset), extent: Math.min(align(extent, APPEND_ALIGNMENT), size) };
 }
 
 function readName(bytes: Uint8Array, offset: number, max = 512) {
@@ -254,11 +280,6 @@ function resolveIndex(pointer: number, listOffset: number, count: number, itemSi
   return index >= 0 && index < count ? index : null;
 }
 
-function exhaustSuffix(name: string) {
-  const match = name.trim().toLowerCase().match(/(?:^|_)(?:exhaust|exst|ext)_?([01])$/);
-  return match ? Number(match[1]) : null;
-}
-
 function wheelSuffix(name: string) {
   const normalized = name.trim().toLowerCase();
   const match = normalized.match(/(?:^|_)(?:whl|wheel)_?0*([0-3])$/) ?? normalized.match(/(?:whl|wheel)[_ -]*0*([0-3])$/);
@@ -293,7 +314,8 @@ export class PckDocument {
   readonly roots: number[];
   readonly savedAnchors: [Vec3, Vec3][];
   readonly exhaustSlots: RuntimeSlot[] = [];
-  readonly exhaustLinks = new Map<number, number>();
+  /** Exhaust anchor -> its TBL_Exhausts entries (`exhaustSlots` indices, group * 2 + slot). */
+  readonly exhaustLinks = new Map<number, number[]>();
   readonly wheelSlots: RuntimeSlot[] = [];
   readonly wheelLinks = new Map<number, number>();
   /** whl_N anchors whose raw A1 (+0x00) mirrors the TBL_Wheels slot owned by their axl_N parent.
@@ -449,43 +471,36 @@ export class PckDocument {
     this.runtimeNotes.push(`Wheel runtime table: ${this.wheelSlots.length} slots, ${this.wheelLinks.size} linked anchors.`);
   }
 
+  /**
+   * Links exhaust anchors to their TBL_Exhausts entry through the game's own slot table
+   * (root+0x2E94, `s32[24][2]`), the same read the Exhaust Tips tool uses (src/exhausts.ts, KB
+   * §7.9.1). `exhaustSlots` always holds the 48 entries, index = group * 2 + slot. An anchor can sit
+   * in more than one slot (vp_d_rx8_06 in the VIP), so each link is a list.
+   *
+   * Replaces a name/position heuristic that missed or mislinked about 30% of the corpus PCKs with
+   * slots; when the table can't be read, nothing is linked rather than guessed.
+   */
   private mapExhaustRuntime() {
     if (this.format !== "pck") return;
+    let setup: ExhaustSetup;
+    try { setup = readExhaustSetup(this.bytes); }
+    catch (error) { this.runtimeNotes.push(`Exhaust slot table not read: ${error instanceof Error ? error.message : "unknown layout"}`); return; }
+    if (this.layout.pointerSlot !== 0x1ac || setup.anchorCount !== this.layout.count) { this.runtimeNotes.push("Exhaust slot table not read: the anchor table differs from the one the slots index."); return; }
     const start = virtualToFile((this.rootPointer + 0x138) >>> 0, this.pointerBase);
-    const reservedEnd = start + 24 * 0x18;
-    if (!inside(start, 24 * 0x18 + 2, this.fileSize) || u16(this.view, reservedEnd) !== this.layout.count) { this.runtimeNotes.push("Exhaust runtime table not found."); return; }
-    let lastUsed = -1;
-    for (let group = 0; group < 24; group += 1) if (this.bytes.slice(start + group * 0x18, start + (group + 1) * 0x18).some(Boolean)) lastUsed = group;
-    const groups = lastUsed + 1;
-    if (groups < 1 || 24 - groups < 3) { this.runtimeNotes.push("Exhaust runtime table not present or failed validation."); return; }
-    const bumpersWithExhaust = this.pieces.filter((piece) => (this.children.get(piece.index) ?? []).some((child) => exhaustSuffix(this.pieces[child].name) !== null));
-    const families = new Map<number, number[]>();
-    for (const bumper of bumpersWithExhaust) if (bumper.parentIndex !== null) families.set(bumper.parentIndex, [...(families.get(bumper.parentIndex) ?? []), bumper.index]);
-    const ranked = [...families.entries()].map(([root, anchored]) => ({ all: this.children.get(root) ?? [], anchored })).sort((a, b) => Number(b.all.length === groups) - Number(a.all.length === groups) || b.anchored.length - a.anchored.length);
-    const bumpers = ranked[0] ? (ranked[0].all.length === groups ? ranked[0].all : ranked[0].anchored) : [];
-    if (bumpers.length !== groups) { this.runtimeNotes.push(`Exhaust table has ${groups} groups, hierarchy resolved ${bumpers.length}.`); return; }
-    for (let i = 0; i < groups * 2; i += 1) {
+    for (let i = 0; i < 48; i += 1) {
       const offset = start + i * 12;
-      if (this.readVec(offset).some((n) => !Number.isFinite(n) || Math.abs(n) > 10000)) { this.runtimeNotes.push("Exhaust runtime table contains implausible positions."); this.exhaustSlots.length = 0; return; }
-      this.exhaustSlots.push({ fileOffset: offset, virtualAddress: fileToVirtual(offset, this.pointerBase), anchorIndex: null, note: "" });
+      this.exhaustSlots.push({ fileOffset: offset, virtualAddress: fileToVirtual(offset, this.pointerBase), anchorIndex: null, note: `group ${i >> 1} slot ${i & 1}` });
     }
-    bumpers.forEach((bumper, group) => {
-      const children = (this.children.get(bumper) ?? []).filter((index) => exhaustSuffix(this.pieces[index].name) !== null);
-      const free = new Set([group * 2, group * 2 + 1]);
-      for (const index of children) {
-        const a1 = new Uint8Array(12); const v = new DataView(a1.buffer); this.pieces[index].a1.forEach((n, i) => v.setFloat32(i * 4, n, true));
-        const match = [...free].find((slot) => this.sameBytes(this.vecBytes(this.exhaustSlots[slot].fileOffset), a1));
-        if (match !== undefined) { this.exhaustLinks.set(index, match); this.exhaustSlots[match].anchorIndex = index; this.exhaustSlots[match].note = "Matched by A1 bytes"; free.delete(match); }
-      }
-      for (const index of children) {
-        if (this.exhaustLinks.has(index)) continue;
-        const suffix = exhaustSuffix(this.pieces[index].name);
-        const preferred = suffix === null ? undefined : group * 2 + suffix;
-        const match = preferred !== undefined && free.has(preferred) ? preferred : [...free][0];
-        if (match === undefined) continue;
-        this.exhaustLinks.set(index, match); this.exhaustSlots[match].anchorIndex = index; this.exhaustSlots[match].note = preferred === match ? "Matched by suffix" : "Matched by group order"; free.delete(match);
-      }
-    });
+    let groups = 0;
+    for (const group of setup.groups) {
+      if (group.slots.some((anchor) => anchor >= 0)) groups += 1;
+      group.slots.forEach((anchor, slot) => {
+        if (anchor < 0) return;
+        const index = group.group * 2 + slot;
+        this.exhaustSlots[index].anchorIndex = anchor;
+        this.exhaustLinks.set(anchor, [...(this.exhaustLinks.get(anchor) ?? []), index]);
+      });
+    }
     this.runtimeNotes.push(`Exhaust runtime table: ${groups} groups, ${this.exhaustLinks.size} linked anchors.`);
   }
 
@@ -530,9 +545,9 @@ export class PckDocument {
     if (this.wheelFollowers.has(index)) return false;
     const before: [Vec3, Vec3] = [cloneVec(piece.a1), cloneVec(piece.a2)];
     let nextA1 = cloneVec(a1), nextA2 = cloneVec(a2);
-    const exhaustSlot = this.exhaustLinks.get(index);
+    const exhaustSlots = this.exhaustLinks.get(index);
     const wheelSlot = this.wheelLinks.get(index);
-    if (exhaustSlot !== undefined || wheelSlot !== undefined) {
+    if (exhaustSlots !== undefined || wheelSlot !== undefined) {
       // Both anchors are runtime-linked to a separate position table (exhaust/wheel), so A1 and A2
       // don't carry independent meaning here — keep them forced equal, whichever one was edited.
       const canonical = sameVec(a1, before[0]) && !sameVec(a2, before[1]) ? nextA2 : nextA1;
@@ -557,7 +572,7 @@ export class PckDocument {
     }
     piece.a1 = nextA1; piece.a2 = nextA2;
     this.writeVec(piece.fileOffset, nextA1); this.writeVec(piece.fileOffset + this.layout.a2Offset, nextA2);
-    if (exhaustSlot !== undefined) this.writeVec(this.exhaustSlots[exhaustSlot].fileOffset, nextA1);
+    for (const slot of exhaustSlots ?? []) this.writeVec(this.exhaustSlots[slot].fileOffset, nextA1);
     const saved = this.savedAnchors[index];
     if (sameVec(saved[0], nextA1) && sameVec(saved[1], nextA2)) this.dirtyIndices.delete(index); else this.dirtyIndices.add(index);
     if (record) {
@@ -842,15 +857,13 @@ export class PckDocument {
    * Replaces one LOD entry's embedded mesh blob with a standalone mesh.pck's bytes, handling the
    * case where the new piece is a different size than the one it replaces.
    *
-   * Always appends the new copy at the end of the file and repoints the entry's PTR_Mesh slot at
-   * it — never resizes a blob in place. That's deliberate: the append path is the only strategy
-   * with real production validation behind it (13 logged runs of the precedent Python tool, all
-   * append), while that tool's in-place-resize paths were never exercised even by their own
-   * author. The bytes of the blob being replaced are simply abandoned where they are; nothing
-   * points at them afterwards, and leaving them avoids moving everything that follows.
-   *
-   * A block this same session already appended for this entry is reused when the new piece still
-   * fits, so repeatedly updating one piece doesn't grow the file every time.
+   * Never resizes or overwrites a blob the game shipped: those are abandoned where they are, since
+   * moving them would mean moving everything that follows. Tool-written blocks (the ones carrying
+   * a mini-header) are reused instead — the entry's own block when the new piece fits in it, else
+   * the smallest orphaned block that does — and only then is the piece appended at the end of the
+   * file, with the entry's PTR_Mesh slot repointed at it. Placement never changes the file's
+   * layout around the block, so the same pointer graph the append path always relied on is all
+   * that's rewritten.
    */
   replaceEmbeddedMesh(entry: LodMeshEntry, pieceSource: Uint8Array, record = true) {
     if (this.format !== "pck") throw new Error("Embedded mesh replacement is only supported for PS2 .pck files.");
@@ -873,19 +886,29 @@ export class PckDocument {
 
     const before = this.captureState();
     const key = lodKey(target.lod, target.index);
-    // Re-embedding the identical piece writes over the block it already occupies, which is what
-    // keeps repeated re-embeds from growing the file. Any change in size goes to the end of the
-    // file instead, leaving the old block orphaned for the compaction pass at save to reclaim.
-    //
-    // Writing a smaller piece into the larger block it replaces would look tidier, but every block
-    // declares its own length and they have to tile the region for compaction to be safe; a short
-    // piece in a long block would leave a hole nothing accounts for. Going through append-and-
-    // reclaim instead means a piece that shrinks actually gives its bytes back.
+    // Where the piece goes, cheapest first (KB §17.7):
+    //   in-place  — the tool block this entry already uses, when the piece fits in it;
+    //   reclaimed — the smallest orphaned tool block it fits in;
+    //   appended  — the end of the file, as a last resort.
+    // A block keeps its RESERVED length in the mini-header even when the piece is shorter, so the
+    // blocks still tile the region exactly; the unused tail is zeroed, and compaction trims it
+    // wherever it can move the block. Only appending used to happen for any change in size, which
+    // grew the file for good whenever compaction couldn't run (data that isn't a tool block — an
+    // anchor list relocated by the Exhaust Tips tool, say — sitting between the blocks).
     const current = target.meshBlockOffset === null ? null : this.toolBlockAt(target.meshBlockOffset);
-    const inPlace = current !== null && piece.byteLength === current.reservedSize;
-    const blockOffset = inPlace ? current.base : align(this.bytes.byteLength, APPEND_ALIGNMENT);
-    const reservedSize = piece.byteLength;
-    const placement: "in-place" | "appended" = inPlace ? "in-place" : "appended";
+    // Writing in place also changes every other entry that points at the same block, which is only
+    // right when they're copies of this same piece (an HLOD and MLOD row sharing one blob).
+    const sharedWithOther = current !== null && this.lodMeshes.some((entry) => entry.meshBlockOffset === target.meshBlockOffset && entry.name.toLowerCase() !== target.name.toLowerCase());
+    let placement: "in-place" | "reclaimed" | "appended";
+    let blockOffset: number;
+    let reservedSize: number;
+    if (current !== null && !sharedWithOther && piece.byteLength <= current.reservedSize) {
+      placement = "in-place"; blockOffset = current.base; reservedSize = current.reservedSize;
+    } else {
+      const hole = this.toolBlocks().filter((block) => !block.live && block.reservedSize >= piece.byteLength).sort((a, b) => a.reservedSize - b.reservedSize || a.base - b.base)[0];
+      if (hole) { placement = "reclaimed"; blockOffset = hole.base; reservedSize = hole.reservedSize; }
+      else { placement = "appended"; blockOffset = align(this.bytes.byteLength, APPEND_ALIGNMENT); reservedSize = piece.byteLength; }
+    }
 
     const requiredLength = blockOffset + reservedSize;
     if (requiredLength > this.bytes.byteLength) {
@@ -895,12 +918,13 @@ export class PckDocument {
       this.view = new DataView(this.bytes.buffer);
     }
     this.bytes.set(piece, blockOffset);
+    this.bytes.fill(0, blockOffset + piece.byteLength, blockOffset + reservedSize);
 
     const newBaseVa = fileToVirtual(blockOffset, this.pointerBase);
     const newPayloadVa = (newBaseVa + MESH_PAYLOAD_OFFSET) >>> 0;
-    // Keep the relocated piece's own mini-header coherent: payload pointer, then the block's exact
-    // length. That length is what identifies this block as one a tool wrote and how far it runs,
-    // so it has to describe the piece precisely for blocks to keep tiling the region.
+    // Keep the relocated piece's own mini-header coherent: payload pointer, then the block's
+    // reserved length. That length is what identifies this block as one a tool wrote and how far it
+    // runs, so blocks keep tiling the region. The game doesn't read the mini-header (KB §17.7).
     this.view.setUint32(blockOffset + 0x00, newPayloadVa, true);
     this.view.setUint32(blockOffset + 0x0c, (reservedSize - MESH_PAYLOAD_OFFSET) >>> 0, true);
     for (const reloc of relocs) this.view.setUint32(blockOffset + reloc.slotOffset, (newBaseVa + reloc.targetOffset) >>> 0, true);
@@ -931,33 +955,79 @@ export class PckDocument {
    * before saving is arrived at by the same arithmetic that will actually run — they can't drift
    * apart into a projection that promises a size the save doesn't deliver.
    *
-   * Returns null when compaction would decline: nothing to reclaim, or a layout it can't account
-   * for. Every block must sit at or just past the end of the previous one (16-byte alignment
-   * padding aside) and the last must reach the end of the file; anything else means there is
-   * content between the blocks this doesn't understand, and the file is left alone.
+   * Only tool-written blocks ever move. Anything else from the first tool block on — an anchor list
+   * the Exhaust Tips tool relocated to the end of the file, or any data this doesn't recognize — is
+   * a wall that stays exactly where it is. The walls cut the tool region into bins of fixed size.
+   * Every live block, cut to the bytes its mesh actually uses, is packed into those bins (largest
+   * first, into the bin it fills best), and whatever fits nowhere is laid back to back after the
+   * last wall, where the file then ends. With no walls this is the old behaviour: every live block
+   * laid back to back from the first tool block.
+   *
+   * Every block takes part, not just the ones after the last wall: a block reused in place keeps
+   * the room of the bigger piece it used to hold, and with a wall after it that room was otherwise
+   * lost for good (364 KB of the Mustang 2024's garage PCK).
+   *
+   * A bin that takes blocks is rewritten as a whole, with the last block in it reserving the rest,
+   * so the blocks keep tiling and the next session reads the same layout back. A bin that takes
+   * nothing is left as it was, and what's still in it reads back as orphaned blocks.
+   *
+   * Returns null when the file wouldn't get smaller, or when a live block can't be walked (a layout
+   * this doesn't understand, which is left completely alone).
    */
-  private planCompaction(): { regionStart: number; live: { base: number; payloadOffset: number; reservedSize: number }[]; placements: number[]; finalSize: number } | null {
+  private planCompaction(): CompactionPlan | null {
     if (this.format !== "pck") return null;
     const blocks = this.toolBlocks();
-    if (!blocks.length || !blocks.some((block) => !block.live)) return null;
+    if (!blocks.length) return null;
 
-    const regionStart = blocks[0].base;
-    let cursor = regionStart;
+    // Walls cut the tool region into bins of fixed size; whatever follows the last wall is open.
+    type Bin = { start: number; end: number; cursor: number; placed: CompactionMove[] };
+    const bins: Bin[] = [];
+    let cursor = blocks[0].base;
+    let binStart = blocks[0].base;
     for (const block of blocks) {
-      if (block.base < cursor || block.base - cursor >= APPEND_ALIGNMENT) return null;
+      if (block.base < cursor) return null;
+      if (block.base - cursor >= APPEND_ALIGNMENT) { bins.push({ start: binStart, end: cursor, cursor: binStart, placed: [] }); binStart = block.base; }
       cursor = block.base + block.reservedSize;
     }
-    if (this.fileSize - cursor >= APPEND_ALIGNMENT) return null;
+    let openStart = binStart;
+    if (this.fileSize - cursor >= APPEND_ALIGNMENT) { bins.push({ start: binStart, end: cursor, cursor: binStart, placed: [] }); openStart = this.fileSize; }
 
-    const live = blocks.filter((block) => block.live);
-    const placements: number[] = [];
-    let writeCursor = regionStart;
-    for (const block of live) {
-      const start = align(writeCursor, APPEND_ALIGNMENT);
-      placements.push(start);
-      writeCursor = start + block.reservedSize;
+    // Every live block, with the bytes its mesh really uses. Slack past the mesh is only dropped
+    // when it's padding (00/CD), never unrecognized data.
+    const live: { base: number; payloadOffset: number; reservedSize: number; used: number }[] = [];
+    for (const block of blocks) {
+      if (!block.live) continue;
+      const raw = this.bytes.subarray(block.base, block.base + block.reservedSize);
+      let extent: number;
+      try { extent = meshPieceExtent(raw); } catch { return null; }
+      live.push({ ...block, used: raw.subarray(extent).every((value) => value === 0 || value === 0xcd) ? extent : block.reservedSize });
     }
-    return { regionStart, live, placements, finalSize: writeCursor };
+
+    // Largest first, each into the bin it fills best; what fits nowhere goes after the last wall.
+    const moves: CompactionMove[] = [];
+    const open: typeof live = [];
+    for (const block of [...live].sort((a, b) => b.used - a.used || a.base - b.base)) {
+      const room = (bin: Bin) => bin.end - align(bin.cursor, APPEND_ALIGNMENT);
+      const bin = bins.filter((item) => room(item) >= block.used).sort((a, b) => room(a) - room(b) || a.start - b.start)[0];
+      if (!bin) { open.push(block); continue; }
+      const move = { from: block.base, payloadOffset: block.payloadOffset, used: block.used, to: align(bin.cursor, APPEND_ALIGNMENT), reserved: block.used, oldReserved: block.reservedSize };
+      moves.push(move); bin.placed.push(move); bin.cursor = move.to + block.used;
+    }
+    // The last block in a bin reserves what's left of it, so the bin stays fully tiled. A bin that
+    // took nothing is left as it was: whatever is still in it reads back as orphaned blocks.
+    for (const bin of bins) bin.placed.forEach((move, i) => { move.reserved = (bin.placed[i + 1]?.to ?? bin.end) - move.to; });
+    let writeCursor = align(openStart, APPEND_ALIGNMENT);
+    const tailStart = writeCursor;
+    for (const block of open.sort((a, b) => a.base - b.base)) {
+      moves.push({ from: block.base, payloadOffset: block.payloadOffset, used: block.used, to: writeCursor, reserved: block.used, oldReserved: block.reservedSize });
+      writeCursor += block.used;
+    }
+    const finalSize = open.length ? writeCursor : openStart;
+    // Only worth doing when the file gets smaller; anything else would just reshuffle blocks.
+    if (finalSize >= this.fileSize) return null;
+    const filled = bins.filter((bin) => bin.placed.length);
+    const stuckBytes = bins.reduce((sum, bin) => sum + (bin.end - bin.start) - bin.placed.reduce((used, move) => used + move.used, 0), 0);
+    return { moves, clear: [...filled.map((bin): [number, number] => [bin.start, bin.end]), [tailStart, finalSize]], finalSize, stuckBytes };
   }
 
   /**
@@ -971,49 +1041,53 @@ export class PckDocument {
   get projectedSize() { return this.planCompaction()?.finalSize ?? this.fileSize; }
 
   /**
-   * Reclaims the space held by orphaned tool blocks — the dead copies left behind whenever a piece
-   * was re-embedded before reuse worked across sessions.
+   * Reclaims the space held by orphaned tool blocks and by the unused tail of reserved blocks, as
+   * laid out by `planCompaction`.
    *
-   * Only ever rewrites the run of tool-written blocks, and only when that run is provably
-   * contiguous all the way to the end of the file: everything below the first tool block is
-   * original game data that isn't touched, and refusing when the run isn't contiguous means a file
-   * with unrecognized data interleaved is left completely alone rather than guessed at. Returns
-   * null when there's nothing to do or when it isn't safe, so the caller can just skip it.
+   * Everything below the first tool block is original game data and is never touched, and neither
+   * is any wall (non-tool data) between the blocks: only tool blocks move, and the only pointers
+   * rewritten are each block's own graph and the LOD slots that point at it. Returns null when
+   * there's nothing to do or when it isn't safe, so the caller can just skip it.
    */
-  compactToolBlocks(): { reclaimedBytes: number; movedBlocks: number; sizeBefore: number; sizeAfter: number } | null {
+  compactToolBlocks(): { reclaimedBytes: number; movedBlocks: number; sizeBefore: number; sizeAfter: number; stuckBytes: number } | null {
     const plan = this.planCompaction();
     if (!plan) return null;
 
     const sizeBefore = this.fileSize;
-    const { regionStart, live, placements } = plan;
-    const output = new Uint8Array(this.fileSize);
-    output.set(this.bytes.subarray(0, regionStart));
-    const rebuilt = placements;
-    live.forEach((block, index) => output.set(this.bytes.subarray(block.base, block.base + block.reservedSize), placements[index]));
+    const source = this.bytes;
+    // Which entries each block feeds, resolved before anything moves: a block can land on the spot
+    // another one just left, and matching by offset afterwards would hand it the wrong entries.
+    const owners = plan.moves.map((move) => this.lodMeshes.filter((entry) => entry.meshBlockOffset === move.payloadOffset));
+    const output = new Uint8Array(plan.finalSize);
+    output.set(source.subarray(0, Math.min(source.byteLength, plan.finalSize)));
+    for (const [start, end] of plan.clear) output.fill(0, start, Math.min(end, plan.finalSize));
+    const view = new DataView(output.buffer);
 
-    this.bytes = output.slice(0, plan.finalSize);
-    this.view = new DataView(this.bytes.buffer);
-
-    // Rebase each moved block's internal pointers and repoint the LOD entry that owns it.
-    live.forEach((block, index) => {
-      const newBase = rebuilt[index];
-      const newPayloadVa = fileToVirtual(newBase + MESH_PAYLOAD_OFFSET, this.pointerBase);
-      const relocs = scanMeshRelocs(this.bytes.subarray(newBase, newBase + block.reservedSize));
-      this.view.setUint32(newBase + 0x00, newPayloadVa, true);
-      for (const reloc of relocs) this.view.setUint32(newBase + reloc.slotOffset, (fileToVirtual(newBase, this.pointerBase) + reloc.targetOffset) >>> 0, true);
-      for (const entry of this.lodMeshes) {
-        if (entry.meshBlockOffset !== block.payloadOffset) continue;
-        this.view.setUint32(entry.meshPointerSlotOffset, newPayloadVa, true);
+    plan.moves.forEach((move, index) => {
+      // Relocations are read from the block as it was, before its +0x00 changes.
+      const relocs = scanMeshRelocs(source.subarray(move.from, move.from + move.oldReserved));
+      output.set(source.subarray(move.from, move.from + move.used), move.to);
+      output.fill(0, move.to + move.used, move.to + move.reserved);
+      const newBaseVa = fileToVirtual(move.to, this.pointerBase);
+      const newPayloadVa = (newBaseVa + MESH_PAYLOAD_OFFSET) >>> 0;
+      view.setUint32(move.to + 0x00, newPayloadVa, true);
+      view.setUint32(move.to + 0x0c, (move.reserved - MESH_PAYLOAD_OFFSET) >>> 0, true);
+      for (const reloc of relocs) view.setUint32(move.to + reloc.slotOffset, (newBaseVa + reloc.targetOffset) >>> 0, true);
+      for (const entry of owners[index]) {
+        view.setUint32(entry.meshPointerSlotOffset, newPayloadVa, true);
         entry.meshPointer = newPayloadVa;
-        entry.meshBlockOffset = newBase + MESH_PAYLOAD_OFFSET;
+        entry.meshBlockOffset = move.to + MESH_PAYLOAD_OFFSET;
       }
     });
+
+    this.bytes = output;
+    this.view = view;
     this.view.setUint32(0x0c, (this.fileSize - MESH_PAYLOAD_OFFSET) >>> 0, true);
     this.appendedBlocks.clear();
     this.refreshMeshBlobDirty();
     // Compaction runs as part of saving, not as a user edit — it deliberately leaves undo history
     // alone, since there's nothing meaningful to step back to once the file is on disk.
-    return { reclaimedBytes: sizeBefore - this.fileSize, movedBlocks: live.length, sizeBefore, sizeAfter: this.fileSize };
+    return { reclaimedBytes: sizeBefore - this.fileSize, movedBlocks: plan.moves.filter((move) => move.from !== move.to).length, sizeBefore, sizeAfter: this.fileSize, stuckBytes: plan.stuckBytes };
   }
 
   private applyPieceIdTargets(targets: PieceIdTarget[], ids: number[]) {
@@ -1114,8 +1188,7 @@ export class PckDocument {
   pieceHex(index: number) { const piece = this.pieces[index]; return hexDump(this.bytes.slice(piece.fileOffset, piece.fileOffset + this.layout.itemSize), piece.fileOffset); }
   runtimeFor(index: number) {
     const output: string[] = [];
-    const exhaust = this.exhaustLinks.get(index);
-    if (exhaust !== undefined) { const slot = this.exhaustSlots[exhaust]; output.push(`Exhaust runtime · slot ${exhaust} · VA ${hex(slot.virtualAddress)} · ${slot.note}`); }
+    for (const exhaust of this.exhaustLinks.get(index) ?? []) { const slot = this.exhaustSlots[exhaust]; output.push(`Exhaust runtime · group ${exhaust >> 1} slot ${exhaust & 1} · VA ${hex(slot.virtualAddress)}`); }
     const wheel = this.wheelLinks.get(index);
     if (wheel !== undefined) { const slot = this.wheelSlots[wheel]; output.push(`Wheel runtime · slot ${wheel} · VA ${hex(slot.virtualAddress)} · ${slot.note}`); }
     const follows = this.wheelFollowers.get(index);

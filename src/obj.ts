@@ -22,7 +22,9 @@ const NOR_LENGTH = 3;
 const MAX_BLOCK_VERTICES = 40;
 const MAX_STRIP_VERTICES = MAX_BLOCK_VERTICES;
 const MAX_MESH_ENTRY_QWORDS = 65535;
-const PACKET_VERTEX_SCALE = 256;
+// 1/8192 is the grid native car meshes use (KB 10.7 / 12.5.1); 1/256 (~4 mm) collapses or flips
+// thin triangles. The cost is reach: s16 tops out at 32767/8192 ≈ 4.0 m from the piece origin.
+const PACKET_VERTEX_SCALE = 8192;
 const UV_FIXED_SCALE = 4096;
 const UV_SIGNED_MIN = -32768 / UV_FIXED_SCALE;
 const UV_SIGNED_MAX = 32767 / UV_FIXED_SCALE;
@@ -44,7 +46,8 @@ export type ObjConvertOptions = {
 };
 
 export const defaultObjConvertOptions: ObjConvertOptions = {
-  scale: 256,
+  // Keep these two equal: scale bakes OBJ units into s16, packetVertexScale undoes it on read.
+  scale: PACKET_VERTEX_SCALE,
   packetVertexScale: PACKET_VERTEX_SCALE,
   rotateX: 0, rotateY: 90, rotateZ: 0,
   flipX: false, flipY: false, flipZ: false,
@@ -115,8 +118,15 @@ function pushF32(out: number[], value: number) {
   buffer.setFloat32(0, value, true);
   for (let i = 0; i < 4; i += 1) out.push(buffer.getUint8(i));
 }
-function pushS16(out: number[], value: number) {
-  pushU16(out, clamp(roundHalfToEven(value), -32768, 32767) & 0xffff);
+/** A quantized vertex coordinate. Out of range is an error, not a clamp: clamping would silently
+ *  flatten the part against the edge of the s16 grid. */
+function pushVertexS16(out: number[], value: number, scale: number) {
+  const scaled = roundHalfToEven(value);
+  if (scaled < -32768 || scaled > 32767) {
+    const limit = (32767 / scale).toFixed(2);
+    throw new Error(`A vertex coordinate of ${(value / scale).toFixed(2)} m is outside the ±${limit} m that scale ${scale} can store. The piece is too far from the origin for this scale.`);
+  }
+  pushU16(out, scaled & 0xffff);
 }
 function pushHex(out: number[], hex: string) {
   const clean = hex.replace(/\s+/g, "");
@@ -420,9 +430,9 @@ function encodeBlock(
 
   for (const { ref, skip } of records) {
     const [vx, vy, vz] = transformXyz(obj.vertices[ref.v], t);
-    pushS16(vertexBytes, vx * t.scale + t.rawOffsetX);
-    pushS16(vertexBytes, vy * t.scale + t.rawOffsetY);
-    pushS16(vertexBytes, vz * t.scale + t.rawOffsetZ);
+    pushVertexS16(vertexBytes, vx * t.scale + t.rawOffsetX, t.scale);
+    pushVertexS16(vertexBytes, vy * t.scale + t.rawOffsetY, t.scale);
+    pushVertexS16(vertexBytes, vz * t.scale + t.rawOffsetZ, t.scale);
     pushUv(uvBytes, ref.vt !== null ? obj.uvs[ref.vt] : null, t.flipV, fit);
     const normal = ref.vn !== null ? transformNormal(obj.normals[ref.vn], t) : (smoothed.get(ref.v) ?? [0, 0, 1]);
     pushNormal(normalBytes, normal, !skip);

@@ -423,6 +423,23 @@ button { color:inherit; }
 .inject-status.insert { border-color:#4d6b1a; color:var(--lime); }
 .inject-status.replace { border-color:#3f5a6b; color:#8cc4e6; }
 .inject-status.current { color:#6b736b; }
+.exhaust-table { padding:2px 18px 16px; }
+.exhaust-row { display:grid; grid-template-columns:minmax(0,2.2fr) 64px 64px minmax(0,3fr); gap:12px; align-items:center; padding:7px 10px; border-bottom:1px solid var(--line-soft); font:11px var(--mono); color:#c7cdc7; }
+.exhaust-row>span { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.exhaust-row>span:nth-child(2), .exhaust-row>span:nth-child(3) { text-align:center; }
+.exhaust-row>span:first-child { display:flex; flex-direction:column; gap:2px; }
+.exhaust-row>span:first-child strong { overflow:hidden; text-overflow:ellipsis; font-weight:600; color:#dfe4df; }
+.exhaust-row>span:first-child small { color:#737b73; font-size:9.5px; }
+.exhaust-row>span:last-child { color:#737b73; font-size:10px; }
+.exhaust-row>span.change { color:var(--lime); }
+.exhaust-row>span.warn { color:#e0a25a; }
+.exhaust-row input[type=checkbox] { width:15px; height:15px; accent-color:var(--lime); cursor:pointer; }
+.exhaust-row input[type=checkbox]:disabled { cursor:default; opacity:.35; }
+.exhaust-row:hover:not(.head) { background:#131713; }
+.exhaust-row.changed { background:#141a0e; }
+.exhaust-row.locked>span:first-child strong { color:#8b938b; }
+.exhaust-row.head { border-bottom-color:var(--line); color:#646c64; font:600 9px var(--mono); letter-spacing:.12em; }
+.exhaust-row.head>span:last-child { color:#646c64; font-size:9px; }
 .inject-status.problem { border-color:#5a4526; background:#1e1710; color:#e0a25a; }
 .carcfg-parameter-actions { display:flex; align-items:center; gap:14px; padding:11px 18px 16px; }
 .carcfg-invalid { color:#e0a25a; font-size:10px; }

@@ -588,7 +588,7 @@ export default function App() {
           }
           convertedNames.push(result.name);
         } catch (error) {
-          failures.push(`${objName}: ${error instanceof Error ? error.message : "unknown error"}`);
+          failures.push(`${objName}: ${tr(error instanceof Error ? error.message : "unknown error")}`);
         }
       }
 
@@ -598,7 +598,12 @@ export default function App() {
       // user wants to see — show every one that sits on an anchor.
       const convertedAnchors = convertedNames.map((name) => nextMeshDocs.get(name)?.geometry.anchorIndex).filter((index): index is number => typeof index === "number");
       if (convertedAnchors.length) setVisibleMeshAnchors((current) => new Set([...current, ...convertedAnchors]));
-      if (failures.length) console.warn("OBJ conversion failures:", failures);
+      // The embed status below replaces this one, so a failed OBJ (e.g. a piece too far from the
+      // origin for the s16 grid) gets a dialog instead of a note that would scroll away.
+      if (failures.length) {
+        console.warn("OBJ conversion failures:", failures);
+        void messageDialog(`Could not convert (these pieces were left unchanged):\n\n${failures.join("\n")}`, { title: "OBJ conversion", kind: "warning" });
+      }
       if (!convertedNames.length) { setStatus(`No OBJ could be converted · ${failures[0] ?? "unknown error"}`); return; }
 
       setObjFolder(folderPath);
@@ -954,9 +959,10 @@ export default function App() {
       // file can't keep growing across sessions. Refuses (returns null) on any layout it can't
       // account for, in which case the document is simply saved as-is.
       let reclaimedBytes = 0;
+      let stuckBytes = 0;
       for (const role of roles) {
         const target = prepared[role]; if (!target) continue;
-        try { reclaimedBytes += target.document.compactToolBlocks()?.reclaimedBytes ?? 0; }
+        try { const compaction = target.document.compactToolBlocks(); reclaimedBytes += compaction?.reclaimedBytes ?? 0; stuckBytes += compaction?.stuckBytes ?? 0; }
         catch (error) { console.warn(`Compaction skipped for ${roleLabels[role]}:`, error); }
       }
       const loaded = roles.filter((role) => prepared[role]); const outputPaths: Partial<Record<VehicleRole, string>> = {};
@@ -997,7 +1003,9 @@ export default function App() {
       const shaderNote = syncedShaderEdits ? ` · ${syncedShaderEdits} shader ID${syncedShaderEdits === 1 ? "" : "s"} synchronized to embedded copies` : "";
       const shaderWarnNote = shaderSyncWarnings.length ? ` · ${shaderSyncWarnings.length} shader sync warning${shaderSyncWarnings.length === 1 ? "" : "s"} (see console)` : "";
       const meshNote = dirtyMeshDocs.length ? ` · ${dirtyMeshDocs.length} mesh.pck file${dirtyMeshDocs.length === 1 ? "" : "s"} updated` : "";
-      const reclaimNote = reclaimedBytes ? ` · ${sizeLabel(reclaimedBytes)} reclaimed` : "";
+      // Space before data that isn't a mesh (an anchor list moved by Exhaust Tips) can only be reused
+      // by later embeds, not cut out, so say how much is still held that way.
+      const reclaimNote = `${reclaimedBytes ? ` · ${sizeLabel(reclaimedBytes)} reclaimed` : ""}${stuckBytes ? ` · ${sizeLabel(stuckBytes)} unused before non-mesh data, kept for later embeds` : ""}`;
       if (shaderSyncWarnings.length) console.warn("Shader sync warnings:", shaderSyncWarnings);
       setStatus(`${loaded.length} vehicle PCK${loaded.length === 1 ? "" : "s"} ${destination} · ${changed.length} changed anchor${changed.length === 1 ? "" : "s"} synchronized on save${pieceIdNote}${shaderNote}${shaderWarnNote}${meshNote}${reclaimNote}`);
     } catch (error) { setStatus(`Save failed${writtenCount ? ` after writing ${writtenCount} file${writtenCount === 1 ? "" : "s"}` : ""}. In-memory edits are intact. ${error instanceof Error ? error.message : ""}`.trim()); }

@@ -8,6 +8,7 @@ import { IdSyncTool } from "./id-sync-tool";
 import { DatBuilderTool } from "./dat-builder-tool";
 import { CompactIsoTool } from "./compact-iso-tool";
 import { CleanerTool } from "./cleaner-tool";
+import { ExhaustTool } from "./exhaust-tool";
 import { basename } from "./toolkit-io";
 
 /**
@@ -19,7 +20,7 @@ import { basename } from "./toolkit-io";
  * is why an unsaved tool asks first.
  */
 
-type ToolId = "injector" | "id-sync" | "flash-menu" | "carcfg" | "parts-mapper" | "cleaner" | "dat-builder" | "compact-iso";
+type ToolId = "injector" | "id-sync" | "flash-menu" | "carcfg" | "parts-mapper" | "cleaner" | "dat-builder" | "compact-iso" | "exhausts";
 type ToolStatus = "active" | "next" | "planned";
 type Tool = { id: ToolId; number: string; name: string; blurb: string; status: ToolStatus };
 
@@ -32,6 +33,7 @@ const tools: Tool[] = [
   { id: "id-sync", number: "06", name: "Mesh ID Sync", blurb: "Stamp a car PCK's LOD table IDs onto loose meshes", status: "active" },
   { id: "dat-builder", number: "07", name: "Vehicle DAT Builder", blurb: "Pack a car folder into its vp_*.dat", status: "active" },
   { id: "compact-iso", number: "08", name: "Compact ISO", blurb: "Pack the original dual-layer ISO into one layer", status: "active" },
+  { id: "exhausts", number: "09", name: "Exhaust Tips", blurb: "Turn rear-bumper exhaust tips on or off", status: "active" },
 ];
 
 const statusBadges: Record<ToolStatus, string | null> = { active: null, next: "NEXT", planned: "SOON" };
@@ -63,6 +65,7 @@ export function ModToolkitWorkspace({ onStatus, dirtyVehiclePaths, dropped, onCo
   const injectorPending = useCallback((value: boolean) => setPending("injector", value), [setPending]);
   const idSyncPending = useCallback((value: boolean) => setPending("id-sync", value), [setPending]);
   const cleanerPending = useCallback((value: boolean) => setPending("cleaner", value), [setPending]);
+  const exhaustsPending = useCallback((value: boolean) => setPending("exhausts", value), [setPending]);
 
   const selectTool = async (tool: Tool) => {
     if (tool.status !== "active" || tool.id === activeTool) return;
@@ -148,6 +151,13 @@ export function ModToolkitWorkspace({ onStatus, dirtyVehiclePaths, dropped, onCo
         dropped={dropped}
         onConsumeDrop={onConsumeDrop}
         onStatus={onStatus}
+      />}
+      {activeTool === "exhausts" && <ExhaustTool
+        dropped={dropped}
+        onConsumeDrop={onConsumeDrop}
+        onStatus={onStatus}
+        isPathBlocked={isPathBlocked}
+        onPendingChange={exhaustsPending}
       />}
       {activeTool === "id-sync" && <IdSyncTool
         dropped={dropped}
