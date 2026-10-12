@@ -43,6 +43,19 @@ export type MeshGeometry = {
   category: string;
   stock: boolean;
   anchorIndex: number | null;
+  /** Every geometry packet, in stream order, with offsets into the bytes the piece was read from
+   *  (the car PCK for an embedded piece) — what an in-place vertex rewrite needs. */
+  packets: MeshPacket[];
+};
+
+export type MeshPacket = {
+  /** Packet header (`98 00 02 6C` / `C5 01 02 6C`): +0x04 packet_scale, +0x08..+0x13 culling bounds. */
+  offset: number;
+  /** First s16 X of the vertex stream; `count` × 6 bytes. */
+  vertexOffset: number;
+  count: number;
+  /** packet_scale exactly as stored (may be non-finite or ≤ 0 in a broken packet). */
+  scale: number;
 };
 
 type PacketVertex = { xyz: Vec3; normal: Vec3; uv: [number, number]; faceEnabled: boolean };
@@ -374,6 +387,7 @@ function parseMeshAt(name: string, bytes: Uint8Array, meshOffset: number, vaToOf
   const vertexGroupIndices: number[] = [];
   const indices: number[] = [];
   let packetVertices = 0;
+  const packets: MeshPacket[] = [];
   const markerAt = (offset: number, markers: Set<string>, expectedCount?: number) => inside(offset, 4, bytes.length) && (expectedCount === undefined || view.getUint8(offset + 2) === expectedCount) && markers.has(markerKey(view, offset));
   const findMarker = (start: number, end: number, markers: Set<string>, expectedCount: number) => {
     for (let offset = Math.max(0, start); offset <= Math.min(bytes.length - 4, end); offset += 1) if (markerAt(offset, markers, expectedCount)) return offset;
@@ -407,7 +421,8 @@ function parseMeshAt(name: string, bytes: Uint8Array, meshOffset: number, vaToOf
       for (let offset = cursor; offset < end; offset += 1) if (bytes[offset] !== 0 && bytes[offset] !== 0xcd) { paddingOnly = false; break; }
       if (paddingOnly) break;
       if (!inside(cursor, 44, end) || !BLOCK_HEADERS.has(bytesKey(bytes, cursor, 4))) throw new Error(`${name}: unsupported packet header at 0x${cursor.toString(16).toUpperCase()}.`);
-      let scale = f32(view, cursor + 4); if (!Number.isFinite(scale) || scale <= 0) scale = 1;
+      const storedScale = f32(view, cursor + 4);
+      const scale = Number.isFinite(storedScale) && storedScale > 0 ? storedScale : 1;
       const count = u32(view, cursor + 20);
       if (count !== u32(view, cursor + 32) || count < 1 || count > 255) throw new Error(`${name}: invalid packet vertex count at 0x${cursor.toString(16).toUpperCase()}.`);
       let position = cursor + 36;
@@ -449,6 +464,7 @@ function parseMeshAt(name: string, bytes: Uint8Array, meshOffset: number, vaToOf
       // vertices are seeds marked as skip; removing them would connect the
       // first real face to the previous packet and create stretched bridges.
       output.push(decoded);
+      packets.push({ offset: cursor, vertexOffset: vertexPayload, count, scale: storedScale });
       const next = cursor + align(position - cursor, 16);
       if (next <= cursor) throw new Error(`${name}: packet parser did not advance.`);
       cursor = next;
@@ -509,6 +525,7 @@ function parseMeshAt(name: string, bytes: Uint8Array, meshOffset: number, vaToOf
     category: meshCategory(name),
     stock: /(?:^|_)stk(?:_|\.)/i.test(name) || meshCategory(name) === "lodgroup",
     anchorIndex: hostAnchor(name, document, lod === null ? null : meshId),
+    packets,
   };
 }
 

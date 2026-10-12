@@ -10,6 +10,9 @@ import { loadRecent, pushRecent, saveRecent } from "../recent-paths";
  * One file at a time, as the precedent tool works: which bumper or spoiler should disappear is a
  * judgement made per vehicle against its own item list, not something a batch pass can decide.
  *
+ * Menus are read from the script `+0xDC` points at, which is the one the game runs; a VIP-edited file
+ * keeps orphaned older copies that a scan from the start of the file would pick up instead.
+ *
  * Unchecking items only marks them; `src/flash-avm1.ts` rebuilds the AVM1 arrays and the file is
  * overwritten only by Save, which then re-reads it from disk so the next edit starts from what the
  * file actually holds.
@@ -140,7 +143,8 @@ export function FlashMenuTool({ dropped, onConsumeDrop, onStatus, isPathBlocked,
       setAnalysis(next);
       setKept(keepAll(next));
       lastTouched.current = {};
-      onStatus(`${reopened.name} saved · ${report.itemsRemoved} item${report.itemsRemoved === 1 ? "" : "s"} removed across ${report.categoriesChanged} categor${report.categoriesChanged === 1 ? "y" : "ies"}`);
+      const summary = `${reopened.name} saved · ${report.itemsRemoved} item${report.itemsRemoved === 1 ? "" : "s"} removed across ${report.categoriesChanged} categor${report.categoriesChanged === 1 ? "y" : "ies"}`;
+      onStatus(report.appended ? `${summary} · ${report.appended} redefined by an appended script, file grew by ${sizeLabel(report.outputSize - report.originalSize)}` : summary);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "The edited menu could not be saved.");
     } finally {
@@ -164,7 +168,7 @@ export function FlashMenuTool({ dropped, onConsumeDrop, onStatus, isPathBlocked,
       <div>
         <p className="eyebrow">{tr("AVM1 MENU ARRAYS")}</p>
         <h2>{tr("Limit the Visual Shop menu entries")}</h2>
-        <p className="toolkit-hero-copy"><Tx t="Detects the physical-part arrays inside a {0} and edits Names, Status, Price and Brand together, preserving the original display order. Removed entries are rewritten inside the existing action, so the file keeps its exact size." v={[<code>vs_*.pck</code>]} /></p>
+        <p className="toolkit-hero-copy"><Tx t="Reads the menus of a {0} from the script the game runs (the one {1} points at) and edits Names, Status, Price and Brand together, preserving the display order. A category is rewritten inside its existing action, so the file keeps its size; one a VIP-style edit rebuilt is redefined by a script appended to the file instead." v={[<code>vs_*.pck</code>, <code>+0xDC</code>]} /></p>
       </div>
       <div className="toolkit-facts">
         <div><span>{tr("INPUT")}</span><strong>{tr("One vs_*.pck")}</strong></div>

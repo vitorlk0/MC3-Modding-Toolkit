@@ -48,6 +48,24 @@ export async function pickFiles(filters: { name: string; extensions: string[] }[
 
 export const isMeshPckName = (path: string) => /\.mesh\.pck$/i.test(basename(path));
 
+export const CAR_ROLES = [["player", "", "Player"], ["garage", "_g", "Garage"], ["opponent", "_o", "Opponent"]] as const;
+export type CarRole = typeof CAR_ROLES[number][0];
+
+/** Finds `<car>.pck`, `<car>_g.pck` and `<car>_o.pck` directly inside a folder. */
+export async function findCarFiles(folder: string) {
+  const names = (await readDir(folder)).filter((entry) => !entry.isDirectory && /\.pck$/i.test(entry.name) && !isMeshPckName(entry.name)).map((entry) => entry.name);
+  const bases = new Set(names.map((name) => name.replace(/(_g|_o)?\.pck$/i, "")));
+  const folderName = basename(folder).toLowerCase();
+  const base = [...bases].find((item) => item.toLowerCase() === folderName) ?? (bases.size === 1 ? [...bases][0] : null);
+  if (!base) throw new Error(`Couldn't tell which car this is: ${basename(folder)} holds ${bases.size ? [...bases].join(", ") : "no car PCK"}. Open the car's own folder.`);
+  const found: { role: CarRole; label: string; path: string }[] = [];
+  for (const [role, suffix, label] of CAR_ROLES) {
+    const name = names.find((item) => item.toLowerCase() === `${base}${suffix}.pck`.toLowerCase());
+    if (name) found.push({ role, label, path: await join(folder, name) });
+  }
+  return { base, found };
+}
+
 /** Every loose `*.mesh.pck` directly inside a folder, sorted by name — how the precedent scripts
  *  picked up their pieces, by scanning the folder the car PCK sits in. */
 export async function listMeshPcks(folder: string) {

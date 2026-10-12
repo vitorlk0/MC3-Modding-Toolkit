@@ -2,7 +2,7 @@ import { tr, Tx, confirmDialog, messageDialog, setLanguage, useLanguage } from "
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { open, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { AboutDialog } from "./about-dialog";
-import { readFile, writeFile, readDir, stat } from "@tauri-apps/plugin-fs";
+import { readFile, writeFile, readDir, stat, exists } from "@tauri-apps/plugin-fs";
 import { join } from "@tauri-apps/api/path";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -14,7 +14,8 @@ import { convertObjToMeshPck } from "../src/obj";
 import { evaluateFieldInput } from "../src/expression";
 import { collectLightAnchors, lightFamilies, lightFamilyLabels, planGlobalLightAnchors, summarizeLightAnchors, type LightFamily, type LightFamilySummary } from "../src/light-anchors";
 import { parseFirstPpfModel, type PpfGeometry, type PpfKind } from "../src/ppf";
-import { MeshViewer } from "./mesh-viewer";
+import { MeshViewer, type CameraHandle, type ShopCameraPoints } from "./mesh-viewer";
+import { DEFAULT_GARAGE_FOV, McGarageDocument, cameraOrbit, decodeLatin1, garageToPck, orbitPosition, parseGarageSharedFov, pckToGarage, shopCameraLabel, type CameraOrbit, type ShopCameraId } from "../src/mcgarage";
 import { MeshEditorWorkspace } from "./mesh-editor-workspace";
 import { ModToolkitWorkspace } from "./mod-toolkit/toolkit-workspace";
 import { onFileWritten } from "./mod-toolkit/toolkit-io";
@@ -207,6 +208,35 @@ const PPF_RECENTS_KEY = "mc3pae.recentPpfFolders";
 
 const PANEL_WIDTHS_KEY = "mc3pae.panelWidths";
 const ZERO_SHELL_ID_KEY = "mc3pae.syncZeroShellId";
+const CAMERA_ASPECT_KEY = "mc3pae.shopCameraAspect";
+const TARGET_PLANE_KEY = "mc3pae.shopCameraTargetPlane";
+const SAFE_AREAS_KEY = "mc3pae.shopCameraSafeAreas";
+const CAMERA_FIELDS_KEY = "mc3pae.shopCameraFields";
+const orbitFields: { key: keyof CameraOrbit; label: string; step: number }[] = [
+  { key: "distance", label: "Dist", step: 1 },
+  { key: "yaw", label: "Yaw", step: 100 },
+  { key: "pitch", label: "Pitch", step: 100 },
+];
+
+/** The car's shop cameras and the field of view they are shown with. */
+type GarageSlot = { document: McGarageDocument; fov: number; fovFromFile: boolean };
+const cameraAspects = { "4:3": 4 / 3, "16:9": 16 / 9 } as const;
+const cameraDistance = ({ camera, target }: { camera: Vec3; target: Vec3 }) => Math.hypot(camera[0] - target[0], camera[1] - target[1], camera[2] - target[2]);
+type CameraAspect = keyof typeof cameraAspects;
+/** ASSETS/resources/vehicle/<car>/<car>.pck → ASSETS/tune/garage/<car>.mcgarage. */
+async function garagePathFor(vehiclePckPath: string, base: string) {
+  const assets = dirname(dirname(dirname(dirname(vehiclePckPath))));
+  return join(assets, "tune", "garage", `${base}.mcgarage`);
+}
+async function readGarage(path: string): Promise<GarageSlot> {
+  const document = new McGarageDocument(path, basename(path), decodeLatin1(await readFile(path)));
+  // The field of view is global, in garage.garageshared beside the per-car files.
+  try {
+    const shared = await join(dirname(path), "garage.garageshared");
+    if (await exists(shared)) { const fov = parseGarageSharedFov(decodeLatin1(await readFile(shared))); if (fov !== null) return { document, fov, fovFromFile: true }; }
+  } catch { /* fall back to the shipped value */ }
+  return { document, fov: DEFAULT_GARAGE_FOV, fovFromFile: false };
+}
 const PANEL_LIMITS = { nav: [220, 480], editor: [320, 800], meshList: [220, 900] } as const;
 function clampPanelWidth(value: number, [min, max]: readonly [number, number], fallback: number) {
   return Number.isFinite(value) ? Math.min(max, Math.max(min, value)) : fallback;
@@ -237,7 +267,7 @@ function TreeRow({ document, index, selectedIndices, expanded, meshAnchors, visi
   return <><div className={`tree-row ${selectedIndices.has(index) ? "selected" : ""}`} style={{ paddingLeft: 10 + depth * 16 }}><button className={`tree-toggle ${children.length ? "" : "empty"}`} onClick={() => children.length && onToggle(index)} aria-label={isOpen ? tr("Collapse") : tr("Expand")}>{isOpen ? "−" : "+"}</button><button className="tree-label" onClick={(event) => onSelect(index, { additive: event.ctrlKey || event.metaKey, range: event.shiftKey })} title={piece.name}><span>{piece.name}</span><small>{hex(piece.index, 4)}</small></button><MeshVisibilityButton index={index} available={meshAnchors.has(index)} visible={visibleAnchors.has(index)} onToggle={onToggleVisibility} /></div>{isOpen && children.map((child) => <TreeRow key={child} document={document} index={child} selectedIndices={selectedIndices} expanded={expanded} meshAnchors={meshAnchors} visibleAnchors={visibleAnchors} onSelect={onSelect} onToggle={onToggle} onToggleVisibility={onToggleVisibility} depth={depth + 1} />)}</>;
 }
 type CoordinateChangeMode = "commit" | "preview" | "scrub-commit" | "scrub-cancel";
-function CoordinateInput({ axis, value, mixed, locked, onChange }: { axis: string; value: number; mixed?: boolean; locked?: boolean; onChange(value: number, mode: CoordinateChangeMode, startValue?: number): void }) {
+function CoordinateInput({ axis, value, mixed, locked, step: stepScale = 1, onChange }: { axis: string; value: number; mixed?: boolean; locked?: boolean; step?: number; onChange(value: number, mode: CoordinateChangeMode, startValue?: number): void }) {
   const formatted = mixed ? "" : (Number.isFinite(value) ? value.toFixed(5) : "0.00000"); const [draft, setDraft] = useState(formatted);
   const scrubRef = useRef<{ pointerId: number; startX: number; lastX: number; startValue: number; currentValue: number; moved: boolean } | null>(null);
   useEffect(() => setDraft(formatted), [formatted]);
@@ -258,7 +288,7 @@ function CoordinateInput({ axis, value, mixed, locked, onChange }: { axis: strin
     const movement = event.clientX - scrub.lastX; scrub.lastX = event.clientX;
     if (!scrub.moved && Math.abs(event.clientX - scrub.startX) < 2) return;
     scrub.moved = true; document.body.classList.add("anchor-scrubbing"); event.preventDefault();
-    const step = event.ctrlKey ? 0.01 : event.shiftKey ? 0.0001 : 0.001;
+    const step = (event.ctrlKey ? 0.01 : event.shiftKey ? 0.0001 : 0.001) * stepScale;
     scrub.currentValue = Math.round((scrub.currentValue + movement * step) * 100000) / 100000;
     setDraft(scrub.currentValue.toFixed(5)); onChange(scrub.currentValue, "preview", scrub.startValue);
   }} onPointerUp={(event) => { if (scrubRef.current?.pointerId === event.pointerId) finishScrub(true); }} onPointerCancel={() => finishScrub(false)} onKeyDown={(event) => { if (event.key === "Enter") event.currentTarget.blur(); if (event.key === "Escape") { if (scrubRef.current) finishScrub(false); else { setDraft(formatted); event.currentTarget.blur(); } } }} aria-label={tr(`${axis} coordinate`)} /></label>;
@@ -329,7 +359,21 @@ export default function App() {
   const selected = useMemo(() => { const list = [...selectedIndices]; return list.length ? list[list.length - 1] : 0; }, [selectedIndices]);
   const [expanded, setExpanded] = useState<Set<number>>(new Set());
   const [search, setSearch] = useState(""); const [listSearch, setListSearch] = useState("");
-  const [navigatorTab, setNavigatorTab] = useState<"tree" | "list">("tree");
+  const [navigatorTab, setNavigatorTab] = useState<"tree" | "list" | "cameras">("tree");
+  const [garage, setGarage] = useState<GarageSlot | null>(null);
+  // Why there is no camera file, shown in its place (empty while one is loaded).
+  const [garageNote, setGarageNote] = useState("");
+  const [selectedCamera, setSelectedCamera] = useState<ShopCameraId>("FrontBumper");
+  const [cameraHandle, setCameraHandle] = useState<CameraHandle>("camera");
+  const [lookThrough, setLookThrough] = useState(false);
+  const [cameraAspect, setCameraAspect] = useState<CameraAspect>(() => { try { return localStorage.getItem(CAMERA_ASPECT_KEY) === "16:9" ? "16:9" : "4:3"; } catch { return "4:3"; } });
+  useEffect(() => { try { localStorage.setItem(CAMERA_ASPECT_KEY, cameraAspect); } catch { /* storage unavailable */ } }, [cameraAspect]);
+  const [targetPlane, setTargetPlane] = useState(() => { try { return localStorage.getItem(TARGET_PLANE_KEY) !== "false"; } catch { return true; } });
+  useEffect(() => { try { localStorage.setItem(TARGET_PLANE_KEY, String(targetPlane)); } catch { /* storage unavailable */ } }, [targetPlane]);
+  const [safeAreas, setSafeAreas] = useState(() => { try { return localStorage.getItem(SAFE_AREAS_KEY) !== "false"; } catch { return true; } });
+  useEffect(() => { try { localStorage.setItem(SAFE_AREAS_KEY, String(safeAreas)); } catch { /* storage unavailable */ } }, [safeAreas]);
+  const [cameraFields, setCameraFields] = useState<"global" | "local">(() => { try { return localStorage.getItem(CAMERA_FIELDS_KEY) === "local" ? "local" : "global"; } catch { return "global"; } });
+  useEffect(() => { try { localStorage.setItem(CAMERA_FIELDS_KEY, cameraFields); } catch { /* storage unavailable */ } }, [cameraFields]);
   const [detailOpen, setDetailOpen] = useState({ position: true, offset: false, lights: false, hierarchy: true, binary: false, diagnostics: false });
   const [lightDrafts, setLightDrafts] = useState<Record<LightFamily, Vec3Draft>>(emptyLightDrafts);
   const [offsetDraft, setOffsetDraft] = useState<Vec3Draft>(["", "", ""]);
@@ -365,7 +409,8 @@ export default function App() {
   const meshDocument = meshRole ? slots[meshRole]?.document ?? null : null;
   // Piece-ID edits can land on any loaded role via the Mesh Editor's own role selector, independent
   // of which one the Anchor Editor is working on — so "is anything unsaved" must check all three.
-  const anySlotDirty = roles.some((role) => slots[role]?.document.dirty) || [...meshDocs.values()].some((doc) => doc.dirty);
+  const anySlotDirty = roles.some((role) => slots[role]?.document.dirty) || [...meshDocs.values()].some((doc) => doc.dirty) || Boolean(garage?.document.dirty);
+  const cameraMode = workspace === "anchor" && navigatorTab === "cameras";
   const refresh = useCallback(() => setRevision((value) => value + 1), []);
   const pieceIdUndoRef = useRef<MeshEditAction[]>([]);
   const pieceIdRedoRef = useRef<MeshEditAction[]>([]);
@@ -786,6 +831,15 @@ export default function App() {
     }
   }, [refresh]);
   useEffect(() => onFileWritten((path) => { void reloadWrittenFile(path); }), [reloadWrittenFile]);
+  /** Finds the car's shop camera file beside the vehicle folder. A car without one still opens. */
+  const loadGarageFor = useCallback(async (vehiclePckPath: string, base: string) => {
+    setGarage(null); setLookThrough(false);
+    try {
+      const path = await garagePathFor(vehiclePckPath, base);
+      if (!await exists(path)) { setGarageNote(`No ${base}.mcgarage at ${path}`); return; }
+      setGarage(await readGarage(path)); setGarageNote("");
+    } catch (error) { setGarageNote(error instanceof Error ? error.message : "The shop camera file could not be read."); }
+  }, []);
   const loadEntries = useCallback(async (entries: FileEntry[], preferredName?: string) => {
     if (anySlotDirty && !await confirmDiscard("Discard the unsaved changes and open another vehicle set?")) return;
     try {
@@ -806,8 +860,9 @@ export default function App() {
       setMeshDocs(nextMeshDocs); setVisibleMeshAnchors(defaultVisible); setMeshErrors(failures);
       const count = roles.filter((role) => next[role]).length;
       installVehicle(next, nextRole, group.base, `${group.base} loaded · ${count}/3 vehicle PCKs · ${docs.length} mesh files${failures ? ` · ${failures} unsupported` : ""}`);
+      void loadGarageFor(next[nextRole]!.path, group.base);
     } catch (error) { setStatus(error instanceof Error ? error.message : "Could not open this vehicle set."); }
-  }, [anySlotDirty, installVehicle]);
+  }, [anySlotDirty, installVehicle, loadGarageFor]);
   const openFiles = useCallback(async () => {
     setMenu(null);
     try {
@@ -997,6 +1052,14 @@ export default function App() {
         if (!sameBytes(doc.bytes, actual)) throw new Error(`${basename(doc.path)} was written, but read-back verification failed. The editor kept it marked as modified.`);
       }
       for (const doc of dirtyMeshDocs) doc.markSaved();
+      // The shop cameras are their own text file under tune/garage, always saved over itself.
+      const garageCameras = garage?.document.dirtyCameras.length ?? 0;
+      if (garage && garageCameras) {
+        const bytes = garage.document.bytes();
+        await writeFile(garage.document.path, bytes); writtenCount += 1;
+        if (!sameBytes(bytes, await readFile(garage.document.path))) throw new Error(`${garage.document.name} was written, but read-back verification failed. The editor kept it marked as modified.`);
+        garage.document.markSaved();
+      }
       refresh();
       const destination = saveAs ? "saved as new files" : "saved over the opened files";
       const pieceIdNote = changedLodEntries ? ` · ${changedLodEntries} piece ID${changedLodEntries === 1 ? "" : "s"} synchronized` : "";
@@ -1007,19 +1070,22 @@ export default function App() {
       // by later embeds, not cut out, so say how much is still held that way.
       const reclaimNote = `${reclaimedBytes ? ` · ${sizeLabel(reclaimedBytes)} reclaimed` : ""}${stuckBytes ? ` · ${sizeLabel(stuckBytes)} unused before non-mesh data, kept for later embeds` : ""}`;
       if (shaderSyncWarnings.length) console.warn("Shader sync warnings:", shaderSyncWarnings);
-      setStatus(`${loaded.length} vehicle PCK${loaded.length === 1 ? "" : "s"} ${destination} · ${changed.length} changed anchor${changed.length === 1 ? "" : "s"} synchronized on save${pieceIdNote}${shaderNote}${shaderWarnNote}${meshNote}${reclaimNote}`);
+      const garageNoteText = garageCameras ? ` · ${garageCameras} shop camera${garageCameras === 1 ? "" : "s"} saved to ${garage!.document.name}` : "";
+      setStatus(`${loaded.length} vehicle PCK${loaded.length === 1 ? "" : "s"} ${destination} · ${changed.length} changed anchor${changed.length === 1 ? "" : "s"} synchronized on save${pieceIdNote}${shaderNote}${shaderWarnNote}${meshNote}${reclaimNote}${garageNoteText}`);
     } catch (error) { setStatus(`Save failed${writtenCount ? ` after writing ${writtenCount} file${writtenCount === 1 ? "" : "s"}` : ""}. In-memory edits are intact. ${error instanceof Error ? error.message : ""}`.trim()); }
-  }, [document, meshDocs, refresh, slots, workingRole]);
-  const closeVehicle = useCallback(async () => { setMenu(null); if (anySlotDirty && !await confirmDiscard("Discard the unsaved changes in this vehicle set?")) return; perfUndoRef.current = []; perfRedoRef.current = []; audioUndoRef.current = []; audioRedoRef.current = []; pieceIdUndoRef.current = []; pieceIdRedoRef.current = []; setSlots(emptySlots()); setMeshDocs(new Map()); setVisibleMeshAnchors(new Set()); setMeshErrors(0); setWorkingRole(null); setVehicleBase(""); setSelectedIndices(new Set([0])); setStatus("Vehicle set closed"); }, [anySlotDirty]);
+  }, [document, garage, meshDocs, refresh, slots, workingRole]);
+  const closeVehicle = useCallback(async () => { setMenu(null); if (anySlotDirty && !await confirmDiscard("Discard the unsaved changes in this vehicle set?")) return; perfUndoRef.current = []; perfRedoRef.current = []; audioUndoRef.current = []; audioRedoRef.current = []; pieceIdUndoRef.current = []; pieceIdRedoRef.current = []; setSlots(emptySlots()); setMeshDocs(new Map()); setVisibleMeshAnchors(new Set()); setMeshErrors(0); setWorkingRole(null); setVehicleBase(""); setSelectedIndices(new Set([0])); setGarage(null); setGarageNote(""); setLookThrough(false); setStatus("Vehicle set closed"); }, [anySlotDirty]);
   const reload = useCallback(async () => {
-    setMenu(null); if (!document || !workingRole) return; if (document.dirty && !await confirmDiscard("Reload the vehicle set and discard the unsaved anchor changes?")) return;
+    setMenu(null); if (!document || !workingRole) return; if ((document.dirty || garage?.document.dirty) && !await confirmDiscard("Reload the vehicle set and discard the unsaved anchor changes?")) return;
     try {
       const next = emptySlots();
       await Promise.all(roles.map(async (role) => { const slot = slots[role]; if (!slot) return; next[role] = { ...slot, document: await readDocument(slot.path) }; }));
       const source = next[workingRole]!.document; for (const role of roles) if (next[role] && role !== workingRole) next[role]!.document.assertAnchorCompatibility(source);
       installVehicle(next, workingRole, vehicleBase, "Vehicle set reloaded from its last saved state");
+      if (garage) { try { setGarage(await readGarage(garage.document.path)); } catch (error) { setGarage(null); setGarageNote(error instanceof Error ? error.message : "The shop camera file could not be read."); } }
+      else void loadGarageFor(next[workingRole]!.path, vehicleBase);
     } catch (error) { setStatus(error instanceof Error ? error.message : "Could not reload the vehicle set."); }
-  }, [document, installVehicle, slots, vehicleBase, workingRole]);
+  }, [document, garage, installVehicle, loadGarageFor, slots, vehicleBase, workingRole]);
 
   const selectPiece = useCallback((index: number, modifiers?: { additive?: boolean; range?: boolean }) => {
     if (!document) return;
@@ -1122,6 +1188,96 @@ export default function App() {
     setStatus(`${label} mirrored on X · preview refreshed`);
   }, [document, refresh, selectedIndices]);
 
+  // ---- Shop cameras (tune/garage/<car>.mcgarage) ----
+  // Kept in the file's own axes everywhere except the viewer, which draws in PCK space.
+  const cameraPoints = garage && garage.document.cameras.includes(selectedCamera) ? garage.document.get(selectedCamera) : null;
+  const cameraLabel = tr(shopCameraLabel(selectedCamera));
+  useEffect(() => { if (!cameraMode) setLookThrough(false); }, [cameraMode]);
+  useEffect(() => { if (garage && !garage.document.cameras.includes(selectedCamera)) setSelectedCamera(garage.document.cameras[0]); }, [garage, selectedCamera]);
+  /** A gizmo drag or a look-through gesture: previews unrecorded, then commits as one undo step. */
+  const moveShopCamera = useCallback((next: ShopCameraPoints, mode: "preview" | "commit", start?: ShopCameraPoints) => {
+    if (!garage) return;
+    const doc = garage.document;
+    const target = { camera: pckToGarage(next.camera), target: pckToGarage(next.target) };
+    if (mode === "commit") {
+      if (start) doc.set(selectedCamera, { camera: pckToGarage(start.camera), target: pckToGarage(start.target) }, false);
+      if (doc.set(selectedCamera, target, true)) setStatus(`${shopCameraLabel(selectedCamera)} shop camera moved · save to write ${doc.name}`);
+    } else doc.set(selectedCamera, target, false);
+    refresh();
+  }, [garage, refresh, selectedCamera]);
+  const editCameraCoordinate = useCallback((which: "camera" | "target", component: number, value: number, mode: CoordinateChangeMode, startValue?: number) => {
+    if (!garage || !Number.isFinite(value)) return;
+    const doc = garage.document;
+    const withValue = (next: number) => { const point = [...doc.get(selectedCamera)[which]] as Vec3; point[component] = next; return { [which]: point }; };
+    let changed: boolean;
+    if (mode === "scrub-commit") {
+      if (startValue === undefined || Object.is(startValue, value)) return;
+      doc.set(selectedCamera, withValue(startValue), false);
+      changed = doc.set(selectedCamera, withValue(value), true);
+    } else changed = doc.set(selectedCamera, withValue(value), mode === "commit");
+    if (!changed) return;
+    refresh();
+    if (mode === "commit" || mode === "scrub-commit") setStatus(`${shopCameraLabel(selectedCamera)} ${which === "camera" ? "camera" : "target"}.${axes[component]} updated · preview refreshed`);
+  }, [garage, refresh, selectedCamera]);
+  /** Local editing: one of distance / yaw / pitch around the target, the target staying put. */
+  const editCameraOrbit = useCallback((key: keyof CameraOrbit, value: number, mode: CoordinateChangeMode, startValue?: number) => {
+    if (!garage || !Number.isFinite(value)) return;
+    const doc = garage.document;
+    const withValue = (next: number) => { const points = doc.get(selectedCamera); return { camera: orbitPosition(points.target, { ...cameraOrbit(points), [key]: next }) }; };
+    let changed: boolean;
+    if (mode === "scrub-commit") {
+      if (startValue === undefined || Object.is(startValue, value)) return;
+      doc.set(selectedCamera, withValue(startValue), false);
+      changed = doc.set(selectedCamera, withValue(value), true);
+    } else changed = doc.set(selectedCamera, withValue(value), mode === "commit");
+    if (!changed) return;
+    refresh();
+    if (mode === "commit" || mode === "scrub-commit") setStatus(`${shopCameraLabel(selectedCamera)} camera ${key} set to ${value.toFixed(3)} around its target`);
+  }, [garage, refresh, selectedCamera]);
+  const copyCameraVector = useCallback((which: "camera" | "target") => {
+    if (!cameraPoints) return;
+    const value: Vec3 = [...cameraPoints[which]];
+    setVectorClipboard({ value, source: `${shopCameraLabel(selectedCamera)} ${which}` });
+    void navigator.clipboard?.writeText(value.map((item) => item.toFixed(6)).join(" ")).catch(() => undefined);
+    setStatus(`Copied the ${shopCameraLabel(selectedCamera)} ${which} values`);
+  }, [cameraPoints, selectedCamera]);
+  const pasteCameraVector = useCallback((which: "camera" | "target") => {
+    if (!garage || !vectorClipboard) return;
+    if (!garage.document.set(selectedCamera, { [which]: vectorClipboard.value })) { setStatus(`${shopCameraLabel(selectedCamera)} ${which} already matches ${vectorClipboard.source}`); return; }
+    refresh(); setStatus(`Pasted ${vectorClipboard.source} into the ${shopCameraLabel(selectedCamera)} ${which}`);
+  }, [garage, refresh, selectedCamera, vectorClipboard]);
+  const resetCamera = useCallback(() => {
+    if (!garage) return;
+    if (!garage.document.set(selectedCamera, garage.document.getSaved(selectedCamera))) return;
+    refresh(); setStatus(`${shopCameraLabel(selectedCamera)} shop camera back to its saved values`);
+  }, [garage, refresh, selectedCamera]);
+  const cameraUndo = useCallback(() => { const id = garage?.document.undo(); if (!id) return; setSelectedCamera(id); refresh(); setStatus(`Undo · ${shopCameraLabel(id)} shop camera`); }, [garage, refresh]);
+  const cameraRedo = useCallback(() => { const id = garage?.document.redo(); if (!id) return; setSelectedCamera(id); refresh(); setStatus(`Redo · ${shopCameraLabel(id)} shop camera`); }, [garage, refresh]);
+  /** Opens a camera file by hand: a car outside the usual ASSETS layout, or another car's file. */
+  const openGarageFile = useCallback(async () => {
+    try {
+      if (garage?.document.dirty && !await confirmDiscard("Discard the unsaved shop camera changes and open another camera file?")) return;
+      const selection = await open({ multiple: false, filters: [{ name: "MC3 garage cameras", extensions: ["mcgarage"] }] });
+      if (typeof selection !== "string") return;
+      setGarage(await readGarage(selection)); setGarageNote(""); setLookThrough(false);
+      setStatus(`${basename(selection)} opened · saving the vehicle set writes the shop cameras back to it`);
+    } catch (error) { setStatus(error instanceof Error ? error.message : "Could not open that camera file."); }
+  }, [garage]);
+  /** Copies cameras from another car's file — this one, or all of them — as one undo step. */
+  const importCameras = useCallback(async (only: ShopCameraId | null) => {
+    if (!garage) return;
+    try {
+      const selection = await open({ multiple: false, defaultPath: dirname(garage.document.path), filters: [{ name: "MC3 garage cameras", extensions: ["mcgarage"] }] });
+      if (typeof selection !== "string") return;
+      const source = new McGarageDocument(selection, basename(selection), decodeLatin1(await readFile(selection)));
+      const ids = (only ? [only] : garage.document.cameras).filter((id) => source.cameras.includes(id));
+      if (!ids.length) { setStatus(`${source.name} has no ${only ? shopCameraLabel(only) : "matching"} camera`); return; }
+      const changed = garage.document.setMany(ids.map((id) => [id, source.get(id)]));
+      refresh();
+      setStatus(changed ? `${changed} shop camera${changed === 1 ? "" : "s"} copied from ${source.name}` : `The cameras already match ${source.name}`);
+    } catch (error) { setStatus(error instanceof Error ? error.message : "Could not read that camera file."); }
+  }, [garage, refresh]);
+
   const lightAnchors = useMemo(() => document ? collectLightAnchors(document) : [], [document, revision]);
   const lightSummaries = useMemo(() => summarizeLightAnchors(lightAnchors), [lightAnchors]);
   const fillLightDraft = useCallback((family: LightFamily) => {
@@ -1213,15 +1369,17 @@ export default function App() {
       const pressed = event.key.toLowerCase();
       if (pressed === "o") { event.preventDefault(); void openFiles(); return; }
       if (pressed === "s") { event.preventDefault(); void save(event.shiftKey); return; }
-      if (pressed === "z" && !event.shiftKey) { event.preventDefault(); workspace === "mesh" ? meshUndo() : workspace === "performance" ? perfUndo() : workspace === "audio" ? audioUndo() : undo(); return; }
-      if (pressed === "y" || (pressed === "z" && event.shiftKey)) { event.preventDefault(); workspace === "mesh" ? meshRedo() : workspace === "performance" ? perfRedo() : workspace === "audio" ? audioRedo() : redo(); return; }
+      if (pressed === "z" && !event.shiftKey) { event.preventDefault(); workspace === "mesh" ? meshUndo() : workspace === "performance" ? perfUndo() : workspace === "audio" ? audioUndo() : cameraMode ? cameraUndo() : undo(); return; }
+      if (pressed === "y" || (pressed === "z" && event.shiftKey)) { event.preventDefault(); workspace === "mesh" ? meshRedo() : workspace === "performance" ? perfRedo() : workspace === "audio" ? audioRedo() : cameraMode ? cameraRedo() : redo(); return; }
+      // The shop camera tab has no anchor selection to copy, paste or mirror.
+      if (cameraMode) return;
       if (workspace === "anchor" && event.shiftKey && pressed === "c") { event.preventDefault(); void copyValues(); return; }
       if (workspace === "anchor" && event.shiftKey && pressed === "v") { event.preventDefault(); void pasteValues(); return; }
       if (workspace === "anchor" && event.shiftKey && pressed === "m") { event.preventDefault(); mirrorSelection(); }
     };
     window.addEventListener("keydown", key);
     return () => window.removeEventListener("keydown", key);
-  }, [audioRedo, audioUndo, copyValues, meshRedo, meshUndo, mirrorSelection, openFiles, pasteValues, perfRedo, perfUndo, redo, save, undo, workspace]);
+  }, [audioRedo, audioUndo, cameraMode, cameraRedo, cameraUndo, copyValues, meshRedo, meshUndo, mirrorSelection, openFiles, pasteValues, perfRedo, perfUndo, redo, save, undo, workspace]);
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     let cancelled = false;
@@ -1274,7 +1432,9 @@ export default function App() {
     <header className="titlebar"><div className="brand-mark">{tr("MC3")}</div><div className="brand-copy"><strong>{tr("MC3 Modding Toolkit")}</strong><span>{tr("Midnight Club 3 desktop workspace")}</span></div><nav className="workspace-tabs">{workspaceTabs.map((tab) => <button key={tab.id} className={workspace === tab.id ? "active" : ""} onClick={() => setWorkspace(tab.id)}>{tr(tab.label)}</button>)}</nav><div className="document-title">{workspace === "anchor" ? (document && workingRole ? <><Tx t="{0}{1} · Editing {2}{3}" v={[<span className={document.dirty ? "dirty-dot" : "clean-dot"} />, vehicleBase, roleLabels[workingRole], document.dirty && tr(" — Modified")]} /></> : tr("No vehicle set open")) : workspace === "mesh" ? tr("Meshes") : workspace === "performance" ? tr("Performance") : workspace === "audio" ? tr("Audio") : workspace === "textures" ? tr("Textures") : workspace === "iso" ? tr("ISO Install") : tr("Tools")}</div>{workspace !== "toolkit" && workspace !== "textures" && workspace !== "iso" && document && <div className={`local-badge ${anySlotDirty ? "unsaved" : ""}`} title={anySlotDirty ? tr("Edits are held in memory — nothing on disk has changed yet") : tr("Everything is written to disk")}><span /> {anySlotDirty ? (pendingCount > 0 ? tr(`${pendingCount} pending change${pendingCount === 1 ? "" : "s"}`) : tr("Unsaved changes")) : tr("Saved")}</div>}<div className="language-switch" title={tr("Interface language")}>{(["en", "pt"] as const).map((code) => <button key={code} className={language === code ? "active" : ""} onClick={() => setLanguage(code)}>{code.toUpperCase()}</button>)}</div></header>
     <div className="menubar" ref={menuRef}>
       <div className="menu-wrap"><button className={menu === "file" ? "active" : ""} onClick={() => setMenu(menu === "file" ? null : "file")}>{tr("File")}</button>{menu === "file" && (workspace === "textures" ? <div className="dropdown"><MenuItem shortcut="Ctrl+O" onClick={() => textureAction("open")}>{tr("Open PCK…")}</MenuItem><div className="separator" /><MenuItem shortcut="Ctrl+S" disabled={!textureMenu.current?.dirty} onClick={() => textureAction("save")}>{tr("Save")}</MenuItem><MenuItem shortcut="Ctrl+Shift+S" disabled={!textureMenu.current?.hasFile} onClick={() => textureAction("saveAs")}>{tr("Save as…")}</MenuItem><div className="separator" /><MenuItem disabled={!textureMenu.current?.hasFile} onClick={() => textureAction("close")}>{tr("Close PCK")}</MenuItem></div> : <div className="dropdown"><MenuItem onClick={() => void openFolder()}>{tr("Open vehicle folder…")}</MenuItem><MenuItem shortcut="Ctrl+O" onClick={() => void openFiles()}>{tr("Open PCK file(s)…")}</MenuItem><MenuItem disabled={!document} onClick={() => void reload()}>{tr("Reload vehicle set")}</MenuItem><div className="separator" /><MenuItem shortcut="Ctrl+S" disabled={!document} onClick={() => void save(false)}>{tr("Save vehicle set")}</MenuItem><MenuItem shortcut="Ctrl+Shift+S" disabled={!document} onClick={() => void save(true)}>{tr("Save vehicle set as…")}</MenuItem><div className="separator" /><MenuItem disabled={!document} onClick={() => void closeVehicle()}>{tr("Close vehicle set")}</MenuItem></div>)}</div>
-      {workspace === "anchor"
+      {cameraMode
+        ? <div className="menu-wrap"><button className={menu === "edit" ? "active" : ""} onClick={() => setMenu(menu === "edit" ? null : "edit")}>{tr("Edit")}</button>{menu === "edit" && <div className="dropdown"><MenuItem shortcut="Ctrl+Z" disabled={!garage?.document.undoStack.length} onClick={() => { setMenu(null); cameraUndo(); }}>{tr("Undo")}</MenuItem><MenuItem shortcut="Ctrl+Y" disabled={!garage?.document.redoStack.length} onClick={() => { setMenu(null); cameraRedo(); }}>{tr("Redo")}</MenuItem><div className="separator" /><MenuItem disabled={!garage} onClick={() => { setMenu(null); resetCamera(); }}>{tr("Reset this camera to saved")}</MenuItem><MenuItem onClick={() => { setMenu(null); void openGarageFile(); }}>{tr("Open .mcgarage…")}</MenuItem></div>}</div>
+        : workspace === "anchor"
         ? <div className="menu-wrap"><button className={menu === "edit" ? "active" : ""} onClick={() => setMenu(menu === "edit" ? null : "edit")}>{tr("Edit")}</button>{menu === "edit" && <div className="dropdown"><MenuItem shortcut="Ctrl+Z" disabled={!document?.undoStack.length} onClick={undo}>{tr("Undo")}</MenuItem><MenuItem shortcut="Ctrl+Y" disabled={!document?.redoStack.length} onClick={redo}>{tr("Redo")}</MenuItem><div className="separator" /><MenuItem shortcut="Ctrl+Shift+C" disabled={!piece} onClick={() => void copyValues()}>{tr("Copy anchor values")}</MenuItem><MenuItem shortcut="Ctrl+Shift+V" disabled={!piece} onClick={() => void pasteValues()}>{tr("Paste anchor values")}</MenuItem><div className="separator" /><MenuItem shortcut="Ctrl+Shift+M" disabled={!piece} onClick={mirrorSelection}>{tr("Mirror anchors on X")}</MenuItem></div>}</div>
         : workspace === "toolkit" || workspace === "iso" ? null
         : workspace === "textures" ? <div className="menu-wrap"><button className={menu === "edit" ? "active" : ""} onClick={() => setMenu(menu === "edit" ? null : "edit")}>{tr("Edit")}</button>{menu === "edit" && <div className="dropdown"><MenuItem shortcut="Ctrl+Z" disabled={!textureMenu.current?.canUndo} onClick={() => textureAction("undo")}>{tr("Undo")}</MenuItem><MenuItem shortcut="Ctrl+Y" disabled={!textureMenu.current?.canRedo} onClick={() => textureAction("redo")}>{tr("Redo")}</MenuItem></div>}</div>
@@ -1288,8 +1448,8 @@ export default function App() {
       <section className="vehicle-set-bar"><div className="set-summary"><p className="eyebrow">{tr("VEHICLE SET")}</p><strong>{vehicleBase}</strong><span><Tx t="{0}/3 files ready · sync on save" v={[loadedCount]} /></span></div><div className="vehicle-slots">{roles.map((role) => { const slot = slots[role]; const active = role === workingRole; return <article key={role} className={`vehicle-slot ${active ? "working" : ""} ${slot ? "loaded" : "missing"}`}><div className="slot-heading"><span>{tr(roleLabels[role])}</span><em>{active ? tr("WORKING") : slot ? tr("READY") : tr("MISSING")}</em></div><strong title={slot?.path}>{slot?.document.name ?? tr(`Select ${roleLabels[role]} PCK`)}</strong><small className={slot?.document.dirty ? "size-pending" : ""} title={slot?.document.dirty ? tr("Size this file will have once saved — it still holds the old contents on disk") : undefined}>{slot ? `${slot.document.format.toUpperCase()} · ${pendingSizeLabel(slot.document)}` : tr("Manual file slot")}</small><div className="slot-actions">{slot && <button disabled={active} onClick={() => void switchWorkingFile(role)}>{active ? tr("Editing here") : tr("Edit this")}</button>}<button onClick={() => void chooseSlot(role)}>{slot ? tr("Replace…") : tr("Browse…")}</button></div></article>; })}</div><button className="folder-button" onClick={() => void openFolder()}>{tr("Open folder…")}</button></section>
       <section className="reference-geometry-bar"><div className="reference-summary"><p className="eyebrow">{tr("REFERENCE GEOMETRY")}</p><span>{tr("First drawable model · preview only")}</span><div className="reference-summary-actions"><button className="folder-button" onClick={() => void openPpfFolder()}>{tr("Open PPF folder…")}</button><RecentMenu recents={recentPpfFolders} onOpen={(path) => void openPpfFolderAtPath(path)} onClear={clearPpfRecents} /></div></div><div className="reference-slots">{ppfKinds.map((kind) => { const slot = ppfSlots[kind]; const wheelReference = kind === "rim" || kind === "tire"; return <article key={kind} className={`reference-slot ${slot ? "loaded" : "missing"} ${wheelReference ? "wheel-reference" : ""}`}><div><strong>{tr(ppfLabels[kind])}</strong><em>{slot ? tr("READY") : tr("OPTIONAL")}</em></div><span title={slot?.path}>{slot?.name ?? tr(`Select ${kind}.ppf`)}</span><small>{slot ? tr(`Entry ${slot.geometry.entryIndex} · ${slot.geometry.triangles.toLocaleString()} tris`) : kind === "exhaust" ? tr(`${document.exhaustLinks.size} exhaust anchors`) : tr(`${document.wheelLinks.size} wheel anchors`)}</small><div className="reference-slot-actions">{wheelReference && <select className="rim-size-select" value={rimSizeInches} onChange={(event) => changeRimSize(Number(event.target.value))} title={tr("Reference rim diameter")} aria-label={tr("Reference rim diameter")}>{rimSizeOptions.map((size) => <option key={size} value={size}>{size}″</option>)}</select>}<button onClick={() => choosePpf(kind)}>{tr("Browse")}</button>{slot && <button className="remove" onClick={() => removePpf(kind)}>{tr("Clear")}</button>}</div></article>; })}</div></section>
       <aside className="navigator combined-navigator">
-        <div className="navigator-tabs"><button className={navigatorTab === "tree" ? "active" : ""} onClick={() => setNavigatorTab("tree")}><Tx t="{0}Navigator" v={[<span>01</span>]} /></button><button className={navigatorTab === "list" ? "active" : ""} onClick={() => setNavigatorTab("list")}><Tx t="{0}Anchor list" v={[<span>02</span>]} /></button><em>{document.pieces.length}</em></div>
-        {navigatorTab === "tree" ? <>
+        <div className="navigator-tabs"><button className={navigatorTab === "tree" ? "active" : ""} onClick={() => setNavigatorTab("tree")}><Tx t="{0}Navigator" v={[<span>01</span>]} /></button><button className={navigatorTab === "list" ? "active" : ""} onClick={() => setNavigatorTab("list")}><Tx t="{0}Anchor list" v={[<span>02</span>]} /></button><button className={navigatorTab === "cameras" ? "active" : ""} onClick={() => setNavigatorTab("cameras")} title={tr("Garage shop cameras · tune/garage/<car>.mcgarage")}><Tx t="{0}Cameras" v={[<span>03</span>]} />{garage?.document.dirty && <i className="tab-dirty-dot" />}</button><em>{navigatorTab === "cameras" ? garage?.document.cameras.length ?? 0 : document.pieces.length}</em></div>
+        {navigatorTab === "cameras" ? <div className="tree-scroll camera-list">{garage ? garage.document.cameras.map((id) => <button key={id} className={`camera-row ${id === selectedCamera ? "selected" : ""}`} onClick={() => setSelectedCamera(id)}><span className="camera-row-name">{tr(shopCameraLabel(id))}</span>{garage.document.isCameraDirty(id) && <i className="camera-dirty" title={tr("Pending save")} />}<small>{id}</small></button>) : <div className="camera-missing"><strong>{tr("No shop camera file")}</strong><p>{tr(garageNote || "Open a vehicle folder from ASSETS/resources/vehicle to find its camera file automatically.")}</p><button className="secondary" onClick={() => void openGarageFile()}>{tr("Open .mcgarage…")}</button></div>}</div> : navigatorTab === "tree" ? <>
           <div className="search"><span>⌕</span><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder={tr("Name, ID or index…")} /><kbd>/</kbd></div>
           <div className="tree-actions"><button onClick={() => setExpanded(new Set(document.pieces.map((item) => item.index)))}>{tr("Expand all")}</button><button onClick={() => setExpanded(new Set(document.roots))}>{tr("Collapse all")}</button></div>
           <div className="tree-scroll">{search.trim() ? treeMatches.map((item) => <div key={item.index} className={`search-result-row ${selectedIndices.has(item.index) ? "selected" : ""}`}><button className="search-result" onClick={(event) => selectPiece(item.index, { additive: event.ctrlKey || event.metaKey, range: event.shiftKey })}><span>{item.name}</span><small>#{hex(item.index, 4)}</small></button><MeshVisibilityButton index={item.index} available={meshAnchorIndices.has(item.index)} visible={visibleMeshAnchors.has(item.index)} onToggle={toggleMeshVisibility} /></div>) : document.roots.map((root) => <TreeRow key={root} document={document} index={root} selectedIndices={selectedIndices} expanded={expanded} meshAnchors={meshAnchorIndices} visibleAnchors={visibleMeshAnchors} onSelect={selectPiece} onToggle={(index) => { const next = new Set(expanded); next.has(index) ? next.delete(index) : next.add(index); setExpanded(next); }} onToggleVisibility={toggleMeshVisibility} />)}</div>
@@ -1298,10 +1458,41 @@ export default function App() {
           <div className="flat-list-caption">{tr("File order · no hierarchy")}</div>
           <div className="tree-scroll flat-list-scroll">{listMatches.map((item) => <div key={item.index} className={`flat-anchor-row ${selectedIndices.has(item.index) ? "selected" : ""}`}><button className="flat-anchor-main" onClick={(event) => selectPiece(item.index, { additive: event.ctrlKey || event.metaKey, range: event.shiftKey })}><span className="flat-index">{item.index.toString(16).toUpperCase().padStart(4, "0")}</span><span className="flat-name">{item.name}</span></button><MeshVisibilityButton index={item.index} available={meshAnchorIndices.has(item.index)} visible={visibleMeshAnchors.has(item.index)} onToggle={toggleMeshVisibility} /></div>)}</div>
         </>}
-        <div className="navigator-footer"><span>{navigatorTab === "tree" ? tr("Hierarchy") : tr("Sequential")}</span><span><Tx t="{0} shown" v={[navigatorTab === "tree" ? document.pieces.length : listMatches.length]} /></span><span><Tx t="{0} edited" v={[document.dirtyIndices.size]} /></span></div>
+        {navigatorTab === "cameras" ? <div className="navigator-footer"><span>{tr("Shop cameras")}</span><span>{garage ? garage.document.name : tr("No file")}</span><span><Tx t="{0} edited" v={[garage?.document.dirtyCameras.length ?? 0]} /></span></div>
+        : <div className="navigator-footer"><span>{navigatorTab === "tree" ? tr("Hierarchy") : tr("Sequential")}</span><span><Tx t="{0} shown" v={[navigatorTab === "tree" ? document.pieces.length : listMatches.length]} /></span><span><Tx t="{0} edited" v={[document.dirtyIndices.size]} /></span></div>}
       </aside>
       <ResizeHandle variant="resize-nav" onDrag={resizeNav} />
-      {piece && <section className="editor-pane">
+      {cameraMode ? <section className="editor-pane camera-pane">
+        <div className="editor-header"><div><p className="eyebrow">{tr("SHOP CAMERA")}{garage ? ` · ${garage.document.name}` : ""}</p><h2>{cameraLabel}</h2><div className="chips"><span title={garage?.fovFromFile ? tr("CameraFOV from garage.garageshared") : tr("garage.garageshared not found · shipped value")}><Tx t="FOV {0}°" v={[garage?.fov ?? DEFAULT_GARAGE_FOV]} /></span><span>{selectedCamera}</span>{garage?.document.isCameraDirty(selectedCamera) && <span className="modified-chip">{tr("Pending save")}</span>}</div></div><div className="editor-buttons"><button disabled={!garage?.document.undoStack.length} onClick={cameraUndo}>{tr("Undo")}</button><button disabled={!garage?.document.redoStack.length} onClick={cameraRedo}>{tr("Redo")}</button></div></div>
+        <div className="editor-scroll">
+          {!garage || !cameraPoints ? <div className="camera-missing"><strong>{tr("No shop camera file")}</strong><p>{tr(garageNote || "Open a vehicle folder from ASSETS/resources/vehicle to find its camera file automatically.")}</p><button className="secondary" onClick={() => void openGarageFile()}>{tr("Open .mcgarage…")}</button></div> : <>
+          <div className="sync-notice"><strong>{tr("Saved with the vehicle set")}</strong><span><Tx t="Ctrl+S writes {0} along with the PCKs. Values are in the file's own axes: +Z is the car's front, the opposite of the PCK." v={[garage.document.name]} /></span></div>
+          <div className="toggle-stack">
+            <TogglePanel title={tr("Camera and target")} meta={tr(`${cameraDistance(cameraPoints).toFixed(3)} m apart`)} open={detailOpen.position} onToggle={() => setDetailOpen((value) => ({ ...value, position: !value.position }))}>
+              <div className="panel-pad">
+                <div className="camera-handle-switch"><span>{tr("Gizmo moves")}</span><div className="segmented"><button className={cameraHandle === "camera" ? "active" : ""} onClick={() => setCameraHandle("camera")} title={tr("Or click the box in the viewer · C")}>{tr("Camera")}</button><button className={cameraHandle === "target" ? "active" : ""} onClick={() => setCameraHandle("target")} title={tr("Or click the sphere in the viewer · T")}>{tr("Target")}</button></div></div>
+                <div className="camera-handle-switch"><span>{tr("Camera fields")}</span><div className="segmented"><button className={cameraFields === "global" ? "active" : ""} onClick={() => setCameraFields("global")} title={tr("X, Y, Z in the file's axes")}>{tr("Global")}</button><button className={cameraFields === "local" ? "active" : ""} onClick={() => setCameraFields("local")} title={tr("Distance, yaw and pitch around the target; the target stays put")}>{tr("Local")}</button></div></div>
+                <div className="vector-stack vertical">{cameraFields === "local" ? (() => { const orbit = cameraOrbit(cameraPoints); return <section className="vector-card"><div className="vector-title"><strong>{tr("Camera around the target")}</strong><div className="vector-title-tools"><small className="orbit-hint">{tr("m · ° · ° — drag a field sideways to adjust")}</small></div></div><div className="vector-grid">{orbitFields.map((field) => <CoordinateInput key={field.key} axis={tr(field.label)} value={orbit[field.key]} step={field.step} onChange={(next, mode, startValue) => editCameraOrbit(field.key, next, mode, startValue)} />)}</div></section>; })() : <VecEditor label={tr("Camera position")} value={cameraPoints.camera} canPaste={Boolean(vectorClipboard)} onCopy={() => copyCameraVector("camera")} onPaste={() => pasteCameraVector("camera")} onChange={(component, value, mode, startValue) => editCameraCoordinate("camera", component, value, mode, startValue)} />}<VecEditor label={tr("Look-at target")} value={cameraPoints.target} canPaste={Boolean(vectorClipboard)} onCopy={() => copyCameraVector("target")} onPaste={() => pasteCameraVector("target")} onChange={(component, value, mode, startValue) => editCameraCoordinate("target", component, value, mode, startValue)} /></div>
+                <div className="panel-actions panel-actions-end"><button className="link-button" disabled={!garage.document.isCameraDirty(selectedCamera)} onClick={resetCamera}>{tr("Reset to saved")}</button></div>
+              </div>
+            </TogglePanel>
+            <TogglePanel title={tr("Preview")} meta={cameraAspect} open={detailOpen.offset} onToggle={() => setDetailOpen((value) => ({ ...value, offset: !value.offset }))}>
+              <div className="panel-pad">
+                <p className="light-intro"><Tx t="{0} shows what this camera frames, letterboxed to the game's screen. While in it, drag orbits the target, the wheel moves the camera in or out and right-drag pans both — each gesture is one undo step." v={[<strong>{tr("Camera view")}</strong>]} /></p>
+                <div className="camera-handle-switch"><span>{tr("Screen")}</span><div className="segmented">{(Object.keys(cameraAspects) as CameraAspect[]).map((aspect) => <button key={aspect} className={cameraAspect === aspect ? "active" : ""} onClick={() => setCameraAspect(aspect)} title={aspect === "4:3" ? tr("The frame the game renders; a 16:9 window only stretches it") : tr("Only for a widescreen patch that widens the view")}>{aspect === "4:3" ? tr("4:3 · game") : tr("16:9 · widescreen patch")}</button>)}</div></div>
+                <div className="panel-actions panel-actions-end"><button className={`mirror-button ${targetPlane ? "active" : ""}`} onClick={() => setTargetPlane((value) => !value)} title={tr("A 3 × 2 m red plane at the target, square to the line of sight · preview only")}>{tr("Target plane")}</button><button className={`mirror-button ${safeAreas ? "active" : ""}`} onClick={() => setSafeAreas((value) => !value)} title={tr("In the camera view, shades where the shop's own UI covers the frame")}>{tr("Safe areas")}</button><button className={`mirror-button ${lookThrough ? "active" : ""}`} onClick={() => setLookThrough((value) => !value)} title={tr("Numpad 0 · Esc to leave")}>{lookThrough ? tr("Leave camera view") : tr("Camera view")}</button></div>
+              </div>
+            </TogglePanel>
+            <TogglePanel title={tr("Copy from another car")} meta=".mcgarage" open={detailOpen.lights} onToggle={() => setDetailOpen((value) => ({ ...value, lights: !value.lights }))}>
+              <div className="panel-pad">
+                <p className="light-intro">{tr("Takes the cameras from another car's .mcgarage — a car with a similar shape is a good start. One undo step; nothing is written until you save.")}</p>
+                <div className="panel-actions panel-actions-end"><button className="mirror-button" onClick={() => void importCameras(selectedCamera)}><Tx t="This camera ({0})…" v={[cameraLabel]} /></button><button className="mirror-button" onClick={() => void importCameras(null)}>{tr("All cameras…")}</button></div>
+              </div>
+            </TogglePanel>
+          </div>
+          </>}
+        </div>
+      </section> : piece && <section className="editor-pane">
         <div className="editor-header"><div><p className="eyebrow"><Tx t="ANCHOR #{0}{1}" v={[piece.index.toString(16).toUpperCase().padStart(4, "0"), selectedIndices.size > 1 && tr(` · ${selectedIndices.size} SELECTED`)]} /></p><h2>{piece.name}</h2><div className="chips"><span><Tx t="{0} source" v={[roleLabels[workingRole!]]} /></span><span><Tx t="File {0}" v={[hex(piece.fileOffset)]} /></span>{document.dirtyIndices.has(piece.index) && <span className="modified-chip">{tr("Pending for set")}</span>}</div></div><div className="editor-buttons"><button disabled={!document.undoStack.length} onClick={undo}>{tr("↶ Undo")}</button><button disabled={!document.redoStack.length} onClick={redo}>{tr("↷ Redo")}</button></div></div>
         <div className="editor-scroll">
           <div className="sync-notice"><strong>{tr("Deferred set sync")}</strong><span><Tx t="Editing {0}. Save applies {1} changed anchor{2} to {3} loaded PCK{4}." v={[roleLabels[workingRole!], document.dirtyIndices.size, document.dirtyIndices.size === 1 ? "" : "s", loadedCount, loadedCount === 1 ? "" : "s"]} /></span></div>
@@ -1342,7 +1533,7 @@ export default function App() {
         </div>
       </section>}
       <ResizeHandle variant="resize-editor" onDrag={resizeEditor} />
-      <MeshViewer document={document} selected={selected} multiSelected={selectedIndices} meshes={anchorMeshes} visibleAnchors={visibleMeshAnchors} referenceGeometry={referenceGeometry} rimSizeInches={rimSizeInches} revision={revision} onMoveSelection={moveSelection} />
+      <MeshViewer document={document} selected={selected} multiSelected={selectedIndices} meshes={anchorMeshes} visibleAnchors={visibleMeshAnchors} referenceGeometry={referenceGeometry} rimSizeInches={rimSizeInches} revision={revision} onMoveSelection={moveSelection} cameraEdit={cameraMode && garage && cameraPoints ? { camera: garageToPck(cameraPoints.camera), target: garageToPck(cameraPoints.target), handle: cameraHandle, lookThrough, targetPlane, safeAreas, fov: garage.fov, aspect: cameraAspects[cameraAspect], onSelectHandle: setCameraHandle, onToggleLookThrough: () => setLookThrough((value) => !value), onMove: moveShopCamera } : null} />
     </main>)}
     {workspace === "mesh" && <div className="mesh-editor-shell"><MeshEditorWorkspace document={meshDocument} activeRole={meshRole} slots={slots} onSelectRole={setMeshViewRole} meshes={meshEditorMeshes} onEditPieceId={editPieceId} onEditGroupShader={editGroupShader} onUpdateEmbedded={updateEmbeddedMesh} onUpdateAllEmbedded={updateAllEmbeddedMeshes} onConvertObjs={() => void chooseObjFolder()} zeroShellId={zeroShellId} onSetZeroShellId={setZeroShellId} onExportObj={(mesh) => void exportPieceObj(mesh)} embeddedUnreadable={embeddedOnly.unreadable} objFolder={objFolder} describeEmbedTarget={describeEmbedTarget} describePieceSize={describePieceSize} onUndo={meshUndo} onRedo={meshRedo} canUndo={pieceIdUndoRef.current.length > 0} canRedo={pieceIdRedoRef.current.length > 0} vehicleBase={vehicleBase} loadedCount={loadedCount} onOpenFolder={() => void openFolder()} recentVehicleFolders={recentVehicleFolders} onOpenRecentFolder={(path) => void openVehicleFolderAtPath(path)} onClearRecentFolders={clearVehicleRecents} listWidth={panelWidths.meshList} onResizeList={resizeMeshList} /></div>}
     {workspace === "performance" && <PerformanceWorkspace slots={slots} workingRole={workingRole} vehicleBase={vehicleBase} loadedCount={loadedCount} revision={revision} onApply={applyPerformance} onStatus={setStatus} onOpenFolder={() => void openFolder()} recentVehicleFolders={recentVehicleFolders} onOpenRecentFolder={(path) => void openVehicleFolderAtPath(path)} onClearRecentFolders={clearVehicleRecents} />}

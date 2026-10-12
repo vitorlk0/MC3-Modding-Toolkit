@@ -12,19 +12,25 @@
  *
  * The four arrays behind one category (`…Names`, `…Status`, `…Price`, `…Brand`) are parallel: item
  * *n* of each belongs to the same part, so they are only ever patched as a group.
+ *
+ * Which script: the one `+0xDC` points at, never the first one in the file. The VIP edits a flash by
+ * appending a bigger copy of the main script at the end and repointing `+0xDC`, leaving the old copy
+ * orphaned at the front (KB §20.6); a scan from the start of the file finds — and patches — a copy
+ * the game never runs. What the menus hold is read by running that script (src/avm1-run.ts), so an
+ * array the VIP rebuilt item by item reads the way the game sees it. A category whose `Push` in the
+ * live script still produces exactly that is patched in place, as above; one rebuilt after its
+ * `Push` can't be, and is redefined instead by appending a new script (src/avm1-append.ts), the
+ * VIP's own technique — the file then grows. Either way the result is run again before it's returned.
  */
 
-const ACTION_END = 0x00;
+import { rewriteFlashArrays } from "./avm1-append";
+import { readMainScript, runFlashArrays, sameScalars, scalarText, type AvmScalar, type FlashArrays } from "./avm1-run";
+
 const ACTION_POP = 0x17;
 const ACTION_END_DRAG = 0x28;
 const ACTION_PUSH_DUPLICATE = 0x4c;
 const ACTION_CONSTANT_POOL = 0x88;
 const ACTION_PUSH = 0x96;
-
-/** How far into the file the constant-pool scan looks, and how far the action walk may run. Both
- *  are the precedent tool's own limits — a real vs_*.pck puts its global pool near the front. */
-const POOL_SCAN_LIMIT = 0x40000;
-const ACTION_WALK_LIMIT = 0x200000;
 
 /** Named outright because a name alone can't always tell a physical part array from a paint or
  *  trim one, and getting that wrong would delete the wrong menu. */
@@ -71,7 +77,14 @@ export type ArrayDef = {
   constructorValue: PushValue;
 };
 
-export type FlashModel = { constantPool: string[]; arrays: Map<string, ArrayDef> };
+export type FlashModel = {
+  /** The live script's constant pool — the last one it declares. */
+  constantPool: string[];
+  /** Array initializers found as one `Push` in the live script; the last one wins per name. */
+  arrays: Map<string, ArrayDef>;
+  /** Every `_global` array as the live script leaves it — what the game shows. */
+  live: FlashArrays;
+};
 
 export type FlashMenuItem = { index: number; token: string };
 
@@ -108,8 +121,11 @@ export type FlashMenuCategory = {
 };
 export type FlashMenuAnalysis = { file: { name: string; size: number }; categories: FlashMenuCategory[]; totalItems: number };
 
-export type FlashMenuGroupReport = { array: string; oldCount: number; newCount: number; kept: string[]; removed: string[]; patchedArrays: string[] };
-export type FlashMenuReport = { originalSize: number; outputSize: number; categoriesChanged: number; itemsRemoved: number; groups: FlashMenuGroupReport[] };
+/** `inPlace`: the category's Push was rewritten where it stands. `appended`: it was redefined by a
+ *  script appended to the file, because the live script rebuilds it after its Push. */
+export type FlashMenuPatchMode = "inPlace" | "appended";
+export type FlashMenuGroupReport = { array: string; oldCount: number; newCount: number; kept: string[]; removed: string[]; patchedArrays: string[]; mode: FlashMenuPatchMode };
+export type FlashMenuReport = { originalSize: number; outputSize: number; categoriesChanged: number; itemsRemoved: number; appended: number; groups: FlashMenuGroupReport[] };
 
 function u16(bytes: Uint8Array, offset: number) {
   if (offset < 0 || offset + 2 > bytes.length) throw new Error(`Read past the end of the file at 0x${offset.toString(16)}.`);
@@ -136,54 +152,19 @@ function isString(value: PushValue["value"]): value is string { return typeof va
 export function displayItems(array: ArrayDef) { return [...array.internalItems].reverse(); }
 export function displayStrings(array: ArrayDef) { return displayItems(array).map((item) => String(item.value)); }
 
-/**
- * Reads a ConstantPool action at `offset`, returning its strings and the offset just past it —
- * which is where the action stream that uses those strings begins. Returns null for anything that
- * doesn't parse cleanly as one, since the scan below tries every 0x88 byte in the file.
- */
-function constantPoolAt(bytes: Uint8Array, offset: number): { pool: string[]; actionStart: number } | null {
-  if (offset < 0 || offset + 5 > bytes.length || bytes[offset] !== ACTION_CONSTANT_POOL) return null;
-  const length = u16(bytes, offset + 1);
-  const payloadOff = offset + 3;
-  const payloadEnd = payloadOff + length;
-  if (payloadEnd > bytes.length || length < 2) return null;
-  const count = u16(bytes, payloadOff);
-  let pos = payloadOff + 2;
+/** The strings of a ConstantPool action's payload. Every pool in the live script is decoded, so a
+ *  `Push` is read against the pool in force where it stands, the way the player reads it. */
+function poolStrings(payload: Uint8Array) {
+  const count = u16(payload, 0);
+  let pos = 2;
   const pool: string[] = [];
   for (let index = 0; index < count; index += 1) {
-    const end = indexOfZero(bytes, pos, payloadEnd);
-    if (end < 0) return null;
-    pool.push(latin1(bytes, pos, end));
+    const end = indexOfZero(payload, pos, payload.length);
+    if (end < 0) throw new Error("Damaged AVM1 constant pool.");
+    pool.push(latin1(payload, pos, end));
     pos = end + 1;
   }
-  // The declared count has to consume the payload exactly; anything left over means this 0x88 was
-  // a coincidence inside other data rather than a real pool.
-  return pos === payloadEnd ? { pool, actionStart: payloadEnd } : null;
-}
-
-/**
- * Finds the movie's global constant pool by scoring every candidate on how much it looks like the
- * one that defines the shop menus, rather than trusting the first that parses. A vs_*.pck holds
- * several pools; only one carries the `BodyUpgrade…Names` symbols this editor works on.
- */
-function findPool(bytes: Uint8Array): { pool: string[]; actionStart: number } {
-  const candidates: { score: number; offset: number; pool: string[]; actionStart: number }[] = [];
-  const scanEnd = Math.min(bytes.length, POOL_SCAN_LIMIT);
-  for (let offset = 0; offset < scanEnd; offset += 1) {
-    if (bytes[offset] !== ACTION_CONSTANT_POOL) continue;
-    const parsed = constantPoolAt(bytes, offset);
-    if (!parsed) continue;
-    const unique = new Set(parsed.pool);
-    let score = (unique.has("_global") ? 10 : 0) + (unique.has("Array") ? 10 : 0);
-    for (const value of parsed.pool) {
-      if (value.endsWith("Names")) score += 1;
-      if (value.startsWith("BodyUpgrade") && value.endsWith("Names")) score += 5;
-    }
-    if (score >= 25) candidates.push({ score, offset, pool: parsed.pool, actionStart: parsed.actionStart });
-  }
-  if (!candidates.length) throw new Error("Could not find the global AVM1 constant pool in this VS PCK.");
-  candidates.sort((a, b) => b.score - a.score || a.offset - b.offset);
-  return { pool: candidates[0].pool, actionStart: candidates[0].actionStart };
+  return pool;
 }
 
 /** Splits one `Push` action's payload into its values. Throws on anything malformed; the caller
@@ -240,54 +221,31 @@ function pushValues(payload: Uint8Array, pool: string[]): PushValue[] {
   return values;
 }
 
-/** Walks the action stream from `start` to its End opcode, recording each action's exact extent. */
-function actions(bytes: Uint8Array, start: number): ActionRecord[] {
-  const result: ActionRecord[] = [];
-  let pos = start;
-  const hardEnd = Math.min(bytes.length, start + ACTION_WALK_LIMIT);
-  while (pos < hardEnd) {
-    const off = pos;
-    const opcode = bytes[pos];
-    pos += 1;
-    let payloadLen = 0;
-    let payloadOff = pos;
-    let endOff = pos;
-    let payload = new Uint8Array(0);
-    // Opcodes with the high bit set carry a u16 length and a payload; the rest are bare.
-    if (opcode >= 0x80) {
-      payloadLen = u16(bytes, pos);
-      pos += 2;
-      payloadOff = pos;
-      endOff = pos + payloadLen;
-      if (endOff > hardEnd) throw new Error(`AVM1 action at 0x${off.toString(16).toUpperCase()} exceeds file`);
-      payload = bytes.slice(payloadOff, endOff);
-      pos = endOff;
-    }
-    result.push({ off, opcode, payloadOff, payloadLen, endOff, payload });
-    if (opcode === ACTION_END) return result;
-  }
-  throw new Error("AVM1 action stream has no End opcode within the scan window.");
-}
-
 /**
- * Builds the model of every `Array` initializer in the movie.
+ * Builds the model of the movie's main script — the one `+0xDC` points at.
  *
- * The shape being matched is one `Push` that stacks: the array's variable name, its items, an i32
- * item count, and the constant `"Array"`. Requiring the count to agree with the number of items is
- * what keeps unrelated pushes out.
+ * `live` is that script run to its End: the arrays as the game builds them. `arrays` are the `Push`
+ * actions that look like an initializer — one `Push` that stacks the array's variable name, its
+ * items, an i32 item count, and the constant `"Array"`. Requiring the count to agree with the number
+ * of items is what keeps unrelated pushes out. Only those can be patched in place, and only when
+ * they still produce what `live` holds (see `inPlaceDef`).
  */
-export function parseModel(bytes: Uint8Array): FlashModel {
-  const { pool, actionStart } = findPool(bytes);
+export function parseModel(bytes: Uint8Array, name = "VS PCK"): FlashModel {
+  const script = readMainScript(bytes, name);
+  const live = runFlashArrays(bytes, name);
   const arrays = new Map<string, ArrayDef>();
-  for (const action of actions(bytes, actionStart)) {
-    if (action.opcode !== ACTION_PUSH) continue;
+  let pool: string[] = [];
+  for (const { offset, opcode, payload, size } of script.actions) {
+    if (opcode === ACTION_CONSTANT_POOL) { pool = poolStrings(payload); continue; }
+    if (opcode !== ACTION_PUSH) continue;
     let values: PushValue[];
-    try { values = pushValues(action.payload, pool); } catch { continue; }
+    try { values = pushValues(payload, pool); } catch { continue; }
     if (values.length < 4 || !isString(values[0].value) || values[values.length - 1].value !== "Array") continue;
     const countValue = values[values.length - 2];
     const items = values.slice(1, values.length - 2);
     if (countValue.typeId !== 7 || countValue.value !== items.length) continue;
     if (!items.every((item) => isString(item.value))) continue;
+    const action: ActionRecord = { off: offset, opcode, payloadOff: offset + 3, payloadLen: payload.length, endOff: offset + size, payload: payload.slice() };
     arrays.set(String(values[0].value), {
       name: String(values[0].value),
       action,
@@ -297,12 +255,28 @@ export function parseModel(bytes: Uint8Array): FlashModel {
       constructorValue: values[values.length - 1],
     });
   }
-  if (!arrays.size) throw new Error("No AVM1 Array initializers were detected in the VS PCK.");
-  return { constantPool: pool, arrays };
+  if (!live.size) throw new Error("No AVM1 arrays are defined by this VS PCK's main script.");
+  return { constantPool: script.pool, arrays, live };
+}
+
+/** An array's items as the menu shows them, as text. */
+function liveTokens(model: FlashModel, name: string) { return (model.live.get(name) ?? []).map(scalarText); }
+
+/**
+ * The `Push` that can be patched in place for `name`: one whose items are exactly what the running
+ * script leaves in the array. A VIP file that rebuilds the array after its `Push` (`new Array(0)`,
+ * then item by item) fails this, and that category is redefined by an appended script instead.
+ */
+function inPlaceDef(model: FlashModel, name: string) {
+  const array = model.arrays.get(name);
+  const live = model.live.get(name);
+  if (!array || !live || array.internalItems.length !== live.length) return null;
+  const shown = displayItems(array);
+  return shown.every((item, index) => live[index].kind === "string" && (live[index] as { value: string }).value === item.value) ? array : null;
 }
 
 /** Whether an array drives a physical part menu — the only kind this editor will shorten. */
-function isPhysical(name: string, array: ArrayDef) {
+function isPhysical(name: string, tokens: string[]) {
   if (EXCLUDED_NAMES_ARRAYS.has(name)) return false;
   if (EXACT_PHYSICAL_ARRAYS.has(name)) return true;
   const lower = name.toLowerCase();
@@ -312,7 +286,6 @@ function isPhysical(name: string, array: ArrayDef) {
   }
   // Unrecognized BodyUpgrade array: accept it only when every item reads like a mesh token
   // (underscored, no spaces), which is what distinguishes part names from display labels.
-  const tokens = displayStrings(array);
   return tokens.length >= 2 && tokens.every((token) => token.includes("_") && !token.includes(" ")) && name.startsWith("BodyUpgrade");
 }
 
@@ -323,17 +296,16 @@ function label(name: string) {
   return stripped.replace(/(?<!^)(?=[A-Z])/g, " ").trim() || name;
 }
 
-/** The parallel arrays that must be patched together with `array`, itself included, in patch order. */
-function companionNames(model: FlashModel, array: ArrayDef) {
-  const names = [array.name];
-  const base = array.name.slice(0, -5);
+/** The parallel arrays that must be patched together with `name`, itself included, in patch order. */
+function companionNames(model: FlashModel, name: string) {
+  const names = [name];
+  const count = model.live.get(name)?.length ?? 0;
+  const base = name.slice(0, -5);
   for (const suffix of PARALLEL_SUFFIXES) {
-    const candidate = model.arrays.get(base + suffix);
+    const candidate = model.live.get(base + suffix);
     if (!candidate) continue;
-    if (candidate.internalItems.length !== array.internalItems.length) {
-      throw new Error(`${array.name}: companion ${candidate.name} has a different item count.`);
-    }
-    names.push(candidate.name);
+    if (candidate.length !== count) throw new Error(`${name}: companion ${base + suffix} has a different item count.`);
+    names.push(base + suffix);
   }
   return names;
 }
@@ -366,7 +338,9 @@ function tokenFamily(token: string) {
   return `${head}_${(/^[a-z]+/.exec(segments[1]) ?? [""])[0]}`;
 }
 
-function describeRemoval(bytes: Uint8Array, array: ArrayDef, orphansByFamily: Map<string, string[]>): FlashMenuRemoval | null {
+/** Only a category patched in place leaves this trace; one an appended script redefined doesn't. */
+function describeRemoval(bytes: Uint8Array, array: ArrayDef | null, orphansByFamily: Map<string, string[]>): FlashMenuRemoval | null {
+  if (!array) return null;
   const paddingBytes = paddingRunAt(bytes, array.action.endOff);
   if (!paddingBytes) return null;
   // Each removed entry gave back exactly its own encoding, so the freed space divided by one
@@ -383,15 +357,15 @@ function describeRemoval(bytes: Uint8Array, array: ArrayDef, orphansByFamily: Ma
 
 /** Reads the physical part menus out of a `vs_*.pck`, without modifying anything. */
 export function analyzeFlashMenu(name: string, source: Uint8Array): FlashMenuAnalysis {
-  const model = parseModel(source);
-  const physical = [...model.arrays.values()].filter((array) => isPhysical(array.name, array));
-  physical.sort((a, b) => a.action.off - b.action.off);
+  const model = parseModel(source, name);
+  // In the order the script first defines them, which is the order of their Push actions.
+  const physical = [...model.live.keys()].filter((array) => isPhysical(array, liveTokens(model, array)));
   if (!physical.length) throw new Error("No physical part arrays were detected in the selected VS PCK.");
   // A pool name no array points at is a name nothing can show — either an entry a previous edit took
   // out, or (in a few stock files) a part that was never offered for this car. Grouped by family so
   // each category can claim the ones that look like its own.
   const referenced = new Set<string>();
-  for (const array of model.arrays.values()) for (const token of displayStrings(array)) referenced.add(token);
+  for (const array of model.live.keys()) for (const token of liveTokens(model, array)) referenced.add(token);
   const orphansByFamily = new Map<string, string[]>();
   for (const token of new Set(model.constantPool)) {
     if (referenced.has(token)) continue;
@@ -399,12 +373,12 @@ export function analyzeFlashMenu(name: string, source: Uint8Array): FlashMenuAna
     orphansByFamily.set(family, [...(orphansByFamily.get(family) ?? []), token]);
   }
   const categories = physical.map((array) => ({
-    array: array.name,
-    label: label(array.name),
-    count: array.internalItems.length,
+    array,
+    label: label(array),
+    count: model.live.get(array)!.length,
     companions: companionNames(model, array),
-    items: displayStrings(array).map((token, index) => ({ index, token })),
-    removal: describeRemoval(source, array, orphansByFamily),
+    items: liveTokens(model, array).map((token, index) => ({ index, token })),
+    removal: describeRemoval(source, inPlaceDef(model, array), orphansByFamily),
   }));
   return {
     file: { name, size: source.length },
@@ -462,47 +436,66 @@ function patchArray(bytes: Uint8Array, array: ArrayDef, keepIndices: number[]) {
  *
  * `keepMap` is keyed by the `…Names` array; its companions come along automatically. Categories
  * where nothing was removed are skipped rather than rewritten, so an untouched menu keeps its
- * original bytes exactly. The result is re-parsed and checked against what was asked for before it
- * is returned — a movie that no longer parses never reaches the caller.
+ * original bytes exactly.
+ *
+ * A category is patched in place when every one of its arrays has a `Push` in the live script that
+ * still produces it; otherwise the group is redefined by one script appended to the file. The result
+ * is then run, and every array has to come out as asked — edited ones holding exactly the kept items
+ * in display order, all others unchanged — or nothing is returned. An in-place group that fails that
+ * (the script touches the array again after its Push) is retried through the appended script once.
  */
-export function patchFlashMenu(source: Uint8Array, keepMap: Map<string, number[]> | Record<string, number[]>) {
-  const bytes = source.slice();
-  const model = parseModel(bytes);
+export function patchFlashMenu(source: Uint8Array, keepMap: Map<string, number[]> | Record<string, number[]>, name = "VS PCK") {
+  const model = parseModel(source, name);
   const entries = keepMap instanceof Map ? [...keepMap] : Object.entries(keepMap);
-  const groups: FlashMenuGroupReport[] = [];
+  const plans: { group: Omit<FlashMenuGroupReport, "mode">; indices: number[] }[] = [];
   for (const [arrayName, keepIndices] of entries) {
-    const array = model.arrays.get(arrayName);
-    if (!array || !isPhysical(arrayName, array)) throw new Error(`Physical menu array not found: ${arrayName}`);
-    const count = array.internalItems.length;
+    const live = model.live.get(arrayName);
+    if (!live || !isPhysical(arrayName, liveTokens(model, arrayName))) throw new Error(`Physical menu array not found: ${arrayName}`);
+    const count = live.length;
     const indices = [...new Set(keepIndices.map((index) => Math.trunc(index)))].sort((a, b) => a - b);
     if (!indices.length) throw new Error(`${arrayName}: at least one item must remain`);
     if (indices.some((index) => index < 0 || index >= count)) throw new Error(`${arrayName}: item index outside the array`);
     if (indices.length === count) continue;
-    const companions = companionNames(model, array);
-    const tokens = displayStrings(array);
+    const companions = companionNames(model, arrayName);
+    const tokens = liveTokens(model, arrayName);
     const kept = indices.map((index) => tokens[index]);
     const removed = tokens.filter((_, index) => !indices.includes(index));
-    for (const companion of companions) patchArray(bytes, model.arrays.get(companion)!, indices);
-    groups.push({ array: arrayName, oldCount: count, newCount: indices.length, kept, removed, patchedArrays: companions });
+    plans.push({ group: { array: arrayName, oldCount: count, newCount: indices.length, kept, removed, patchedArrays: companions }, indices });
   }
-  if (!groups.length) throw new Error("No menu items were disabled.");
-  const validated = parseModel(bytes);
-  for (const group of groups) {
-    for (const name of group.patchedArrays) {
-      const array = validated.arrays.get(name);
-      if (!array || array.internalItems.length !== group.newCount) throw new Error(`Validation failed for patched array: ${name}`);
-    }
-    const shown = displayStrings(validated.arrays.get(group.array)!);
-    if (shown.length !== group.kept.length || shown.some((token, index) => token !== group.kept[index])) {
-      throw new Error(`Validation failed: display order changed in ${group.array}`);
-    }
+  if (!plans.length) throw new Error("No menu items were disabled.");
+
+  const expected = new Map<string, AvmScalar[]>(model.live);
+  for (const { group, indices } of plans) {
+    for (const array of group.patchedArrays) expected.set(array, indices.map((index) => model.live.get(array)![index]));
   }
-  const report: FlashMenuReport = {
-    originalSize: source.length,
-    outputSize: bytes.length,
-    categoriesChanged: groups.length,
-    itemsRemoved: groups.reduce((sum, group) => sum + group.removed.length, 0),
-    groups,
-  };
-  return { bytes, report };
+  const appended = new Set(plans.filter(({ group }) => group.patchedArrays.some((array) => !inPlaceDef(model, array))).map(({ group }) => group.array));
+  for (let attempt = 0; ; attempt += 1) {
+    const bytes = source.slice();
+    for (const { group, indices } of plans) {
+      if (appended.has(group.array)) continue;
+      for (const array of group.patchedArrays) patchArray(bytes, inPlaceDef(model, array)!, indices);
+    }
+    const redefined = plans.filter(({ group }) => appended.has(group.array))
+      .flatMap(({ group }) => group.patchedArrays.map((array): [string, AvmScalar[]] => [array, expected.get(array)!]));
+    const output = redefined.length ? rewriteFlashArrays(bytes, redefined, name).bytes : bytes;
+
+    const after = runFlashArrays(output, name);
+    const wrong = [...expected].filter(([array, items]) => !sameScalars(after.get(array) ?? [], items)).map(([array]) => array);
+    if (after.size !== expected.size) throw new Error(`${name}: the set of menu arrays changed after the patch.`);
+    if (!wrong.length) {
+      const groups = plans.map(({ group }): FlashMenuGroupReport => ({ ...group, mode: appended.has(group.array) ? "appended" : "inPlace" }));
+      const report: FlashMenuReport = {
+        originalSize: source.length,
+        outputSize: output.length,
+        categoriesChanged: groups.length,
+        itemsRemoved: groups.reduce((sum, group) => sum + group.removed.length, 0),
+        appended: appended.size,
+        groups,
+      };
+      return { bytes: output, report };
+    }
+    const retry = plans.filter(({ group }) => !appended.has(group.array) && group.patchedArrays.some((array) => wrong.includes(array)));
+    if (attempt > 0 || !retry.length) throw new Error(`Validation failed: ${wrong.join(", ")} didn't come out as expected after the patch.`);
+    for (const { group } of retry) appended.add(group.array);
+  }
 }

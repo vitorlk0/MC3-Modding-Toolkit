@@ -9,6 +9,8 @@ import { DatBuilderTool } from "./dat-builder-tool";
 import { CompactIsoTool } from "./compact-iso-tool";
 import { CleanerTool } from "./cleaner-tool";
 import { ExhaustTool } from "./exhaust-tool";
+import { NeonTool } from "./neon-tool";
+import { SlotRetargetTool } from "./slot-retarget-tool";
 import { basename } from "./toolkit-io";
 
 /**
@@ -20,9 +22,10 @@ import { basename } from "./toolkit-io";
  * is why an unsaved tool asks first.
  */
 
-type ToolId = "injector" | "id-sync" | "flash-menu" | "carcfg" | "parts-mapper" | "cleaner" | "dat-builder" | "compact-iso" | "exhausts";
+type ToolId = "injector" | "id-sync" | "flash-menu" | "carcfg" | "parts-mapper" | "cleaner" | "dat-builder" | "compact-iso" | "exhausts" | "neon" | "slot-retarget";
 type ToolStatus = "active" | "next" | "planned";
-type Tool = { id: ToolId; number: string; name: string; blurb: string; status: ToolStatus };
+/** `experimental`: works in the app but hasn't been tested in game yet. */
+type Tool = { id: ToolId; number: string; name: string; blurb: string; status: ToolStatus; experimental?: boolean };
 
 const tools: Tool[] = [
   { id: "parts-mapper", number: "01", name: "Flash Parts Mapper", blurb: "List the Visual Shop parts in menu order", status: "active" },
@@ -34,6 +37,8 @@ const tools: Tool[] = [
   { id: "dat-builder", number: "07", name: "Vehicle DAT Builder", blurb: "Pack a car folder into its vp_*.dat", status: "active" },
   { id: "compact-iso", number: "08", name: "Compact ISO", blurb: "Pack the original dual-layer ISO into one layer", status: "active" },
   { id: "exhausts", number: "09", name: "Exhaust Tips", blurb: "Turn rear-bumper exhaust tips on or off", status: "active" },
+  { id: "neon", number: "10", name: "Neon & Shadow", blurb: "Resize the colored neon and the ground shadow", status: "active" },
+  { id: "slot-retarget", number: "11", name: "Slot Retarget", blurb: "Move a car mod onto another car's slot", status: "active", experimental: true },
 ];
 
 const statusBadges: Record<ToolStatus, string | null> = { active: null, next: "NEXT", planned: "SOON" };
@@ -66,6 +71,7 @@ export function ModToolkitWorkspace({ onStatus, dirtyVehiclePaths, dropped, onCo
   const idSyncPending = useCallback((value: boolean) => setPending("id-sync", value), [setPending]);
   const cleanerPending = useCallback((value: boolean) => setPending("cleaner", value), [setPending]);
   const exhaustsPending = useCallback((value: boolean) => setPending("exhausts", value), [setPending]);
+  const neonPending = useCallback((value: boolean) => setPending("neon", value), [setPending]);
 
   const selectTool = async (tool: Tool) => {
     if (tool.status !== "active" || tool.id === activeTool) return;
@@ -95,6 +101,7 @@ export function ModToolkitWorkspace({ onStatus, dirtyVehiclePaths, dropped, onCo
         <span className="toolkit-nav-number">{tool.number}</span>
         <span className="toolkit-nav-copy"><strong>{tr(tool.name)}</strong><small>{tr(tool.blurb)}</small></span>
         {statusBadges[tool.status] && <span className="toolkit-nav-badge">{statusBadges[tool.status]}</span>}
+        {tool.experimental && <span className="toolkit-nav-badge experimental" title={tr("Not tested in game yet")}>{tr("Experimental")}</span>}
       </button>)}
       <div className="toolkit-nav-note">
         <strong>{tr("Loose files")}</strong>
@@ -105,7 +112,7 @@ export function ModToolkitWorkspace({ onStatus, dirtyVehiclePaths, dropped, onCo
     <main className="toolkit-main">
       <header className="toolkit-main-head">
         <p className="eyebrow"><Tx t="TOOL {0}" v={[active.number]} /></p>
-        <h1>{tr(active.name)}</h1>
+        <h1>{tr(active.name)}{active.experimental && <span className="toolkit-nav-badge experimental" title={tr("Not tested in game yet")}>{tr("Experimental")}</span>}</h1>
       </header>
       {activeTool === "flash-menu" && <FlashMenuTool
         dropped={dropped}
@@ -158,6 +165,18 @@ export function ModToolkitWorkspace({ onStatus, dirtyVehiclePaths, dropped, onCo
         onStatus={onStatus}
         isPathBlocked={isPathBlocked}
         onPendingChange={exhaustsPending}
+      />}
+      {activeTool === "neon" && <NeonTool
+        dropped={dropped}
+        onConsumeDrop={onConsumeDrop}
+        onStatus={onStatus}
+        isPathBlocked={isPathBlocked}
+        onPendingChange={neonPending}
+      />}
+      {activeTool === "slot-retarget" && <SlotRetargetTool
+        dropped={dropped}
+        onConsumeDrop={onConsumeDrop}
+        onStatus={onStatus}
       />}
       {activeTool === "id-sync" && <IdSyncTool
         dropped={dropped}

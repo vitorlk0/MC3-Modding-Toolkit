@@ -1,11 +1,10 @@
 import { tr, Tx } from "../i18n";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
-import { join } from "@tauri-apps/api/path";
 import { readDir } from "@tauri-apps/plugin-fs";
 import { PckDocument } from "../../src/pck";
 import { applyExhaustChoices, readExhaustSetup, type ExhaustChoices, type ExhaustEditResult, type ExhaustGroup, type ExhaustSetup } from "../../src/exhausts";
-import { basename, isMeshPckName, parentPath, readToolkitFile, writeVerified, type ToolkitFile } from "./toolkit-io";
+import { basename, findCarFiles, parentPath, readToolkitFile, writeVerified, type CarRole, type ToolkitFile } from "./toolkit-io";
 import { RecentList } from "./toolkit-ui";
 import { loadRecent, pushRecent, saveRecent } from "../recent-paths";
 
@@ -20,26 +19,9 @@ import { loadRecent, pushRecent, saveRecent } from "../recent-paths";
  */
 
 const RECENTS_KEY = "mc3pae.recentExhaustFolders";
-const ROLES = [["player", "", "Player"], ["garage", "_g", "Garage"], ["opponent", "_o", "Opponent"]] as const;
-type Role = typeof ROLES[number][0];
-type Loaded = ToolkitFile & { role: Role; label: string; setup: ExhaustSetup };
+type Loaded = ToolkitFile & { role: CarRole; label: string; setup: ExhaustSetup };
 type Car = { folder: string; base: string; files: Loaded[] };
 type Row = { group: ExhaustGroup; locked: string | null; warnings: string[] };
-
-/** Finds `<car>.pck`, `<car>_g.pck` and `<car>_o.pck` directly inside a folder. */
-async function findCarFiles(folder: string) {
-  const names = (await readDir(folder)).filter((entry) => !entry.isDirectory && /\.pck$/i.test(entry.name) && !isMeshPckName(entry.name)).map((entry) => entry.name);
-  const bases = new Set(names.map((name) => name.replace(/(_g|_o)?\.pck$/i, "")));
-  const folderName = basename(folder).toLowerCase();
-  const base = [...bases].find((item) => item.toLowerCase() === folderName) ?? (bases.size === 1 ? [...bases][0] : null);
-  if (!base) throw new Error(`Couldn't tell which car this is: ${basename(folder)} holds ${bases.size ? [...bases].join(", ") : "no car PCK"}. Open the car's own folder.`);
-  const found: { role: Role; label: string; path: string }[] = [];
-  for (const [role, suffix, label] of ROLES) {
-    const name = names.find((item) => item.toLowerCase() === `${base}${suffix}.pck`.toLowerCase());
-    if (name) found.push({ role, label, path: await join(folder, name) });
-  }
-  return { base, found };
-}
 
 const sideLabel = (group: { left: boolean; right: boolean }) => group.left && group.right ? "L+R" : group.left ? "L" : group.right ? "R" : "none";
 

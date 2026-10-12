@@ -397,7 +397,7 @@ function packStripsIntoBlocks(strips: VertexRef[][]): BlockRecord[][] {
 
 /** MC3's per-packet culling data: the Y/Z midpoint of the quantized vertices and half the full
  *  3D AABB diagonal as a radius. Computed from the bytes actually written, not the source floats. */
-function packetCullingBounds(vertexBytes: number[], packetScale: number): Vec3 {
+export function packetCullingBounds(vertexBytes: ArrayLike<number>, packetScale: number): Vec3 {
   const view = new DataView(new Uint8Array(vertexBytes).buffer);
   let minX = Infinity, minY = Infinity, minZ = Infinity;
   let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;

@@ -31,6 +31,7 @@ const categoryLabels: Record<ModCategory, { title: string; blurb: string }> = {
   dat: { title: "Vehicle DAT", blurb: "player, opponent & parts" },
   flash: { title: "Flash menus", blurb: "ds / ms / ps / vs" },
   carcfg: { title: "Carcfg", blurb: "opponent variations" },
+  tune: { title: "Tune", blurb: "cameras, damage, garage" },
 };
 
 type CarCard = {
@@ -43,7 +44,7 @@ type CarCard = {
 
 type Progress = { phase: string; done: number; total: number };
 
-const allOn = (): Record<ModCategory, boolean> => ({ garage: true, dat: true, flash: true, carcfg: true });
+const allOn = (): Record<ModCategory, boolean> => ({ garage: true, dat: true, flash: true, carcfg: true, tune: true });
 const megabytes = (bytes: number) => `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 
 export function IsoInstallWorkspace({ dropped, onConsumeDrop, onStatus, onBusyChange }: {
@@ -215,7 +216,7 @@ export function IsoInstallWorkspace({ dropped, onConsumeDrop, onStatus, onBusyCh
       <section className="toolkit-hero iso-hero">
         <div>
           <h2>{tr("Put finished car mods into a compiled ISO")}</h2>
-          <p className="toolkit-hero-copy"><Tx t="Add mod ZIPs — one car each — and they are written into {0} of the opened ISO, replacing the original car. The {1} and the {2} are required; {3} and {4} files are installed when the package has them. Textures, readmes and scripts in a package are ignored." v={[<code>ASSETS.DAT</code>, <strong>{tr("garage PCK")}</strong>, <strong>{tr("vehicle DAT")}</strong>, <strong>{tr("flash menus")}</strong>, <strong>{tr("carcfg")}</strong>]} /></p>
+          <p className="toolkit-hero-copy"><Tx t="Add mod ZIPs — one car each — and they are written into {0} of the opened ISO, replacing the original car. The {1} and the {2} are required; {3}, {4} and {5} files are installed when the package has them. Textures, readmes and scripts in a package are ignored." v={[<code>ASSETS.DAT</code>, <strong>{tr("garage PCK")}</strong>, <strong>{tr("vehicle DAT")}</strong>, <strong>{tr("flash menus")}</strong>, <strong>{tr("carcfg")}</strong>, <strong>{tr("tune")}</strong>]} /></p>
         </div>
         <div className="toolkit-facts">
           <div><span>{tr("INPUT")}</span><strong>{tr(".iso + mod .zip / folder")}</strong></div>
@@ -345,7 +346,7 @@ function CarCardView({ card, report, hasIso, busy, onToggle, onRemove }: {
         const count = category === "dat" || category === "garage" ? null : `${counted.length}${expected !== undefined ? `/${expected}` : ""}${extras ? ` +${extras}` : ""}`;
         return <label key={category} className={`iso-kind ${present ? "" : "missing"} ${partial ? "partial" : ""}`} title={present ? files.map((file) => file.name).join("\n") : tr("Not in this package")}>
           <input type="checkbox" checked={present && card.enabled[category]} disabled={!present || refused || busy} onChange={() => onToggle(category)} />
-          <span><strong>{tr(categoryLabels[category].title)}{count && <em>{count}</em>}</strong><small>{!present ? tr("Not in package") : files[0].compiledFrom ? tr(`compiled from ${files[0].compiledFrom} PCKs`) : categoryLabels[category].blurb}</small></span>
+          <span><strong>{tr(categoryLabels[category].title)}{count && <em>{count}</em>}</strong><small>{!present ? tr("Not in package") : files[0].compiledFrom ? tr(`compiled from ${files[0].compiledFrom} PCKs`) : tr(categoryLabels[category].blurb)}</small></span>
         </label>;
       })}
     </div>

@@ -10,12 +10,15 @@ import { buildVehicleDat, findVehicleFolders } from "./dave-build";
 /**
  * ISO Install — writes finished car mods into ASSETS.DAT of a compiled MC3 PS2 image.
  *
- * A mod replaces an existing car. Four kinds of file are recognised by name, wherever they sit in
+ * A mod replaces an existing car. Five kinds of file are recognised by name, wherever they sit in
  * the package, and each lands at its fixed ASSETS path:
  *   DAT     vp_x.dat               → vp_x.dat                                  (required)
  *   Garage  vp_x_g.pck             → resources/vehicle/vp_x/vp_x_g.pck          (required)
  *   Flash   ds_|ms_|ps_|vs_|reward_vp_x.pck → flash/…                           (optional)
  *   Carcfg  vp_x.carcfg, vp_x_N.carcfg → tune/vehicle/customdata/…             (optional)
+ *   Tune    vp_x_chase1..4.camtrackcs, _pov.campovcs, _reverse.camtrackcs → tune/camera/…,
+ *           vp_x.mcgarage → tune/garage/…, vp_x.damage and default.mccarcustom (the latter only
+ *           inside a vp_x folder) → tune/vehicle/customdata/vp_x/…                (optional)
  * A HostFS-style package has no vp_x.dat but the DAT's contents loose in a folder (vp_x.pck,
  * vp_x_o.pck and the parts): the DAT is then compiled from that folder (src/dave-build.ts). When a
  * vp_x.dat is present it always wins and loose vehicle PCKs are ignored.
@@ -35,8 +38,8 @@ import { buildVehicleDat, findVehicleFolders } from "./dave-build";
 // ---------------------------------------------------------------------------------------------
 // Package detection
 
-export type ModCategory = "dat" | "garage" | "flash" | "carcfg";
-export const CATEGORY_ORDER: ModCategory[] = ["garage", "dat", "flash", "carcfg"];
+export type ModCategory = "dat" | "garage" | "flash" | "carcfg" | "tune";
+export const CATEGORY_ORDER: ModCategory[] = ["garage", "dat", "flash", "carcfg", "tune"];
 
 export type PackageFile = { path: string; size: number; read: () => Promise<Uint8Array> };
 export type ModFile = {
@@ -62,8 +65,20 @@ export function targetFor(category: ModCategory, car: string, name: string) {
     case "garage": return `resources/vehicle/${car}/${car}_g.pck`;
     case "flash": return `flash/${name}`;
     case "carcfg": return `tune/vehicle/customdata/${name}`;
+    case "tune":
+      if (/\.(camtrackcs|campovcs)$/.test(name)) return `tune/camera/${name}`;
+      if (name.endsWith(".mcgarage")) return `tune/garage/${name}`;
+      return `tune/vehicle/customdata/${car}/${name}`;
   }
 }
+
+/** The per-car tune files (cameras, garage cameras, damage, default customisation) as a pattern. */
+const tunePattern = (escapedCar: string) => new RegExp(`^${escapedCar}(_chase[1-4]\\.camtrackcs|_pov\\.campovcs|_reverse\\.camtrackcs|\\.mcgarage|\\.damage)$`);
+/** default.mccarcustom carries no car name: it belongs to the car whose folder holds it. */
+const isCarCustom = (path: string, car: string) => {
+  const parts = path.replace(/\\/g, "/").toLowerCase().split("/");
+  return parts[parts.length - 1] === "default.mccarcustom" && parts[parts.length - 2] === car;
+};
 
 /**
  * Sorts a package's files into the four installable kinds. Throws — with the reason as the message —
@@ -89,6 +104,7 @@ export async function detectPackage(source: string, files: PackageFile[]): Promi
     ["garage", new RegExp(`^${escaped}_g\\.pck$`)],
     ["flash", new RegExp(`^(ds|ms|ps|vs|reward)_${escaped}\\.pck$`)],
     ["carcfg", new RegExp(`^${escaped}(_\\d+)?\\.carcfg$`)],
+    ["tune", tunePattern(escaped)],
   ];
   const otherCar = new RegExp(`^((ds|ms|ps|vs|reward)_)?${CAR_ID}(_\\d+)?\\.(pck|carcfg|dat)$`);
   // The DAT's contents, when the package carries them loose (HostFS layout).
@@ -103,7 +119,7 @@ export async function detectPackage(source: string, files: PackageFile[]): Promi
   for (const file of files) {
     const name = lower(file);
     if (looseVehicle.has(file.path)) continue;
-    const match = patterns.find(([, pattern]) => pattern.test(name));
+    const match = patterns.find(([, pattern]) => pattern.test(name)) ?? (isCarCustom(file.path, car) ? ["tune", null] as const : undefined);
     if (!match) {
       if (otherCar.test(name)) throw new Error(`${baseName(file.path)} belongs to a different car than ${car}. Put one car per ZIP.`);
       ignored.push(file.path);
@@ -218,9 +234,11 @@ export function checkPackage(session: IsoSession, pkg: ModPackage): CarReport {
   const expectedFlash = keys.filter((key) => new RegExp(`^flash/(ds|ms|ps|vs)_${car}\\.pck$`).test(key)).length;
   // Only the numbered opponent variants count towards a complete set; the plain vp_x.carcfg is optional.
   const expectedCarcfg = keys.filter((key) => new RegExp(`^tune/vehicle/customdata/${car}_\\d+\\.carcfg$`).test(key)).length;
+  const tune = tunePattern(car.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  const expectedTune = keys.filter((key) => tune.test(key.replace(/^.*\//, "")) || isCarCustom(key, car)).length;
   const categories = Object.fromEntries(CATEGORY_ORDER.map((category) => [category, {
     category, files: [] as ModFile[],
-    expected: category === "flash" ? expectedFlash : category === "carcfg" ? expectedCarcfg : 1,
+    expected: category === "flash" ? expectedFlash : category === "carcfg" ? expectedCarcfg : category === "tune" ? expectedTune : 1,
   }])) as Record<ModCategory, CategoryReport>;
   for (const file of pkg.files) {
     if (!session.byName.has(daveKey(file.target))) {
@@ -277,9 +295,10 @@ const record12 = (offset: number, full: number, stored: number) => {
   return out;
 };
 
-/** Only .carcfg is stored compressed, and only where the original entry is — vehicle DATs, PCKs and
- *  flash stay raw like the original game keeps them. */
-const shouldCompress = (file: ModFile, entries: DaveEntry[]) => file.category === "carcfg" && entries.every(isCompressed);
+/** The text tune files (.carcfg, cameras, .mcgarage, .damage, .mccarcustom) are stored compressed,
+ *  and only where the original entry is — vehicle DATs, PCKs and flash stay raw like the original
+ *  game keeps them. */
+const shouldCompress = (file: ModFile, entries: DaveEntry[]) => (file.category === "carcfg" || file.category === "tune") && entries.every(isCompressed);
 
 export async function buildPlan(session: IsoSession, selections: { car: string; files: ModFile[] }[]): Promise<InstallPlan> {
   const { archive, assets, iso } = session;
