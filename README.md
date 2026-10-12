@@ -27,8 +27,8 @@ dropped onto the window. Keep a backup of your files anyway.
 
 | Tab | What it does |
 | --- | --- |
-| **Tools** | Loose-file tools: Visual Shop menu editor, Carcfg Randomizer, Flash Parts Mapper, Car PCK Mesh Injector, Mesh ID Sync, Car PCK Cleaner, Vehicle DAT Builder and Compact ISO |
-| **Anchors** | Anchor positions with a 3D preview, multi-select, mirroring and wheel/exhaust sync |
+| **Tools** | Loose-file tools: Visual Shop menu editor, Carcfg Randomizer, Flash Parts Mapper, Car PCK Mesh Injector, Mesh ID Sync, Car PCK Cleaner, Vehicle DAT Builder, Compact ISO, Exhaust Tips, Neon & Shadow and Slot Retarget (experimental) |
+| **Anchors** | Anchor positions with a 3D preview, multi-select, mirroring and wheel/exhaust sync, plus the garage shop cameras |
 | **Meshes** | Piece IDs, shader IDs, re-embedding loose `mesh.pck` files and OBJ export |
 | **Performance** | Vehicle physics and performance values across all three PCKs at once |
 | **Textures** | Finds, previews and replaces PS2 textures in a PCK |
