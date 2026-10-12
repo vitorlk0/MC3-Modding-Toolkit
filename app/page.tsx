@@ -1219,6 +1219,21 @@ export default function App() {
     refresh();
     if (mode === "scrub-commit") setStatus(`${moves.length} anchor${moves.length === 1 ? "" : "s"} moved · preview refreshed`);
   }, [document, refresh]);
+  // The rotate gizmo: same shape as moveSelection, with rotations in radians. The start values
+  // are the exact stored angles, so rewinding before the recorded batch restores their bits.
+  const rotateSelection = useCallback((moves: { index: number; value: Vec3 }[], mode: "preview" | "scrub-commit", startMoves?: { index: number; value: Vec3 }[]) => {
+    if (!document?.rotationEditable) return;
+    let changed = false;
+    if (mode === "scrub-commit" && startMoves) {
+      document.setAnchorRotationBatch(startMoves.map((move) => ({ index: move.index, rotation: move.value })), false);
+      changed = document.setAnchorRotationBatch(moves.map((move) => ({ index: move.index, rotation: move.value }))) > 0;
+    } else {
+      changed = document.setAnchorRotationBatch(moves.map((move) => ({ index: move.index, rotation: move.value })), false) > 0;
+    }
+    if (!changed) return;
+    refresh();
+    if (mode === "scrub-commit") setStatus(`${moves.length} anchor${moves.length === 1 ? "" : "s"} rotated · preview refreshed`);
+  }, [document, refresh]);
   const mirrorSelection = useCallback(() => {
     if (!document) return;
     const indices = [...selectedIndices];
@@ -1587,7 +1602,7 @@ export default function App() {
         </div>
       </section>}
       <ResizeHandle variant="resize-editor" onDrag={resizeEditor} />
-      <MeshViewer document={document} selected={selected} multiSelected={selectedIndices} meshes={anchorMeshes} visibleAnchors={visibleMeshAnchors} referenceGeometry={referenceGeometry} rimSizeInches={rimSizeInches} revision={revision} onMoveSelection={moveSelection} cameraEdit={cameraMode && garage && cameraPoints ? { camera: garageToPck(cameraPoints.camera), target: garageToPck(cameraPoints.target), handle: cameraHandle, lookThrough, targetPlane, safeAreas, fov: garage.fov, aspect: cameraAspects[cameraAspect], onSelectHandle: setCameraHandle, onToggleLookThrough: () => setLookThrough((value) => !value), onMove: moveShopCamera } : null} />
+      <MeshViewer document={document} selected={selected} multiSelected={selectedIndices} meshes={anchorMeshes} visibleAnchors={visibleMeshAnchors} referenceGeometry={referenceGeometry} rimSizeInches={rimSizeInches} revision={revision} onMoveSelection={moveSelection} onRotateSelection={rotateSelection} canRotate={document.rotationEditable && !positionLocked} cameraEdit={cameraMode && garage && cameraPoints ? { camera: garageToPck(cameraPoints.camera), target: garageToPck(cameraPoints.target), handle: cameraHandle, lookThrough, targetPlane, safeAreas, fov: garage.fov, aspect: cameraAspects[cameraAspect], onSelectHandle: setCameraHandle, onToggleLookThrough: () => setLookThrough((value) => !value), onMove: moveShopCamera } : null} />
     </main>)}
     {workspace === "mesh" && <div className="mesh-editor-shell"><MeshEditorWorkspace document={meshDocument} activeRole={meshRole} slots={slots} onSelectRole={setMeshViewRole} meshes={meshEditorMeshes} onEditPieceId={editPieceId} onEditGroupShader={editGroupShader} onUpdateEmbedded={updateEmbeddedMesh} onUpdateAllEmbedded={updateAllEmbeddedMeshes} onConvertObjs={() => void chooseObjFolder()} zeroShellId={zeroShellId} onSetZeroShellId={setZeroShellId} onExportObj={(mesh) => void exportPieceObj(mesh)} embeddedUnreadable={embeddedOnly.unreadable} embeddedEmpty={embeddedOnly.empty} objFolder={objFolder} describeEmbedTarget={describeEmbedTarget} describePieceSize={describePieceSize} onUndo={meshUndo} onRedo={meshRedo} canUndo={pieceIdUndoRef.current.length > 0} canRedo={pieceIdRedoRef.current.length > 0} vehicleBase={vehicleBase} loadedCount={loadedCount} onOpenFolder={() => void openFolder()} recentVehicleFolders={recentVehicleFolders} onOpenRecentFolder={(path) => void openVehicleFolderAtPath(path)} onClearRecentFolders={clearVehicleRecents} listWidth={panelWidths.meshList} onResizeList={resizeMeshList} /></div>}
     {workspace === "performance" && <PerformanceWorkspace slots={slots} workingRole={workingRole} vehicleBase={vehicleBase} loadedCount={loadedCount} revision={revision} onApply={applyPerformance} onStatus={setStatus} onOpenFolder={() => void openFolder()} recentVehicleFolders={recentVehicleFolders} onOpenRecentFolder={(path) => void openVehicleFolderAtPath(path)} onClearRecentFolders={clearVehicleRecents} />}

@@ -5,13 +5,14 @@ import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { TransformControls } from "three/addons/controls/TransformControls.js";
 import type { PckDocument, Vec3 } from "../src/pck";
 import { anchorWorldPosition, nearestMeshAnchor, type MeshGeometry } from "../src/mesh";
-import { applyAnchorRotation } from "./anchor-rotation";
+import { anchorWorldQuaternion, applyAnchorRotation, localRotationFor } from "./anchor-rotation";
 import type { PpfGeometry, PpfKind } from "../src/ppf";
 
 type ActiveCamera = THREE.PerspectiveCamera | THREE.OrthographicCamera;
 type ViewDirection = "front" | "back" | "left" | "right" | "top" | "bottom";
 type Projection = "perspective" | "orthographic";
 type GizmoSpace = "world" | "local";
+type GizmoMode = "translate" | "rotate";
 
 export type CameraHandle = "camera" | "target";
 export type ShopCameraPoints = { camera: Vec3; target: Vec3 };
@@ -37,6 +38,7 @@ export type CameraEdit = ShopCameraPoints & {
 // 16:9, it would be far off. A 16:9 PCSX2 window just stretches that 4:3 frame.
 const verticalFov = (fov: number) => fov;
 const GIZMO_SPACE_KEY = "mc3pae.gizmoSpace";
+const GIZMO_MODE_KEY = "mc3pae.gizmoMode";
 // Share of the frame height the Body Shop UI covers, full width: title, "N OF M", brand and price on
 // top; money and the button row at the bottom. Measured on an in-game shot (VIP Mustang, Front
 // Bumpers): top band down to 34.4%, bottom band from 79.4%. A widescreen patch may lay it out differently.
@@ -133,7 +135,7 @@ function frameOrthographic(camera: THREE.OrthographicCamera, distance: number, a
 }
 const round5 = (value: number) => Math.round(value * 100000) / 100000;
 
-export function MeshViewer({ document, selected, multiSelected, meshes, visibleAnchors, referenceGeometry, rimSizeInches, revision, onMoveSelection, cameraEdit = null }: { document: PckDocument; selected: number; multiSelected: Set<number>; meshes: MeshGeometry[]; visibleAnchors: Set<number>; referenceGeometry: Partial<Record<PpfKind, PpfGeometry>>; rimSizeInches: number; revision: number; onMoveSelection(moves: { index: number; value: Vec3 }[], mode: "preview" | "scrub-commit", startMoves?: { index: number; value: Vec3 }[]): void; cameraEdit?: CameraEdit | null }) {
+export function MeshViewer({ document, selected, multiSelected, meshes, visibleAnchors, referenceGeometry, rimSizeInches, revision, onMoveSelection, onRotateSelection, canRotate = false, cameraEdit = null }: { document: PckDocument; selected: number; multiSelected: Set<number>; meshes: MeshGeometry[]; visibleAnchors: Set<number>; referenceGeometry: Partial<Record<PpfKind, PpfGeometry>>; rimSizeInches: number; revision: number; onMoveSelection(moves: { index: number; value: Vec3 }[], mode: "preview" | "scrub-commit", startMoves?: { index: number; value: Vec3 }[]): void; /** Same contract as onMoveSelection, with anchor rotations (radians). */ onRotateSelection?(moves: { index: number; value: Vec3 }[], mode: "preview" | "scrub-commit", startMoves?: { index: number; value: Vec3 }[]): void; /** False for a PSPPCK or a selection of locked wheel followers. */ canRotate?: boolean; cameraEdit?: CameraEdit | null }) {
   const hostRef = useRef<HTMLDivElement>(null);
   const runtimeRef = useRef<ViewerRuntime | null>(null);
   const objectsRef = useRef(new Map<MeshGeometry, THREE.Mesh>());
@@ -142,12 +144,14 @@ export function MeshViewer({ document, selected, multiSelected, meshes, visibleA
   const lastMeshSetRef = useRef<string | null>(null);
   const lastReferenceSetRef = useRef<typeof referenceGeometry | null>(null);
   const dragRef = useRef<{ anchors: { index: number; start: Vec3 }[]; startWorld: THREE.Vector3 } | null>(null);
+  // A rotate-gizmo drag: each anchor's stored angles and world orientation, and the gizmo's.
+  const rotateDragRef = useRef<{ anchors: { index: number; start: Vec3; startWorld: THREE.Quaternion }[]; startGizmo: THREE.Quaternion } | null>(null);
   // A gizmo drag of a shop camera point, and an orbit/zoom/pan while looking through the camera.
   const cameraDragRef = useRef<{ start: ShopCameraPoints; handle: CameraHandle; startWorld: THREE.Vector3 } | null>(null);
   const orbitStartRef = useRef<ShopCameraPoints | null>(null);
   // Read by the render loop and the orbit listeners, which outlive any one render.
   const lookThroughRef = useRef({ active: false, aspect: 4 / 3, savedTarget: new THREE.Vector3() });
-  const latestRef = useRef({ document, multiSelected, onMoveSelection, cameraEdit });
+  const latestRef = useRef({ document, multiSelected, onMoveSelection, onRotateSelection, cameraEdit });
   const edgesRef = useRef<THREE.LineSegments[]>([]);
   const [gridVisible, setGridVisible] = useState(true);
   const [renderMode, setRenderMode] = useState<"solid" | "wireframe" | "solid-wire">("solid");
@@ -155,7 +159,11 @@ export function MeshViewer({ document, selected, multiSelected, meshes, visibleA
   const [gizmoVisible, setGizmoVisible] = useState(true);
   const [gizmoSpace, setGizmoSpace] = useState<GizmoSpace>(() => { try { return localStorage.getItem(GIZMO_SPACE_KEY) === "local" ? "local" : "world"; } catch { return "world"; } });
   useEffect(() => { try { localStorage.setItem(GIZMO_SPACE_KEY, gizmoSpace); } catch { /* storage unavailable */ } }, [gizmoSpace]);
-  useEffect(() => { latestRef.current = { document, multiSelected, onMoveSelection, cameraEdit }; });
+  const [gizmoMode, setGizmoMode] = useState<GizmoMode>(() => { try { return localStorage.getItem(GIZMO_MODE_KEY) === "rotate" ? "rotate" : "translate"; } catch { return "translate"; } });
+  useEffect(() => { try { localStorage.setItem(GIZMO_MODE_KEY, gizmoMode); } catch { /* storage unavailable */ } }, [gizmoMode]);
+  // Shop cameras are points, and a locked selection has no rotation to edit: those always move.
+  const effectiveGizmoMode: GizmoMode = cameraEdit || !canRotate || !onRotateSelection ? "translate" : gizmoMode;
+  useEffect(() => { latestRef.current = { document, multiSelected, onMoveSelection, onRotateSelection, cameraEdit }; });
   const lookingThrough = Boolean(cameraEdit?.lookThrough);
   const visible = useMemo(() => meshes.filter((mesh) => mesh.anchorIndex !== null && visibleAnchors.has(mesh.anchorIndex)), [meshes, visibleAnchors]);
   const referencePlacements = useMemo(() => {
@@ -209,6 +217,7 @@ export function MeshViewer({ document, selected, multiSelected, meshes, visibleA
   const toggleProjection = useCallback(() => { setProjection((current) => current === "perspective" ? "orthographic" : "perspective"); }, []);
   const toggleGizmo = useCallback(() => { setGizmoVisible((value) => !value); }, []);
   const toggleGizmoSpace = useCallback(() => { setGizmoSpace((value) => value === "local" ? "world" : "local"); }, []);
+  const toggleGizmoMode = useCallback(() => { setGizmoMode((value) => value === "rotate" ? "translate" : "rotate"); }, []);
 
   useEffect(() => {
     const host = hostRef.current;
@@ -268,6 +277,13 @@ export function MeshViewer({ document, selected, multiSelected, meshes, visibleA
     const gizmoTarget = new THREE.Object3D(); scene.add(gizmoTarget);
     const transformControls = new TransformControls(perspectiveCamera, renderer.domElement);
     transformControls.mode = "translate";
+    // The gizmo's turn since the drag began, applied to each anchor's world orientation and read
+    // back as that anchor's own angles (the solution closest to the ones it had).
+    const rotatedAnchors = (drag: NonNullable<typeof rotateDragRef.current>) => {
+      const delta = gizmoTarget.quaternion.clone().multiply(drag.startGizmo.clone().invert());
+      const doc = latestRef.current.document;
+      return drag.anchors.map(({ index, start, startWorld }) => ({ index, value: localRotationFor(doc, index, delta.clone().multiply(startWorld), start) }));
+    };
     transformControls.attach(gizmoTarget);
     const gizmoHelper = transformControls.getHelper();
     scene.add(gizmoHelper);
@@ -284,6 +300,22 @@ export function MeshViewer({ document, selected, multiSelected, meshes, visibleA
           const { start, handle, startWorld } = cameraDragRef.current;
           cameraDragRef.current = null;
           latestRef.current.cameraEdit?.onMove(cameraMoveFrom(start, handle, gizmoTarget.position.clone().sub(startWorld)), "commit", start);
+        }
+        return;
+      }
+      if (transformControls.mode === "rotate") {
+        const { document: doc, multiSelected: sel, onRotateSelection: rotate } = latestRef.current;
+        if (event.value) {
+          // An anchor whose ancestor is also selected already turns with that ancestor; rotating it
+          // as well would turn it twice.
+          const isCarried = (index: number) => { const seen = new Set<number>(); let cursor = doc.pieces[index].parentIndex; while (cursor !== null && !seen.has(cursor)) { if (sel.has(cursor)) return true; seen.add(cursor); cursor = doc.pieces[cursor].parentIndex; } return false; };
+          const anchors = [...sel].filter((index) => !isCarried(index)).map((index) => ({ index, start: [...doc.pieces[index].rotation] as Vec3, startWorld: anchorWorldQuaternion(doc, index) }));
+          rotateDragRef.current = { anchors, startGizmo: gizmoTarget.quaternion.clone() };
+        } else if (rotateDragRef.current) {
+          const drag = rotateDragRef.current; rotateDragRef.current = null;
+          const moves = rotatedAnchors(drag);
+          const startMoves = drag.anchors.map(({ index, start }) => ({ index, value: start }));
+          if (moves.some((move, i) => !move.value.every((v, c) => Object.is(v, startMoves[i].value[c])))) rotate?.(moves, "scrub-commit", startMoves);
         }
         return;
       }
@@ -304,6 +336,8 @@ export function MeshViewer({ document, selected, multiSelected, meshes, visibleA
     transformControls.addEventListener("objectChange", () => {
       const cameraDrag = cameraDragRef.current;
       if (cameraDrag) { latestRef.current.cameraEdit?.onMove(cameraMoveFrom(cameraDrag.start, cameraDrag.handle, gizmoTarget.position.clone().sub(cameraDrag.startWorld)), "preview"); return; }
+      const rotateDrag = rotateDragRef.current;
+      if (rotateDrag) { latestRef.current.onRotateSelection?.(rotatedAnchors(rotateDrag), "preview"); return; }
       const drag = dragRef.current; if (!drag) return;
       const { onMoveSelection: move } = latestRef.current;
       const delta = gizmoTarget.position.clone().sub(drag.startWorld);
@@ -377,7 +411,12 @@ export function MeshViewer({ document, selected, multiSelected, meshes, visibleA
       runtime.renderer.setScissorTest(false); runtime.renderer.setViewport(0, 0, width, height);
     };
     render();
+    // Holding Shift snaps a rotate drag to 15° steps; exact angles are typed in the Rotation card.
+    const ROTATION_SNAP = THREE.MathUtils.degToRad(15);
+    const onSnapKey = (event: KeyboardEvent) => { if (event.key === "Shift") transformControls.setRotationSnap(event.type === "keydown" ? ROTATION_SNAP : null); };
+    window.addEventListener("keydown", onSnapKey); window.addEventListener("keyup", onSnapKey);
     return () => {
+      window.removeEventListener("keydown", onSnapKey); window.removeEventListener("keyup", onSnapKey);
       cancelAnimationFrame(frame); observer.disconnect(); controls.dispose(); transformControls.dispose();
       renderer.domElement.removeEventListener("pointerdown", onPointerDown); renderer.domElement.removeEventListener("pointerup", onPointerUp);
       shopHelper.dispose(); cameraMarker.geometry.dispose(); (cameraMarker.material as THREE.Material).dispose(); targetMarker.geometry.dispose(); (targetMarker.material as THREE.Material).dispose(); cameraLine.geometry.dispose(); (cameraLine.material as THREE.Material).dispose();
@@ -499,10 +538,11 @@ export function MeshViewer({ document, selected, multiSelected, meshes, visibleA
       else if (event.code === "Numpad5") { event.preventDefault(); toggleProjection(); }
       else if (event.ctrlKey && event.key.toLowerCase() === "g") { event.preventDefault(); toggleGizmo(); }
       else if (event.ctrlKey && event.key.toLowerCase() === "l") { event.preventDefault(); toggleGizmoSpace(); }
+      else if (!event.ctrlKey && !event.altKey && !event.metaKey && event.code === "KeyR" && !latestRef.current.cameraEdit) { event.preventDefault(); toggleGizmoMode(); }
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [applyView, toggleGizmo, toggleGizmoSpace, toggleProjection]);
+  }, [applyView, toggleGizmo, toggleGizmoMode, toggleGizmoSpace, toggleProjection]);
 
   useEffect(() => {
     const runtime = runtimeRef.current;
@@ -569,6 +609,7 @@ export function MeshViewer({ document, selected, multiSelected, meshes, visibleA
     runtime.markerA1.position.set(displayA1[0], displayA1[1], displayA1[2]); runtime.markerA2.position.set(displayA2[0], displayA2[1], displayA2[2]);
     runtime.markerA1.visible = true; runtime.markerA2.visible = displayA1.some((value, index) => Math.abs(value - displayA2[index]) > 1e-7);
     runtime.transformControls.space = gizmoSpace;
+    runtime.transformControls.mode = effectiveGizmoMode;
     // Don't fight an in-progress gizmo drag with a recomputed (should-be-equal) position, nor turn
     // the gizmo under the cursor: local axes are taken when a drag starts and held through it.
     if (runtime.transformControls.dragging) return;
@@ -583,7 +624,7 @@ export function MeshViewer({ document, selected, multiSelected, meshes, visibleA
     runtime.gizmoTarget.position.set(displayA1[0], displayA1[1], displayA1[2]);
     // Local = the primary anchor's rotation (and its parents'), the way its piece is drawn.
     applyAnchorRotation(runtime.gizmoTarget, document, selected);
-  }, [document, revision, selected, visible, cameraEdit, gizmoSpace]);
+  }, [document, revision, selected, visible, cameraEdit, gizmoSpace, effectiveGizmoMode]);
 
   useEffect(() => { if (runtimeRef.current) runtimeRef.current.grid.visible = gridVisible; }, [gridVisible]);
   useEffect(() => {
@@ -608,6 +649,7 @@ export function MeshViewer({ document, selected, multiSelected, meshes, visibleA
       <div className="view-toggles">
         <button className={projection === "orthographic" ? "active" : ""} onClick={toggleProjection} title={tr("Toggle orthographic / perspective (Numpad 5)")}>{projection === "orthographic" ? tr("Ortho") : tr("Persp")}</button>
         <button className={gizmoVisible ? "active" : ""} onClick={toggleGizmo} title={tr("Toggle move gizmo (Ctrl+G)")}>{tr("Gizmo")}</button>
+        {!cameraEdit && <button className={effectiveGizmoMode === "rotate" ? "active" : ""} disabled={!canRotate} onClick={toggleGizmoMode} title={canRotate ? tr("Gizmo mode: move or rotate the selected anchor(s) · R · Shift while rotating snaps to 15°") : tr("Rotation isn't editable for this selection")}>{gizmoMode === "rotate" && canRotate ? tr("Rotate") : tr("Move")}</button>}
         <button className={gizmoSpace === "local" ? "active" : ""} onClick={toggleGizmoSpace} title={cameraEdit ? tr("Gizmo axes: global, or the shop camera's own (Z along the line of sight) · Ctrl+L") : tr("Gizmo axes: global, or the selected anchor's own rotation · Ctrl+L")}>{gizmoSpace === "local" ? tr("Local") : tr("Global")}</button>
         {cameraEdit && <button className={cameraEdit.lookThrough ? "active" : ""} onClick={cameraEdit.onToggleLookThrough} title={tr("See what the shop camera frames (Numpad 0) · Esc to leave")}>{tr("Camera view")}</button>}
       </div>
