@@ -15,9 +15,9 @@ export type Piece = {
   divider: number;
   a1: Vec3;
   a2: Vec3;
-  /** Euler angles in radians at +0x2C/+0x30/+0x34 (PS2 layout; zero for PSPPCK, not mapped there).
-   *  Read-only, for previews: ±π/2 on the suspension arms, π on rear axles, the cop-light spinners'
-   *  headings (modding KB §7.2). */
+  /** Euler angles in radians at +0x2C/+0x30/+0x34 (PS2 layout; zero for PSPPCK, not mapped there):
+   *  ±π/2 on the suspension arms, π on rear axles and exhausts, the cop-light spinners' headings
+   *  (modding KB §7.2). Written through `PckDocument.setAnchorRotation`. */
   rotation: Vec3;
   nextPointer: number;
   childPointer: number;
@@ -51,6 +51,10 @@ type AnchorMove = { index: number; before: [Vec3, Vec3]; after: [Vec3, Vec3] };
 // light anchors) is a single undo step. Recorded per anchor it would cost one MAX_HISTORY slot
 // each, so a 60-anchor action would flush the entire history and only be partly undoable.
 type AnchorGroupHistoryEntry = { kind: "anchorGroup"; moves: AnchorMove[] };
+type RotationMove = { index: number; before: Vec3; after: Vec3 };
+type RotationHistoryEntry = { kind: "rotation"; moves: RotationMove[] };
+// Edits made inside groupEdits() — Mirror flipping position and rotation together — undo as one step.
+type CompoundHistoryEntry = { kind: "compound"; entries: HistoryEntry[] };
 type PieceIdTarget = { lod: LodLevel; index: number; idSlotOffset: number; meshBlockOffset: number | null };
 type PieceIdHistoryEntry = { kind: "pieceId"; targets: PieceIdTarget[]; before: number[]; after: number };
 type ShaderIdTarget = { meshBlockOffset: number; slotOffset: number };
@@ -58,7 +62,7 @@ type ShaderIdHistoryEntry = { kind: "shaderId"; targets: ShaderIdTarget[]; befor
 // Replacing an embedded mesh rewrites pointers, grows the file, and re-maps LOD entries — far too
 // much to describe as a field-level diff, so this one snapshots the whole document instead.
 type MeshBlobHistoryEntry = { kind: "meshBlob"; before: MeshBlobSnapshot; after: MeshBlobSnapshot };
-type HistoryEntry = AnchorHistoryEntry | AnchorGroupHistoryEntry | PieceIdHistoryEntry | ShaderIdHistoryEntry | MeshBlobHistoryEntry;
+type HistoryEntry = AnchorHistoryEntry | AnchorGroupHistoryEntry | RotationHistoryEntry | CompoundHistoryEntry | PieceIdHistoryEntry | ShaderIdHistoryEntry | MeshBlobHistoryEntry;
 const lodKey = (lod: LodLevel, index: number) => `${lod}:${index}`;
 type RuntimeSlot = { fileOffset: number; virtualAddress: number; anchorIndex: number | null; note: string; followerIndex?: number | null };
 
@@ -101,6 +105,9 @@ export type MeshBlobSnapshot = {
 const FALLBACK_BASE = 0x067fff80;
 const POINTER_SLOTS = [0x1ac, 0x1b0, 0x1b4];
 const MAX_HISTORY = 20;
+/** Anchor rotation, PS2 layout only: three f32 radians at +0x2C/+0x30/+0x34, applied Y, then X,
+ *  then Z (modding KB §7.2). Finite and within ±2π in all 80,390 anchors of the HostFS + VIP PCKs. */
+const ROTATION_OFFSET = 0x2c;
 const LODS_POINTER_OFFSET = 0x1a8;
 const MESH_PAYLOAD_OFFSET = 0x80;
 const MESH_ID_BYTE = 0x06;
@@ -313,6 +320,7 @@ export class PckDocument {
   readonly children = new Map<number, number[]>();
   readonly roots: number[];
   readonly savedAnchors: [Vec3, Vec3][];
+  readonly savedRotations: Vec3[];
   readonly exhaustSlots: RuntimeSlot[] = [];
   /** Exhaust anchor -> its TBL_Exhausts entries (`exhaustSlots` indices, group * 2 + slot). */
   readonly exhaustLinks = new Map<number, number[]>();
@@ -341,6 +349,8 @@ export class PckDocument {
   appendedBlocks = new Map<string, { offset: number; reservedSize: number }>();
   undoStack: HistoryEntry[] = [];
   redoStack: HistoryEntry[] = [];
+  /** Collects history while groupEdits() runs, so its edits land as one compound undo step. */
+  private pendingGroup: HistoryEntry[] | null = null;
 
   constructor(name: string, source: ArrayBuffer) {
     this.name = name;
@@ -360,12 +370,15 @@ export class PckDocument {
     this.roots = this.pieces.filter((piece) => piece.parentIndex === null).map((piece) => piece.index);
     if (!this.roots.length && this.pieces.length) this.roots.push(0);
     this.savedAnchors = this.pieces.map((piece) => [cloneVec(piece.a1), cloneVec(piece.a2)]);
+    this.savedRotations = this.pieces.map((piece) => cloneVec(piece.rotation));
     this.mapExhaustRuntime();
     this.mapWheelRuntime();
     this.mapLodTables();
   }
 
   get format() { return this.layout.format; }
+  /** Rotation is only mapped in the PS2 anchor layout. */
+  get rotationEditable() { return this.layout.format === "pck"; }
   get dirty() { return this.dirtyIndices.size > 0 || this.dirtyLodKeys.size > 0 || this.dirtyShaderKeys.size > 0 || this.dirtyMeshBlobs.size > 0 || this.dirtyFieldKeys.size > 0; }
   get fileSize() { return this.bytes.byteLength; }
 
@@ -382,7 +395,7 @@ export class PckDocument {
         namePointer, pieceId: u16(this.view, o + l.idOffset), divider: u32(this.view, o + l.dividerOffset),
         a1: [f32(this.view, o), f32(this.view, o + 4), f32(this.view, o + 8)],
         a2: [f32(this.view, o + l.a2Offset), f32(this.view, o + l.a2Offset + 4), f32(this.view, o + l.a2Offset + 8)],
-        rotation: l.format === "pck" ? [0x2c, 0x30, 0x34].map((field) => { const value = f32(this.view, o + field); return Number.isFinite(value) ? value : 0; }) as Vec3 : [0, 0, 0],
+        rotation: l.format === "pck" ? [0, 1, 2].map((component) => { const value = f32(this.view, o + ROTATION_OFFSET + component * 4); return Number.isFinite(value) ? value : 0; }) as Vec3 : [0, 0, 0],
         nextPointer: u32(this.view, o + l.nextOffset), childPointer: u32(this.view, o + l.childOffset), parentPointer: u32(this.view, o + l.parentOffset),
         nextIndex: null, childIndex: null, parentIndex: null,
       });
@@ -566,21 +579,87 @@ export class PckDocument {
         const mirrored = cloneVec(follower.a1);
         before[0].forEach((value, component) => { if (!Object.is(value, nextA1[component])) mirrored[component] = nextA1[component]; });
         follower.a1 = mirrored; this.writeVec(follower.fileOffset, mirrored);
-        const savedFollower = this.savedAnchors[followerIndex];
-        if (sameVec(savedFollower[0], follower.a1) && sameVec(savedFollower[1], follower.a2)) this.dirtyIndices.delete(followerIndex); else this.dirtyIndices.add(followerIndex);
+        this.refreshAnchorDirty(followerIndex);
       }
     }
     piece.a1 = nextA1; piece.a2 = nextA2;
     this.writeVec(piece.fileOffset, nextA1); this.writeVec(piece.fileOffset + this.layout.a2Offset, nextA2);
     for (const slot of exhaustSlots ?? []) this.writeVec(this.exhaustSlots[slot].fileOffset, nextA1);
-    const saved = this.savedAnchors[index];
-    if (sameVec(saved[0], nextA1) && sameVec(saved[1], nextA2)) this.dirtyIndices.delete(index); else this.dirtyIndices.add(index);
-    if (record) {
-      this.undoStack.push({ kind: "anchor", index, before, after: [cloneVec(nextA1), cloneVec(nextA2)] });
-      if (this.undoStack.length > MAX_HISTORY) this.undoStack.shift();
-      this.redoStack = [];
-    }
+    this.refreshAnchorDirty(index);
+    if (record) this.pushHistory({ kind: "anchor", index, before, after: [cloneVec(nextA1), cloneVec(nextA2)] });
     return true;
+  }
+
+  /** An anchor is pending when its position or its rotation differs from the last save. */
+  private refreshAnchorDirty(index: number) {
+    const piece = this.pieces[index], saved = this.savedAnchors[index];
+    const clean = sameVec(saved[0], piece.a1) && sameVec(saved[1], piece.a2) && sameVec(this.savedRotations[index], piece.rotation);
+    if (clean) this.dirtyIndices.delete(index); else this.dirtyIndices.add(index);
+  }
+
+  private pushHistory(entry: HistoryEntry) {
+    if (this.pendingGroup) { this.pendingGroup.push(entry); return; }
+    this.undoStack.push(entry);
+    if (this.undoStack.length > MAX_HISTORY) this.undoStack.shift();
+    this.redoStack = [];
+  }
+
+  /** Runs several recorded edits (setAnchorsBatch, setAnchorRotationBatch…) as one undo step. */
+  groupEdits(apply: () => void) {
+    if (this.pendingGroup) { apply(); return; }
+    this.pendingGroup = [];
+    try { apply(); } finally {
+      const entries = this.pendingGroup;
+      this.pendingGroup = null;
+      if (entries.length === 1) this.pushHistory(entries[0]);
+      else if (entries.length > 1) this.pushHistory({ kind: "compound", entries });
+    }
+  }
+
+  /**
+   * Writes an anchor's rotation (radians). Only the components that actually change are written,
+   * so an angle the user didn't touch keeps its exact stored bits — the game's -π/2 is 0xBFC90FD8,
+   * not the 0xBFC90FDB a round trip through degrees would give. Nothing else stores this rotation.
+   */
+  setAnchorRotation(index: number, rotation: Vec3, record = true) {
+    const piece = this.pieces[index];
+    if (!piece) throw new Error("Invalid anchor index.");
+    if (!this.rotationEditable) throw new Error("Anchor rotation is only mapped in PS2 car PCKs.");
+    // A wheel follower is locked like its position (and syncAnchorsFrom never carries it over).
+    if (this.wheelFollowers.has(index)) return false;
+    const before = cloneVec(piece.rotation);
+    let changed = false;
+    rotation.forEach((value, component) => {
+      if (!Number.isFinite(value) || Math.fround(value) === before[component]) return;
+      const offset = piece.fileOffset + ROTATION_OFFSET + component * 4;
+      this.view.setFloat32(offset, value, true);
+      piece.rotation[component] = f32(this.view, offset);
+      changed = true;
+    });
+    if (!changed) return false;
+    this.refreshAnchorDirty(index);
+    if (record) this.pushHistory({ kind: "rotation", moves: [{ index, before, after: cloneVec(piece.rotation) }] });
+    return true;
+  }
+
+  /** Many rotations as a single undo step. Returns how many anchors actually changed. */
+  setAnchorRotationBatch(moves: { index: number; rotation: Vec3 }[], record = true) {
+    const applied: RotationMove[] = [];
+    for (const move of moves) {
+      const piece = this.pieces[move.index];
+      if (!piece) throw new Error("Invalid anchor index.");
+      const before = cloneVec(piece.rotation);
+      if (!this.setAnchorRotation(move.index, move.rotation, false)) continue;
+      applied.push({ index: move.index, before, after: cloneVec(piece.rotation) });
+    }
+    if (applied.length && record) this.pushHistory({ kind: "rotation", moves: applied });
+    return applied.length;
+  }
+
+  updateRotationComponent(index: number, component: number, value: number, record = true) {
+    const rotation = cloneVec(this.pieces[index].rotation);
+    rotation[component] = value;
+    return this.setAnchorRotation(index, rotation, record);
   }
 
   /**
@@ -599,11 +678,7 @@ export class PckDocument {
       if (!this.setAnchors(move.index, move.a1, move.a2, false)) continue;
       applied.push({ index: move.index, before, after: [cloneVec(piece.a1), cloneVec(piece.a2)] });
     }
-    if (applied.length && record) {
-      this.undoStack.push({ kind: "anchorGroup", moves: applied });
-      if (this.undoStack.length > MAX_HISTORY) this.undoStack.shift();
-      this.redoStack = [];
-    }
+    if (applied.length && record) this.pushHistory({ kind: "anchorGroup", moves: applied });
     return applied.length;
   }
 
@@ -1109,48 +1184,71 @@ export class PckDocument {
 
   undo() {
     const entry = this.undoStack.pop(); if (!entry) return null;
-    if (entry.kind === "anchor") { this.setAnchors(entry.index, entry.before[0], entry.before[1], false); this.redoStack.push(entry); return entry.index; }
+    const index = this.revertEntry(entry);
+    this.redoStack.push(entry);
+    return index;
+  }
+  redo() {
+    const entry = this.redoStack.pop(); if (!entry) return null;
+    const index = this.reapplyEntry(entry);
+    this.undoStack.push(entry);
+    return index;
+  }
+  /** Puts an entry's "before" back. Returns the anchor to select afterwards, if it was an anchor edit. */
+  private revertEntry(entry: HistoryEntry): number | null {
+    if (entry.kind === "anchor") { this.setAnchors(entry.index, entry.before[0], entry.before[1], false); return entry.index; }
     if (entry.kind === "anchorGroup") {
       // Unwind in reverse: a batch may legitimately touch the same anchor twice, and only the
       // last-to-first order restores the value it held before the batch started.
       for (let i = entry.moves.length - 1; i >= 0; i -= 1) { const move = entry.moves[i]!; this.setAnchors(move.index, move.before[0], move.before[1], false); }
-      this.redoStack.push(entry);
       return entry.moves[0]?.index ?? null;
     }
-    if (entry.kind === "meshBlob") { this.restoreState(entry.before); this.redoStack.push(entry); return null; }
+    if (entry.kind === "rotation") {
+      for (let i = entry.moves.length - 1; i >= 0; i -= 1) { const move = entry.moves[i]!; this.setAnchorRotation(move.index, move.before, false); }
+      return entry.moves[0]?.index ?? null;
+    }
+    if (entry.kind === "compound") {
+      let index: number | null = null;
+      for (let i = entry.entries.length - 1; i >= 0; i -= 1) index = this.revertEntry(entry.entries[i]!) ?? index;
+      return index;
+    }
+    if (entry.kind === "meshBlob") { this.restoreState(entry.before); return null; }
     if (entry.kind === "shaderId") {
       entry.targets.forEach((target, i) => this.view.setUint16(target.slotOffset, entry.before[i], true));
       for (const target of entry.targets) this.refreshShaderDirty(target);
-      this.redoStack.push(entry);
       return null;
     }
     this.applyPieceIdTargets(entry.targets, entry.before);
     for (const target of entry.targets) this.refreshLodDirty(target);
-    this.redoStack.push(entry);
     return null;
   }
-  redo() {
-    const entry = this.redoStack.pop(); if (!entry) return null;
-    if (entry.kind === "anchor") { this.setAnchors(entry.index, entry.after[0], entry.after[1], false); this.undoStack.push(entry); return entry.index; }
+  private reapplyEntry(entry: HistoryEntry): number | null {
+    if (entry.kind === "anchor") { this.setAnchors(entry.index, entry.after[0], entry.after[1], false); return entry.index; }
     if (entry.kind === "anchorGroup") {
       for (const move of entry.moves) this.setAnchors(move.index, move.after[0], move.after[1], false);
-      this.undoStack.push(entry);
       return entry.moves[0]?.index ?? null;
     }
-    if (entry.kind === "meshBlob") { this.restoreState(entry.after); this.undoStack.push(entry); return null; }
+    if (entry.kind === "rotation") {
+      for (const move of entry.moves) this.setAnchorRotation(move.index, move.after, false);
+      return entry.moves[0]?.index ?? null;
+    }
+    if (entry.kind === "compound") {
+      let index: number | null = null;
+      for (const item of entry.entries) { const selected = this.reapplyEntry(item); index ??= selected; }
+      return index;
+    }
+    if (entry.kind === "meshBlob") { this.restoreState(entry.after); return null; }
     if (entry.kind === "shaderId") {
       for (const target of entry.targets) this.view.setUint16(target.slotOffset, entry.after, true);
       for (const target of entry.targets) this.refreshShaderDirty(target);
-      this.undoStack.push(entry);
       return null;
     }
     this.applyPieceIdTargets(entry.targets, entry.targets.map(() => entry.after));
     for (const target of entry.targets) this.refreshLodDirty(target);
-    this.undoStack.push(entry);
     return null;
   }
   markSaved() {
-    this.pieces.forEach((piece, i) => { this.savedAnchors[i] = [cloneVec(piece.a1), cloneVec(piece.a2)]; });
+    this.pieces.forEach((piece, i) => { this.savedAnchors[i] = [cloneVec(piece.a1), cloneVec(piece.a2)]; this.savedRotations[i] = cloneVec(piece.rotation); });
     this.savedBytes = this.bytes.slice();
     this.dirtyIndices.clear();
     this.dirtyLodKeys.clear();
@@ -1181,6 +1279,7 @@ export class PckDocument {
       if (this.wheelFollowers.has(index)) continue;
       const piece = source.pieces[index];
       this.setAnchors(index, piece.a1, piece.a2, false);
+      if (this.rotationEditable && source.rotationEditable) this.setAnchorRotation(index, piece.rotation, false);
     }
     return selected.length;
   }

@@ -194,11 +194,13 @@ async function collectDroppedPaths(paths: string[]) {
   }
   return output;
 }
-function axisMixed(doc: PckDocument, indices: number[], anchor: "a1" | "a2", component: number) {
+function axisMixed(doc: PckDocument, indices: number[], anchor: "a1" | "a2" | "rotation", component: number) {
   if (indices.length <= 1) return false;
   const first = doc.pieces[indices[0]][anchor][component];
   return indices.some((index) => !Object.is(doc.pieces[index][anchor][component], first));
 }
+const toDegrees = (radians: number) => radians * 180 / Math.PI;
+const toRadians = (degrees: number) => degrees * Math.PI / 180;
 function classifyPpfFile(name: string): PpfKind | null {
   const stem = basename(name).replace(/\.ppf$/i, "").toLowerCase();
   if (stem === "exhaust") return "exhaust";
@@ -297,8 +299,8 @@ function CoordinateInput({ axis, value, mixed, locked, step: stepScale = 1, onCh
     setDraft(scrub.currentValue.toFixed(5)); onChange(scrub.currentValue, "preview", scrub.startValue);
   }} onPointerUp={(event) => { if (scrubRef.current?.pointerId === event.pointerId) finishScrub(true); }} onPointerCancel={() => finishScrub(false)} onKeyDown={(event) => { if (event.key === "Enter") event.currentTarget.blur(); if (event.key === "Escape") { if (scrubRef.current) finishScrub(false); else { setDraft(formatted); event.currentTarget.blur(); } } }} aria-label={tr(`${axis} coordinate`)} /></label>;
 }
-function VecEditor({ label, value, mixed, locked, canPaste, onCopy, onPaste, onChange }: { label: string; value: Vec3; mixed?: [boolean, boolean, boolean]; locked?: boolean; canPaste: boolean; onCopy(): void; onPaste(): void; onChange(component: number, value: number, mode: CoordinateChangeMode, startValue?: number): void }) {
-  return <section className="vector-card"><div className="vector-title"><strong>{label}</strong><div className="vector-title-tools"><button onClick={onCopy}>{tr("Copy Values")}</button><button disabled={!canPaste || locked} onClick={onPaste}>{tr("Paste Values")}</button></div></div><div className="vector-grid">{axes.map((axis, component) => <CoordinateInput key={axis} axis={axis} value={value[component]} mixed={mixed?.[component]} locked={locked} onChange={(next, mode, startValue) => onChange(component, next, mode, startValue)} />)}</div></section>;
+function VecEditor({ label, value, mixed, locked, step, canPaste, onCopy, onPaste, onChange }: { label: string; value: Vec3; mixed?: [boolean, boolean, boolean]; locked?: boolean; step?: number; canPaste: boolean; onCopy(): void; onPaste(): void; onChange(component: number, value: number, mode: CoordinateChangeMode, startValue?: number): void }) {
+  return <section className="vector-card"><div className="vector-title"><strong>{label}</strong><div className="vector-title-tools"><button onClick={onCopy}>{tr("Copy Values")}</button><button disabled={!canPaste || locked} onClick={onPaste}>{tr("Paste Values")}</button></div></div><div className="vector-grid">{axes.map((axis, component) => <CoordinateInput key={axis} axis={axis} value={value[component]} mixed={mixed?.[component]} locked={locked} step={step} onChange={(next, mode, startValue) => onChange(component, next, mode, startValue)} />)}</div></section>;
 }
 type Vec3Draft = [string, string, string];
 const emptyLightDrafts = (): Record<LightFamily, Vec3Draft> => ({ tail: ["", "", ""], rev: ["", "", ""], brake: ["", "", ""] });
@@ -1164,6 +1166,44 @@ export default function App() {
     if (!changed) { setStatus(`${label} ${anchorDisplayLabel[anchor]} already matches ${vectorClipboard.source}`); return; }
     refresh(); setStatus(`Pasted ${vectorClipboard.source} into ${label} ${anchorDisplayLabel[anchor]} · preview refreshed`);
   }, [document, refresh, selectedIndices, vectorClipboard]);
+  // Rotation is stored in radians and edited in degrees. A scrub keeps the exact stored angles it
+  // started from, so cancelling or committing never rewrites them through a degree round trip.
+  const rotationScrubStart = useRef<Map<number, Vec3> | null>(null);
+  const editRotation = useCallback((component: number, degrees: number, mode: CoordinateChangeMode) => {
+    if (!document?.rotationEditable || !Number.isFinite(degrees)) return;
+    const indices = [...selectedIndices];
+    const withComponent = (index: number, value: number): Vec3 => { const rotation: Vec3 = [...document.pieces[index].rotation]; rotation[component] = value; return rotation; };
+    if (mode === "preview") {
+      rotationScrubStart.current ??= new Map(indices.map((index) => [index, [...document.pieces[index].rotation] as Vec3]));
+      if (document.setAnchorRotationBatch(indices.map((index) => ({ index, rotation: withComponent(index, toRadians(degrees)) })), false)) refresh();
+      return;
+    }
+    const start = rotationScrubStart.current; rotationScrubStart.current = null;
+    if (start) document.setAnchorRotationBatch([...start].map(([index, rotation]) => ({ index, rotation })), false);
+    if (mode === "scrub-cancel") { refresh(); return; }
+    // Leaving a field re-submits its 5-decimal text; that alone must not rewrite the stored angle.
+    if (mode === "commit" && indices.every((index) => toDegrees(document.pieces[index].rotation[component]).toFixed(5) === degrees.toFixed(5))) return;
+    const changed = document.setAnchorRotationBatch(indices.map((index) => ({ index, rotation: withComponent(index, toRadians(degrees)) })));
+    refresh();
+    if (!changed) return;
+    const label = indices.length > 1 ? `${indices.length} anchors` : document.pieces[indices[0]].name;
+    setStatus(`${label} Rotation.${axes[component]} updated · preview refreshed`);
+  }, [document, refresh, selectedIndices]);
+  const copyRotationValues = useCallback(() => {
+    if (!document) return;
+    const piece = document.pieces[selected]; const value = piece.rotation.map(toDegrees) as Vec3;
+    setVectorClipboard({ value, source: `${piece.name} Rotation` });
+    void navigator.clipboard?.writeText(value.map((item) => item.toFixed(5)).join(" ")).catch(() => undefined);
+    setStatus(`Copied Rotation values from ${piece.name}`);
+  }, [document, selected]);
+  const pasteRotationValues = useCallback(() => {
+    if (!document?.rotationEditable || !vectorClipboard) return;
+    const indices = [...selectedIndices];
+    const changed = document.setAnchorRotationBatch(indices.map((index) => ({ index, rotation: vectorClipboard.value.map(toRadians) as Vec3 })));
+    const label = indices.length > 1 ? `${indices.length} anchors` : document.pieces[indices[0]].name;
+    if (!changed) { setStatus(`${label} Rotation already matches ${vectorClipboard.source}`); return; }
+    refresh(); setStatus(`Pasted ${vectorClipboard.source} into ${label} Rotation · preview refreshed`);
+  }, [document, refresh, selectedIndices, vectorClipboard]);
   const moveSelection = useCallback((moves: { index: number; value: Vec3 }[], mode: "preview" | "scrub-commit", startMoves?: { index: number; value: Vec3 }[]) => {
     if (!document) return;
     let changed = false;
@@ -1182,10 +1222,19 @@ export default function App() {
   const mirrorSelection = useCallback(() => {
     if (!document) return;
     const indices = [...selectedIndices];
-    const changed = document.setAnchorsBatch(indices.map((index) => {
-      const piece = document.pieces[index];
-      return { index, a1: [-piece.a1[0], piece.a1[1], piece.a1[2]] as Vec3, a2: [-piece.a2[0], piece.a2[1], piece.a2[2]] as Vec3 };
-    }));
+    // Reflecting across X keeps the X angle and negates Y and Z (YXZ order), which is how the
+    // game's own left/right pairs relate: Arm_Front_L at Y −π/2, Arm_Front_R at +π/2.
+    let changed = 0;
+    document.groupEdits(() => {
+      changed += document.setAnchorsBatch(indices.map((index) => {
+        const piece = document.pieces[index];
+        return { index, a1: [-piece.a1[0], piece.a1[1], piece.a1[2]] as Vec3, a2: [-piece.a2[0], piece.a2[1], piece.a2[2]] as Vec3 };
+      }));
+      if (document.rotationEditable) changed += document.setAnchorRotationBatch(indices.map((index) => {
+        const [x, y, z] = document.pieces[index].rotation;
+        return { index, rotation: [x, -y, -z] as Vec3 };
+      }));
+    });
     if (!changed) return;
     refresh();
     const label = indices.length > 1 ? `${indices.length} anchors` : document.pieces[indices[0]].name;
@@ -1427,6 +1476,7 @@ export default function App() {
   const positionLocked = Boolean(document) && selectedIndicesList.length > 0 && selectedIndicesList.every((index) => document!.wheelFollowers.has(index));
   const mixedPrimary = useMemo(() => document ? (axes.map((_, c) => axisMixed(document, selectedIndicesList, "a2", c)) as [boolean, boolean, boolean]) : ([false, false, false] as [boolean, boolean, boolean]), [document, selectedIndicesList, revision]);
   const mixedSecondary = useMemo(() => document ? (axes.map((_, c) => axisMixed(document, selectedIndicesList, "a1", c)) as [boolean, boolean, boolean]) : ([false, false, false] as [boolean, boolean, boolean]), [document, selectedIndicesList, revision]);
+  const mixedRotation = useMemo(() => document ? (axes.map((_, c) => axisMixed(document, selectedIndicesList, "rotation", c)) as [boolean, boolean, boolean]) : ([false, false, false] as [boolean, boolean, boolean]), [document, selectedIndicesList, revision]);
   const treeMatches = useMemo(() => { if (!document || !search.trim()) return []; const query = search.trim().toLowerCase(); return document.pieces.filter((item) => item.name.toLowerCase().includes(query) || item.index.toString().includes(query) || item.index.toString(16).includes(query)); }, [document, search, revision]);
   const listMatches = useMemo(() => { if (!document) return []; const query = listSearch.trim().toLowerCase(); return query ? document.pieces.filter((item) => item.name.toLowerCase().includes(query) || item.index.toString().includes(query) || item.index.toString(16).includes(query)) : document.pieces; }, [document, listSearch, revision]);
   const meshAnchorIndices = useMemo(() => new Set(anchorMeshes.map((mesh) => mesh.anchorIndex).filter((index): index is number => index !== null)), [anchorMeshes]);
@@ -1503,8 +1553,8 @@ export default function App() {
           <div className="toggle-stack">
             <TogglePanel title={tr("Position anchors")} meta={selectedIndices.size === 1 ? "1 anchor" : `${selectedIndices.size} anchors`} open={detailOpen.position} onToggle={() => setDetailOpen((value) => ({ ...value, position: !value.position }))}>
               <div className="panel-pad">
-                <div className="panel-actions panel-actions-end"><button className="mirror-button" disabled={positionLocked} onClick={mirrorSelection} title={tr("Flip the X position of the selected anchor(s) · Ctrl+Shift+M")}>{tr("Mirror")}</button></div>
-                <div className="vector-stack vertical"><VecEditor label="A1 · Primary position" value={piece.a2} mixed={mixedPrimary} locked={positionLocked} canPaste={Boolean(vectorClipboard)} onCopy={() => copyVectorValues("a2")} onPaste={() => pasteVectorValues("a2")} onChange={(component, value, mode, startValue) => editCoordinate("a2", component, value, mode, startValue)} /><VecEditor label="A2 · Secondary position" value={piece.a1} mixed={mixedSecondary} locked={positionLocked} canPaste={Boolean(vectorClipboard)} onCopy={() => copyVectorValues("a1")} onPaste={() => pasteVectorValues("a1")} onChange={(component, value, mode, startValue) => editCoordinate("a1", component, value, mode, startValue)} /></div>
+                <div className="panel-actions panel-actions-end"><button className="mirror-button" disabled={positionLocked} onClick={mirrorSelection} title={tr("Mirror the selected anchor(s) across X: the X position flips, and so do the Y and Z rotation · Ctrl+Shift+M")}>{tr("Mirror")}</button></div>
+                <div className="vector-stack vertical"><VecEditor label="A1 · Primary position" value={piece.a2} mixed={mixedPrimary} locked={positionLocked} canPaste={Boolean(vectorClipboard)} onCopy={() => copyVectorValues("a2")} onPaste={() => pasteVectorValues("a2")} onChange={(component, value, mode, startValue) => editCoordinate("a2", component, value, mode, startValue)} /><VecEditor label="A2 · Secondary position" value={piece.a1} mixed={mixedSecondary} locked={positionLocked} canPaste={Boolean(vectorClipboard)} onCopy={() => copyVectorValues("a1")} onPaste={() => pasteVectorValues("a1")} onChange={(component, value, mode, startValue) => editCoordinate("a1", component, value, mode, startValue)} />{document.rotationEditable && <VecEditor label={tr("Rotation · degrees")} value={piece.rotation.map(toDegrees) as Vec3} mixed={mixedRotation} locked={positionLocked} step={100} canPaste={Boolean(vectorClipboard)} onCopy={copyRotationValues} onPaste={pasteRotationValues} onChange={(component, value, mode) => editRotation(component, value, mode)} />}</div>
                 {document.runtimeFor(selected).length > 0 && <div className="runtime-callout"><strong>{tr("Runtime-linked anchor")}</strong>{document.runtimeFor(selected).map((line) => <span key={line}>{tr(line)}</span>)}<p>{document.wheelFollowers.has(selected) ? tr("This wheel's position is owned by its axle. Move the axle — it writes the wheel runtime table and this wheel's position together.") : tr("Each target PCK updates its own validated runtime position table during save synchronization.")}</p></div>}
               </div>
             </TogglePanel>
