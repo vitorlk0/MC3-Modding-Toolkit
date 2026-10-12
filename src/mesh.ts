@@ -29,8 +29,8 @@ export type MeshGeometry = {
   idByteOffset: number;
   /** Two floats per vertex (parallel to positions), as stored: raw / 4096, no V flip applied. */
   uvs: Float32Array;
-  /** Packets whose UVs couldn't be decoded and were zero-filled — the 0x66 UV variant, which is
-   *  still an open problem in the knowledge base, or a packet with no UV stream at all. */
+  /** Packets whose UV stream doesn't cover every vertex, zero-filled. None in the game's corpus;
+   *  kept for hand-made files. */
   uvZeroedPackets: number;
   /** "loose" for a standalone mesh.pck. "embedded" for a piece read straight out of a car PCK
    *  because no loose file exists for it — the only copy is the one baked into the car. */
@@ -51,30 +51,43 @@ export type MeshGeometry = {
 export type MeshPacket = {
   /** Packet header (`98 00 02 6C` / `C5 01 02 6C`): +0x04 packet_scale, +0x08..+0x13 culling bounds. */
   offset: number;
-  /** First s16 X of the vertex stream; `count` × 6 bytes. */
+  /** First s16 X of the vertex stream; `count` × 6 bytes. Only meaningful when `packedPositions` is false. */
   vertexOffset: number;
   count: number;
   /** packet_scale exactly as stored (may be non-finite or ≤ 0 in a broken packet). */
   scale: number;
+  /** True when positions aren't one plain V3-16 run (V3-8 deltas or several chunks): they can't be
+   *  rewritten in place through `vertexOffset`. */
+  packedPositions: boolean;
 };
 
 type PacketVertex = { xyz: Vec3; normal: Vec3; uv: [number, number]; faceEnabled: boolean };
 
 const PAYLOAD_OFFSET = 0x80;
 const MAGIC = [0x98, 0x0f, 0x7a, 0x00];
+// A geometry packet is a VIF command stream, read the way the PS2's VIF reads it: a header
+// (UNPACK V4-32 ×2 at VU address H = 0x98 or 0x1C5, the two halves of the double buffer), then the
+// stream unpacks and the register setup between them, then ITOP + MSCAL to run the microprogram.
 const BLOCK_HEADERS = new Set(["9800026c", "c501026c"]);
 const FOOTERS = new Set(["9800000406000014", "c501000406000014"]);
-const VERTEX_MARKERS = new Set(["238:105", "539:105"]);
-// The damage stream is a V4-8 unpack (0x6E, 4 bytes a vertex) or the same unpack with the mask bit
-// set (0x7E): after STMASK 0x55555555 + STROW every vertex takes the row constant and the stream
-// carries no payload at all. Motorcycles use the masked form almost everywhere.
-const DAMAGE_MARKERS = new Set(["16664:110", "16965:110", "16664:126", "16965:126"]);
-const DAMAGE_MASKED = 0x7e;
-const NORMAL_MARKERS = new Set(["154:106", "455:106"]);
-// C4/1F1 with kind 0x65 is the plain u16-pair stream the OBJ->PCK writer emits; kind 0x66 (also
-// under 1FC) shows up in original game meshes and isn't decoded yet (KB §23.5).
-const UV_MARKERS = new Set(["196:101", "497:101", "196:102", "497:102", "508:102"]);
-const UV_KIND_PLAIN = 0x65;
+const PACKET_COMMANDS_START = 0x24;
+const VIF_NOP = 0x00, VIF_STCYCL = 0x01, VIF_ITOP = 0x04, VIF_STMOD = 0x05, VIF_STMASK = 0x20, VIF_STROW = 0x30, VIF_STCOL = 0x31;
+const STMOD_OFFSET = 1, STMOD_DIFFERENCE = 2;
+const MASK_ALL_ROW = 0x55555555;
+// Each stream owns 42 VU slots right after the header: normals at H+2, UVs at H+44, positions at
+// H+86, damage at H+128. An unpack's address says which stream it feeds and from which vertex, so a
+// stream can arrive in several chunks (any order, mixed formats) and still land in place.
+const STREAM_SLOTS = 42;
+const STREAM_NORMAL = 0, STREAM_UV = 1, STREAM_POSITION = 2, STREAM_DAMAGE = 3;
+// Unpack kinds per stream (VIF cmd with the mask bit cleared). Positions: V3-16, or V3-8 deltas
+// after STROW + STMOD difference (30 game pieces: tail lights, grilles, the SSR body). UVs: V2-16
+// (what OBJ->PCK writes), V2-8 deltas the same way, V2-32, and V4-16 on a few motorcycle packets
+// (only x/y read as the UV; inference). Damage is never decoded: V4-8, or masked with no payload.
+const POSITION_KINDS = new Set([0x69, 0x6a]);
+const UV_KINDS = new Set([0x64, 0x65, 0x66, 0x6d]);
+const NORMAL_KIND = 0x6a;
+const DAMAGE_KIND = 0x6e;
+const UNPACK_PLAIN_POSITIONS = 0x69;
 const UV_FIXED_SCALE = 4096;
 
 const align = (value: number, alignment: number) => value + ((alignment - value % alignment) % alignment);
@@ -84,7 +97,6 @@ const s16 = (view: DataView, offset: number) => view.getInt16(offset, true);
 const u32 = (view: DataView, offset: number) => view.getUint32(offset, true);
 const f32 = (view: DataView, offset: number) => view.getFloat32(offset, true);
 const signed8 = (value: number) => value >= 128 ? value - 256 : value;
-const markerKey = (view: DataView, offset: number) => `${u16(view, offset)}:${view.getUint8(offset + 3)}`;
 const bytesKey = (bytes: Uint8Array, offset: number, length: number) => [...bytes.slice(offset, offset + length)].map((value) => value.toString(16).padStart(2, "0")).join("");
 const sub = (a: Vec3, b: Vec3): Vec3 => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
 const cross = (a: Vec3, b: Vec3): Vec3 => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
@@ -341,6 +353,10 @@ export function nearestMeshAnchor(document: PckDocument, selected: number, meshe
   return null;
 }
 
+/** A piece that parses but draws nothing — VIP ships placeholders like this (every vertex at the
+ *  origin) to switch a LOD row off. Not a read failure. */
+export class EmptyMeshError extends Error {}
+
 export function parseMeshPck(name: string, source: ArrayBuffer, document: PckDocument): MeshGeometry {
   const bytes = new Uint8Array(source.slice(0));
   const view = new DataView(bytes.buffer);
@@ -388,85 +404,130 @@ function parseMeshAt(name: string, bytes: Uint8Array, meshOffset: number, vaToOf
   const indices: number[] = [];
   let packetVertices = 0;
   const packets: MeshPacket[] = [];
-  const markerAt = (offset: number, markers: Set<string>, expectedCount?: number) => inside(offset, 4, bytes.length) && (expectedCount === undefined || view.getUint8(offset + 2) === expectedCount) && markers.has(markerKey(view, offset));
-  const findMarker = (start: number, end: number, markers: Set<string>, expectedCount: number) => {
-    for (let offset = Math.max(0, start); offset <= Math.min(bytes.length - 4, end); offset += 1) if (markerAt(offset, markers, expectedCount)) return offset;
-    return -1;
-  };
   let uvZeroedPackets = 0;
-  // Walks the gap between the vertex and damage streams the way the reference PCK->OBJ tool does:
-  // original meshes can put VIF/GIF setup bytes in there, so markers are searched, not assumed.
-  // Returns null when the packet's UVs can't be decoded and have to be zero-filled.
-  const decodeUvs = (start: number, damageOffset: number, count: number): [number, number][] | null => {
-    const values: [number, number][] = [];
-    for (let offset = start; offset <= damageOffset - 4 && values.length < count;) {
-      if (!UV_MARKERS.has(markerKey(view, offset))) { offset += 1; continue; }
-      if (bytes[offset + 3] !== UV_KIND_PLAIN) return null;
-      const markerCount = bytes[offset + 2];
-      const payload = offset + 4;
-      if (payload + markerCount * 4 > damageOffset) return null;
-      for (let index = 0; index < markerCount && values.length < count; index += 1) {
-        values.push([s16(view, payload + index * 4) / UV_FIXED_SCALE, s16(view, payload + index * 4 + 2) / UV_FIXED_SCALE]);
+  const hex = (offset: number) => `0x${offset.toString(16).toUpperCase()}`;
+  // Reads one packet's command stream, from just after the header to the ITOP + MSCAL footer.
+  // Returns the packet's vertices and the offset right after the footer.
+  const parsePacket = (cursor: number, end: number) => {
+    const storedScale = f32(view, cursor + 4);
+    const scale = Number.isFinite(storedScale) && storedScale > 0 ? storedScale : 1;
+    const count = u32(view, cursor + 20);
+    if (count !== u32(view, cursor + 32) || count < 1 || count > 255) throw new Error(`${name}: invalid packet vertex count at ${hex(cursor)}.`);
+    const headerAddress = u16(view, cursor) & 0x3ff;
+    // Filled, not sparse: some()/every() skip holes.
+    const position: (Vec3 | undefined)[] = new Array(count).fill(undefined);
+    const uv: ([number, number] | undefined)[] = new Array(count).fill(undefined);
+    const normalBytes = new Int32Array(count).fill(-1);
+    const row = [0, 0, 0, 0];
+    let mode = 0, mask = 0;
+    let vertexOffset = -1, plainPositions = true;
+    let offset = cursor + PACKET_COMMANDS_START;
+    for (;;) {
+      if (!inside(offset, 4, end)) throw new Error(`${name}: packet at ${hex(cursor)} has no footer.`);
+      const code = u32(view, offset);
+      const command = (code >>> 24) & 0x7f;
+      const immediate = code & 0xffff;
+      offset += 4;
+      if (command === VIF_ITOP) {
+        if (!inside(offset - 4, 8, end) || !FOOTERS.has(bytesKey(bytes, offset - 4, 8))) throw new Error(`${name}: unexpected ITOP at ${hex(offset - 4)}.`);
+        offset += 4;
+        break;
       }
-      offset = payload + markerCount * 4;
+      if (command === VIF_NOP || command === VIF_STCYCL) continue;
+      if (command === VIF_STMOD) { mode = immediate & 3; continue; }
+      if (command === VIF_STMASK) { mask = u32(view, offset); offset += 4; continue; }
+      if (command === VIF_STROW) { for (let k = 0; k < 4; k += 1) row[k] = view.getInt32(offset + k * 4, true); offset += 16; continue; }
+      if (command === VIF_STCOL) { offset += 16; continue; }
+      if ((command & 0x60) !== 0x60) throw new Error(`${name}: unsupported VIF command 0x${command.toString(16)} at ${hex(offset - 4)}.`);
+
+      // UNPACK: vn+1 components of 32/16/8 bits per vertex, `num` vertices from VU address `addr`.
+      const kind = command & 0x6f;
+      const masked = (command & 0x10) !== 0;
+      const num = ((code >>> 16) & 0xff) || 256;
+      const components = ((kind >> 2) & 3) + 1;
+      const size = [4, 2, 1, 0][kind & 3];
+      const unsigned = (immediate & 0x4000) !== 0;
+      const slot = (immediate & 0x3ff) - headerAddress - 2;
+      const stream = Math.floor(slot / STREAM_SLOTS);
+      const first = slot % STREAM_SLOTS;
+      if (slot < 0 || stream > STREAM_DAMAGE || first + num > count) throw new Error(`${name}: unpack at ${hex(offset - 4)} targets a VU address outside the packet.`);
+      if (masked) {
+        // Only the damage stream is masked, with every field taken from the row: no payload at all.
+        if (stream !== STREAM_DAMAGE || mask !== MASK_ALL_ROW) throw new Error(`${name}: unsupported masked unpack at ${hex(offset - 4)}.`);
+        continue;
+      }
+      if (!size) throw new Error(`${name}: unsupported V4-5 unpack at ${hex(offset - 4)}.`);
+      const payload = offset;
+      const payloadSize = num * components * size;
+      if (!inside(payload, payloadSize, end)) throw new Error(`${name}: truncated unpack at ${hex(offset - 4)}.`);
+      offset = payload + align(payloadSize, 4);
+      const read = (at: number) => size === 4 ? view.getInt32(at, true) : size === 2 ? (unsigned ? u16(view, at) : s16(view, at)) : (unsigned ? bytes[at] : view.getInt8(at));
+      // STMOD offset adds the row to each value; difference adds each value into the row and
+      // writes the row, so V3-8 / V2-8 streams are deltas from the STROW base.
+      const values = (vertex: number) => {
+        const at = payload + vertex * components * size;
+        const raw = Array.from({ length: components }, (_, k) => read(at + k * size));
+        if (mode === STMOD_OFFSET) return raw.map((value, k) => value + row[k]);
+        if (mode === STMOD_DIFFERENCE) { for (let k = 0; k < components; k += 1) row[k] += raw[k]; return row.slice(0, components); }
+        return raw;
+      };
+      if (stream === STREAM_POSITION) {
+        if (!POSITION_KINDS.has(kind)) throw new Error(`${name}: unsupported position format 0x${kind.toString(16)} at ${hex(offset - 4)}.`);
+        if (vertexOffset >= 0 || kind !== UNPACK_PLAIN_POSITIONS || mode !== 0 || first !== 0 || num !== count) plainPositions = false;
+        if (vertexOffset < 0) vertexOffset = payload;
+        for (let vertex = 0; vertex < num; vertex += 1) {
+          const [x, y, z] = values(vertex);
+          position[first + vertex] = [x * scale, y * scale, z * scale];
+        }
+      } else if (stream === STREAM_UV) {
+        if (!UV_KINDS.has(kind)) throw new Error(`${name}: unsupported UV format 0x${kind.toString(16)} at ${hex(offset - 4)}.`);
+        for (let vertex = 0; vertex < num; vertex += 1) {
+          const [u, v] = values(vertex);
+          uv[first + vertex] = [u / UV_FIXED_SCALE, v / UV_FIXED_SCALE];
+        }
+      } else if (stream === STREAM_NORMAL) {
+        if (kind !== NORMAL_KIND || mode !== 0) throw new Error(`${name}: unsupported normal stream at ${hex(offset - 4)}.`);
+        for (let vertex = 0; vertex < num; vertex += 1) normalBytes[first + vertex] = payload + vertex * 3;
+      } else if (kind !== DAMAGE_KIND) {
+        throw new Error(`${name}: unsupported damage format 0x${kind.toString(16)} at ${hex(offset - 4)}.`);
+      }
     }
-    return values.length === count ? values : null;
+
+    if (position.some((value) => !value)) throw new Error(`${name}: packet at ${hex(cursor)} leaves vertices without a position.`);
+    if (normalBytes.some((value) => value < 0)) throw new Error(`${name}: packet at ${hex(cursor)} leaves vertices without a normal.`);
+    const uvComplete = uv.every(Boolean);
+    if (!uvComplete) uvZeroedPackets += 1;
+    const decoded: PacketVertex[] = [];
+    for (let index = 0; index < count; index += 1) {
+      const normalOffset = normalBytes[index];
+      const first = bytes[normalOffset];
+      decoded.push({
+        xyz: position[index]!,
+        normal: normalize([signed8(first & 0xfe) / 127, signed8(bytes[normalOffset + 1]) / 127, signed8(bytes[normalOffset + 2]) / 127]),
+        uv: uvComplete ? uv[index]! : [0, 0],
+        faceEnabled: (first & 1) === 0,
+      });
+    }
+    packets.push({ offset: cursor, vertexOffset, count, scale: storedScale, packedPositions: !plainPositions });
+    return { decoded, next: offset };
   };
   const parseDataBlock = (blockOffset: number, blockSize: number) => {
     const end = blockOffset + blockSize;
     let cursor = blockOffset;
     const output: PacketVertex[][] = [];
     while (cursor < end) {
+      // Packets can sit on any 4-byte boundary with VIF NOPs (zero words) between them (VIP
+      // pieces pack them 8 bytes apart), and a block can end in 00/CD padding.
+      while (inside(cursor, 4, end) && u32(view, cursor) === 0) cursor += 4;
       let paddingOnly = true;
       for (let offset = cursor; offset < end; offset += 1) if (bytes[offset] !== 0 && bytes[offset] !== 0xcd) { paddingOnly = false; break; }
       if (paddingOnly) break;
-      if (!inside(cursor, 44, end) || !BLOCK_HEADERS.has(bytesKey(bytes, cursor, 4))) throw new Error(`${name}: unsupported packet header at 0x${cursor.toString(16).toUpperCase()}.`);
-      const storedScale = f32(view, cursor + 4);
-      const scale = Number.isFinite(storedScale) && storedScale > 0 ? storedScale : 1;
-      const count = u32(view, cursor + 20);
-      if (count !== u32(view, cursor + 32) || count < 1 || count > 255) throw new Error(`${name}: invalid packet vertex count at 0x${cursor.toString(16).toUpperCase()}.`);
-      let position = cursor + 36;
-      if (!markerAt(position, VERTEX_MARKERS, count)) throw new Error(`${name}: unsupported vertex marker at 0x${position.toString(16).toUpperCase()}.`);
-      position += 4;
-      const vertexPayload = position;
-      if (!inside(vertexPayload, count * 6, end)) throw new Error(`${name}: truncated vertex stream.`);
-      position = align(vertexPayload + count * 6, 4);
-      let damage = -1, normal = -1;
-      for (let offset = position; offset <= Math.min(end - 4, position + 0x1000); offset += 1) {
-        if (!markerAt(offset, DAMAGE_MARKERS, count)) continue;
-        const expectedNormal = align(offset + 4 + (bytes[offset + 3] === DAMAGE_MASKED ? 0 : count * 4), 4);
-        const foundNormal = findMarker(expectedNormal, expectedNormal + 0x80, NORMAL_MARKERS, count);
-        if (foundNormal >= 0) { damage = offset; normal = foundNormal; break; }
-      }
-      if (damage < 0 || normal < 0) throw new Error(`${name}: damage/normal streams were not found.`);
-      const normalPayload = normal + 4;
-      if (!inside(normalPayload, count * 3, end)) throw new Error(`${name}: truncated normal stream.`);
-      position = align(normalPayload + count * 3, 4);
-      if (!FOOTERS.has(bytesKey(bytes, position, 8))) {
-        for (let offset = position; offset <= Math.min(position + 0x40, end - 8); offset += 1) if (FOOTERS.has(bytesKey(bytes, offset, 8))) { position = offset; break; }
-      }
-      position += 8;
-      const uvs = decodeUvs(align(vertexPayload + count * 6, 4), damage, count);
-      if (!uvs) uvZeroedPackets += 1;
-      const decoded: PacketVertex[] = [];
-      for (let index = 0; index < count; index += 1) {
-        const vertexOffset = vertexPayload + index * 6;
-        const normalOffset = normalPayload + index * 3;
-        const first = bytes[normalOffset];
-        decoded.push({
-          xyz: [s16(view, vertexOffset) * scale, s16(view, vertexOffset + 2) * scale, s16(view, vertexOffset + 4) * scale],
-          normal: normalize([signed8(first & 0xfe) / 127, signed8(bytes[normalOffset + 1]) / 127, signed8(bytes[normalOffset + 2]) / 127]),
-          uv: uvs ? uvs[index] : [0, 0],
-          faceEnabled: (first & 1) === 0,
-        });
-      }
+      if (!inside(cursor, PACKET_COMMANDS_START + 4, end) || !BLOCK_HEADERS.has(bytesKey(bytes, cursor, 4))) throw new Error(`${name}: unsupported packet header at ${hex(cursor)}.`);
+      const { decoded, next } = parsePacket(cursor, end);
       // Every packet is an independent triangle-strip stream. Its first two
       // vertices are seeds marked as skip; removing them would connect the
       // first real face to the previous packet and create stretched bridges.
       output.push(decoded);
-      packets.push({ offset: cursor, vertexOffset: vertexPayload, count, scale: storedScale });
-      const next = cursor + align(position - cursor, 16);
-      if (next <= cursor) throw new Error(`${name}: packet parser did not advance.`);
       cursor = next;
     }
     return output;
@@ -502,7 +563,7 @@ function parseMeshAt(name: string, bytes: Uint8Array, meshOffset: number, vaToOf
       }
     }
   }
-  if (!indices.length) throw new Error(`${name}: no drawable triangles were decoded.`);
+  if (!indices.length) throw new EmptyMeshError(`${name}: no drawable triangles were decoded.`);
   return {
     name,
     positions: new Float32Array(positions),

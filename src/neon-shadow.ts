@@ -94,6 +94,7 @@ function findShadow(document: PckDocument) {
   try {
     const geometry = parseEmbeddedMesh(entries[0], document);
     if (geometry.packets.some((packet) => !Number.isFinite(packet.scale) || packet.scale <= 0)) throw new Error("a packet has no valid scale");
+    if (geometry.packets.some((packet) => packet.packedPositions)) throw new Error("its vertices are stored compressed and can't be rewritten in place");
     const offset = geometry.anchorIndex === null ? [0, 0, 0] as Vec3 : anchorWorldPosition(document, geometry.anchorIndex, "a2");
     return { shadow: { name: entries[0].name, geometry, offset }, shadowError: null };
   } catch (caught) {

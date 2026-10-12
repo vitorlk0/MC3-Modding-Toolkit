@@ -7,7 +7,7 @@ import { join } from "@tauri-apps/api/path";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { formatClipboard, hex, parseClipboard, PckDocument, type LodMeshEntry, type MeshBlobSnapshot, type Vec3 } from "../src/pck";
-import { MeshPckDocument, hasStockVariants, isLowLodOnly, isShadowPlane, isShellFamily, matchLodEntries, parseEmbeddedMesh, resolveGroupShaderId, resolvePieceId, type MeshGeometry } from "../src/mesh";
+import { EmptyMeshError, MeshPckDocument, hasStockVariants, isLowLodOnly, isShadowPlane, isShellFamily, matchLodEntries, parseEmbeddedMesh, resolveGroupShaderId, resolvePieceId, type MeshGeometry } from "../src/mesh";
 import { isShellPiece } from "../src/mesh-inject";
 import { exportMeshObj } from "../src/obj-export";
 import { convertObjToMeshPck } from "../src/obj";
@@ -133,7 +133,8 @@ function isMeshPck(name: string) { return name.toLowerCase().endsWith(".mesh.pck
 function readEmbeddedOnly(document: PckDocument | null, meshDocs: Map<string, MeshPckDocument>) {
   const pieces: MeshGeometry[] = [];
   const unreadable: string[] = [];
-  if (!document) return { pieces, unreadable };
+  const empty: string[] = [];
+  if (!document) return { pieces, unreadable, empty };
   const loose = new Set([...meshDocs.keys()].map((name) => name.toLowerCase()));
   const seen = new Set<string>();
   for (const entry of document.lodMeshes) {
@@ -142,9 +143,12 @@ function readEmbeddedOnly(document: PckDocument | null, meshDocs: Map<string, Me
     if (entry.meshBlockOffset === null || !entry.name || loose.has(key) || seen.has(key)) continue;
     seen.add(key);
     try { pieces.push(parseEmbeddedMesh(entry, document)); }
-    catch (error) { unreadable.push(error instanceof Error ? error.message : fileName); }
+    catch (error) {
+      if (error instanceof EmptyMeshError) empty.push(entry.name);
+      else unreadable.push(error instanceof Error ? error.message : fileName);
+    }
   }
-  return { pieces, unreadable };
+  return { pieces, unreadable, empty };
 }
 function classifyVehicleFile(name: string) {
   const match = basename(name).match(/^(.*?)(?:_([go]))?(\.psppck|\.pck)$/i);
@@ -1535,7 +1539,7 @@ export default function App() {
       <ResizeHandle variant="resize-editor" onDrag={resizeEditor} />
       <MeshViewer document={document} selected={selected} multiSelected={selectedIndices} meshes={anchorMeshes} visibleAnchors={visibleMeshAnchors} referenceGeometry={referenceGeometry} rimSizeInches={rimSizeInches} revision={revision} onMoveSelection={moveSelection} cameraEdit={cameraMode && garage && cameraPoints ? { camera: garageToPck(cameraPoints.camera), target: garageToPck(cameraPoints.target), handle: cameraHandle, lookThrough, targetPlane, safeAreas, fov: garage.fov, aspect: cameraAspects[cameraAspect], onSelectHandle: setCameraHandle, onToggleLookThrough: () => setLookThrough((value) => !value), onMove: moveShopCamera } : null} />
     </main>)}
-    {workspace === "mesh" && <div className="mesh-editor-shell"><MeshEditorWorkspace document={meshDocument} activeRole={meshRole} slots={slots} onSelectRole={setMeshViewRole} meshes={meshEditorMeshes} onEditPieceId={editPieceId} onEditGroupShader={editGroupShader} onUpdateEmbedded={updateEmbeddedMesh} onUpdateAllEmbedded={updateAllEmbeddedMeshes} onConvertObjs={() => void chooseObjFolder()} zeroShellId={zeroShellId} onSetZeroShellId={setZeroShellId} onExportObj={(mesh) => void exportPieceObj(mesh)} embeddedUnreadable={embeddedOnly.unreadable} objFolder={objFolder} describeEmbedTarget={describeEmbedTarget} describePieceSize={describePieceSize} onUndo={meshUndo} onRedo={meshRedo} canUndo={pieceIdUndoRef.current.length > 0} canRedo={pieceIdRedoRef.current.length > 0} vehicleBase={vehicleBase} loadedCount={loadedCount} onOpenFolder={() => void openFolder()} recentVehicleFolders={recentVehicleFolders} onOpenRecentFolder={(path) => void openVehicleFolderAtPath(path)} onClearRecentFolders={clearVehicleRecents} listWidth={panelWidths.meshList} onResizeList={resizeMeshList} /></div>}
+    {workspace === "mesh" && <div className="mesh-editor-shell"><MeshEditorWorkspace document={meshDocument} activeRole={meshRole} slots={slots} onSelectRole={setMeshViewRole} meshes={meshEditorMeshes} onEditPieceId={editPieceId} onEditGroupShader={editGroupShader} onUpdateEmbedded={updateEmbeddedMesh} onUpdateAllEmbedded={updateAllEmbeddedMeshes} onConvertObjs={() => void chooseObjFolder()} zeroShellId={zeroShellId} onSetZeroShellId={setZeroShellId} onExportObj={(mesh) => void exportPieceObj(mesh)} embeddedUnreadable={embeddedOnly.unreadable} embeddedEmpty={embeddedOnly.empty} objFolder={objFolder} describeEmbedTarget={describeEmbedTarget} describePieceSize={describePieceSize} onUndo={meshUndo} onRedo={meshRedo} canUndo={pieceIdUndoRef.current.length > 0} canRedo={pieceIdRedoRef.current.length > 0} vehicleBase={vehicleBase} loadedCount={loadedCount} onOpenFolder={() => void openFolder()} recentVehicleFolders={recentVehicleFolders} onOpenRecentFolder={(path) => void openVehicleFolderAtPath(path)} onClearRecentFolders={clearVehicleRecents} listWidth={panelWidths.meshList} onResizeList={resizeMeshList} /></div>}
     {workspace === "performance" && <PerformanceWorkspace slots={slots} workingRole={workingRole} vehicleBase={vehicleBase} loadedCount={loadedCount} revision={revision} onApply={applyPerformance} onStatus={setStatus} onOpenFolder={() => void openFolder()} recentVehicleFolders={recentVehicleFolders} onOpenRecentFolder={(path) => void openVehicleFolderAtPath(path)} onClearRecentFolders={clearVehicleRecents} />}
     {workspace === "audio" && <AudioWorkspace slots={slots} workingRole={workingRole} vehicleBase={vehicleBase} loadedCount={loadedCount} revision={revision} onApply={applyAudio} onStatus={setStatus} onOpenFolder={() => void openFolder()} recentVehicleFolders={recentVehicleFolders} onOpenRecentFolder={(path) => void openVehicleFolderAtPath(path)} onClearRecentFolders={clearVehicleRecents} />}
     <div className="workspace-host" style={{ display: workspace === "textures" ? "contents" : "none" }}><TextureWorkspace active={workspace === "textures"} dropped={texturesDrop} onConsumeDrop={() => setTexturesDrop(null)} onStatus={setStatus} isPathBlocked={isVehiclePathBlocked} onPendingChange={setTexturesPending} menuRef={textureMenu} /></div>

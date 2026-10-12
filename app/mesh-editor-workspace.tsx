@@ -25,7 +25,7 @@ function defaultVisibleNames(meshes: MeshGeometry[], document: PckDocument | nul
     && !isLowLodOnly(mesh, document) && !isShadowPlane(mesh.name)).map((mesh) => mesh.name));
 }
 
-export function MeshEditorWorkspace({ document, activeRole, slots, onSelectRole, meshes, onEditPieceId, onEditGroupShader, onUpdateEmbedded, onUpdateAllEmbedded, onConvertObjs, zeroShellId, onSetZeroShellId, onExportObj, embeddedUnreadable, objFolder, describeEmbedTarget, describePieceSize, onUndo, onRedo, canUndo, canRedo, vehicleBase, loadedCount, onOpenFolder, recentVehicleFolders, onOpenRecentFolder, onClearRecentFolders, listWidth, onResizeList }: {
+export function MeshEditorWorkspace({ document, activeRole, slots, onSelectRole, meshes, onEditPieceId, onEditGroupShader, onUpdateEmbedded, onUpdateAllEmbedded, onConvertObjs, zeroShellId, onSetZeroShellId, onExportObj, embeddedUnreadable, embeddedEmpty, objFolder, describeEmbedTarget, describePieceSize, onUndo, onRedo, canUndo, canRedo, vehicleBase, loadedCount, onOpenFolder, recentVehicleFolders, onOpenRecentFolder, onClearRecentFolders, listWidth, onResizeList }: {
   document: PckDocument | null;
   activeRole: VehicleRole | null;
   slots: VehicleSlots;
@@ -42,6 +42,8 @@ export function MeshEditorWorkspace({ document, activeRole, slots, onSelectRole,
   onExportObj(mesh: MeshGeometry): void;
   /** Embedded-only pieces the parser couldn't read, so they're missing from the list. */
   embeddedUnreadable: string[];
+  /** Embedded pieces that parse but draw nothing (placeholders); counted, not listed. */
+  embeddedEmpty: string[];
   objFolder: string;
   describeEmbedTarget(meshName: string): { targets: string[]; inserting: boolean; hasRow: boolean };
   describePieceSize(meshName: string): { embedded: number | null; embeddedSaved: number | null; loose: number | null; looseSaved: number | null; embeddedHere: boolean };
@@ -118,7 +120,7 @@ export function MeshEditorWorkspace({ document, activeRole, slots, onSelectRole,
   return (
     <main className="mesh-editor-loaded">
       <section className="vehicle-set-bar">
-        <div className="set-summary"><p className="eyebrow">{tr("VEHICLE SET")}</p><strong>{vehicleBase}</strong><span><Tx t="{0}/3 files ready · shared with Anchors" v={[loadedCount]} /></span>{embeddedUnreadable.length > 0 && <span className="warn" title={embeddedUnreadable.join("\n")}><Tx t="{0} embedded piece{1} couldn't be read" v={[embeddedUnreadable.length, embeddedUnreadable.length === 1 ? "" : "s"]} /></span>}</div>
+        <div className="set-summary"><p className="eyebrow">{tr("VEHICLE SET")}</p><strong>{vehicleBase}</strong><span><Tx t="{0}/3 files ready · shared with Anchors" v={[loadedCount]} /></span>{embeddedUnreadable.length > 0 && <span className="warn" title={embeddedUnreadable.join("\n")}><Tx t="{0} embedded piece{1} couldn't be read" v={[embeddedUnreadable.length, embeddedUnreadable.length === 1 ? "" : "s"]} /></span>}{embeddedEmpty.length > 0 && <span title={embeddedEmpty.join("\n")}><Tx t="{0} empty placeholder piece{1}" v={[embeddedEmpty.length, embeddedEmpty.length === 1 ? "" : "s"]} /></span>}</div>
         <div className="mesh-role-tabs">{roles.filter((role) => slots[role]).map((role) => {
           const roleDocument = slots[role]!.document;
           const pending = roleDocument.dirty;

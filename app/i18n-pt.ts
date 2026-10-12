@@ -540,6 +540,7 @@ export const PT: Record<string, string> = {
   "Uses the same vehicle folder as the Anchors tab — the three car PCKs and the loose mesh.pck files. Click any triangle to identify its piece and shader.": "Usa a mesma pasta de veículo da aba Anchors — os três PCKs do carro e os mesh.pck soltos. Clique em qualquer triângulo para identificar a peça e o shader.",
   "{0}/3 files ready · shared with Anchors": "{0}/3 arquivos prontos · compartilhado com Anchors",
   "{0} embedded piece{1} couldn't be read": "{0} peça{1} embutida{1} não pôde ser lida",
+  "{0} empty placeholder piece{1}": "{0} peça{1} vazia{1} (placeholder)",
   "Convert the OBJs in {0} into mesh.pck pieces and embed them. Last used folder is remembered; nothing is written until you save.": "Converte os OBJs de {0} em peças mesh.pck e as embute. A última pasta usada é lembrada; nada é gravado até você salvar.",
   "Pick a folder of OBJs to convert into mesh.pck pieces and embed in one pass. Nothing is written until you save.": "Escolha uma pasta de OBJs para converter em peças mesh.pck e embutir de uma vez. Nada é gravado até você salvar.",
   "Convert OBJs…": "Converter OBJs…",
