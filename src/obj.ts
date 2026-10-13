@@ -43,6 +43,9 @@ export type ObjConvertOptions = {
   maxFacesPerMesh: number;
   maxEmittedVerticesPerMesh: number;
   virtualOffset: number;
+  /** Writes the damage stream as the game's masked constant (no payload) and UVs as V2-8 deltas
+   *  where that is smaller (modding KB §10.5.2). Off: the precedent tool's layout, byte for byte. */
+  compactStreams: boolean;
 };
 
 export const defaultObjConvertOptions: ObjConvertOptions = {
@@ -57,6 +60,7 @@ export const defaultObjConvertOptions: ObjConvertOptions = {
   maxFacesPerMesh: 8000,
   maxEmittedVerticesPerMesh: 0,
   virtualOffset: VIRTUAL_OFFSET,
+  compactStreams: false,
 };
 
 export type ConvertedMesh = {
@@ -413,6 +417,12 @@ export function packetCullingBounds(vertexBytes: ArrayLike<number>, packetScale:
   return [(minY + maxY) * 0.5, (minZ + maxZ) * 0.5, radius];
 }
 
+/** One packet's quantized contents, as written: the 32 header bytes after the header code
+ *  (packet_scale, culling bounds, count, aux, count) and the raw bytes of each stream. */
+type PacketData = { count: number; header: number[]; vertexBytes: number[]; uvBytes: number[]; damageBytes: number[]; normalBytes: number[] };
+
+const DAMAGE_DEFAULT = [0x80, 0x80, 0x80, 0x00];
+
 /** Wraps one block's vertices into the four PS2 VIF sub-packets (position, UV, damage, normal)
  *  plus the footer. Every marker alternates on block parity, which the engine relies on. */
 function encodeBlock(
@@ -438,48 +448,102 @@ function encodeBlock(
     pushNormal(normalBytes, normal, !skip);
   }
 
-  const even = blockParity % 2 === 0;
   const packetScale = 1 / t.packetVertexScale;
-  const bounds = packetCullingBounds(vertexBytes, packetScale);
-
-  const vertexChunk: number[] = [];
-  pushHex(vertexChunk, even ? "9800026C" : "C501026C");
-  pushF32(vertexChunk, packetScale);
-  for (const value of bounds) pushF32(vertexChunk, value);
-  pushU32(vertexChunk, count);
-  pushF32(vertexChunk, 0); pushF32(vertexChunk, 0);
-  pushU32(vertexChunk, count);
-  pushHex(vertexChunk, even ? "EE00" : "1B02");
-  vertexChunk.push(count & 0xff);
-  pushHex(vertexChunk, "69");
-  vertexChunk.push(...vertexBytes);
-  padTo(vertexChunk, 4, 0);
-
-  const uvChunk: number[] = [];
-  pushHex(uvChunk, even ? "C400" : "F101");
-  uvChunk.push(count & 0xff);
-  pushHex(uvChunk, "65");
-  uvChunk.push(...uvBytes);
-  padTo(uvChunk, 4, 0);
-
-  const damageChunk: number[] = [];
-  pushHex(damageChunk, even ? "1841" : "4542");
-  damageChunk.push(count & 0xff);
-  pushHex(damageChunk, "6E");
+  const header: number[] = [];
+  pushF32(header, packetScale);
+  for (const value of packetCullingBounds(vertexBytes, packetScale)) pushF32(header, value);
+  pushU32(header, count);
+  pushF32(header, 0); pushF32(header, 0);
+  pushU32(header, count);
   // 0x80808000 written big-endian, i.e. the bytes 80 80 80 00, once per vertex.
-  for (let i = 0; i < count; i += 1) damageChunk.push(0x80, 0x80, 0x80, 0x00);
-  padTo(damageChunk, 4, 0);
+  const damageBytes = Array.from({ length: count }, () => DAMAGE_DEFAULT).flat();
+  return encodePacket({ count, header, vertexBytes, uvBytes, damageBytes, normalBytes }, blockParity, t.compactStreams);
+}
 
-  const normalChunk: number[] = [];
-  pushHex(normalChunk, even ? "9A00" : "C701");
-  normalChunk.push(count & 0xff);
-  pushHex(normalChunk, "6A");
-  normalChunk.push(...normalBytes);
-  padTo(normalChunk, 4, 0);
+const s16At = (bytes: number[], offset: number) => { const value = bytes[offset] | (bytes[offset + 1] << 8); return value >= 0x8000 ? value - 0x10000 : value; };
 
-  const block = [...vertexChunk, ...uvChunk, ...damageChunk, ...normalChunk];
-  pushHex(block, even ? "9800000406000014" : "C501000406000014");
-  return padTo(block, 16, 0);
+/**
+ * UVs as V2-8 deltas, the way the game stores most of its own: STROW sets the base, STMOD 2 makes
+ * every value a step from the previous one, and a delta that leaves s8 starts a new chunk with a
+ * new base. Each chunk lands by its VU address (UV stream base + first vertex).
+ */
+function encodeUvDeltas(uvBytes: number[], count: number, uvAddress: number): number[] {
+  const values = Array.from({ length: count }, (_, i) => [s16At(uvBytes, i * 4), s16At(uvBytes, i * 4 + 2)]);
+  const out: number[] = [];
+  let first = 0;
+  while (first < count) {
+    let end = first + 1;
+    while (end < count && values[end].every((value, k) => { const delta = value - values[end - 1][k]; return delta >= -128 && delta <= 127; })) end += 1;
+    pushHex(out, "00000030");
+    pushU32(out, values[first][0] >>> 0); pushU32(out, values[first][1] >>> 0); pushU32(out, 0); pushU32(out, 0);
+    if (first === 0) pushHex(out, "02000005");          // STMOD 2 (difference)
+    const address = uvAddress + first;
+    out.push(address & 0xff, (address >> 8) & 0x03, (end - first) & 0xff, 0x66);
+    for (let i = first; i < end; i += 1) for (let k = 0; k < 2; k += 1) out.push((i === first ? 0 : values[i][k] - values[i - 1][k]) & 0xff);
+    padTo(out, 4, 0);
+    first = end;
+  }
+  pushHex(out, "00000005");                              // STMOD 0
+  return out;
+}
+
+/** Writes one packet. `compact` swaps in the game's denser forms where they fit (KB §10.5.2):
+ *  a constant damage stream becomes a masked unpack with the value in the row and no payload,
+ *  and UVs become V2-8 deltas when that is smaller. Positions stay V3-16: at 1/8192 consecutive
+ *  strip vertices are almost never within the ±127 units a V3-8 delta reaches. */
+function encodePacket(p: PacketData, parity: number, compact: boolean): number[] {
+  const even = parity % 2 === 0;
+  const count = p.count;
+  const out: number[] = [];
+  pushHex(out, even ? "9800026C" : "C501026C");
+  out.push(...p.header);
+  pushHex(out, even ? "EE00" : "1B02");
+  out.push(count & 0xff);
+  pushHex(out, "69");
+  out.push(...p.vertexBytes);
+  padTo(out, 4, 0);
+
+  const plainUvSize = 4 + padSize(p.uvBytes.length, 4);
+  const deltaUvs = compact ? encodeUvDeltas(p.uvBytes, count, even ? 0xc4 : 0x1f1) : null;
+  if (deltaUvs && deltaUvs.length < plainUvSize) out.push(...deltaUvs);
+  else {
+    pushHex(out, even ? "C400" : "F101");
+    out.push(count & 0xff);
+    pushHex(out, "65");
+    out.push(...p.uvBytes);
+    padTo(out, 4, 0);
+  }
+
+  const constantDamage = p.damageBytes.every((value, i) => value === p.damageBytes[i % 4]);
+  if (compact && constantDamage) {
+    // The game's own sequence, byte for byte (bikes, suspension arms): every field from the row,
+    // CL 1 / WL count, the masked V4-8 unpack with no data, then the cycle put back to 1 / 1.
+    // The unpack is unsigned, so row = the bytes zero-extended = what the plain stream gave the VU.
+    pushHex(out, "0000002055555555");
+    pushHex(out, "00000030");
+    for (let k = 0; k < 4; k += 1) pushU32(out, p.damageBytes[k]);
+    out.push(0x01, count & 0xff, 0x00, 0x01);
+    pushHex(out, even ? "1841" : "4542");
+    out.push(count & 0xff);
+    pushHex(out, "7E");
+    pushHex(out, "00000000");
+    pushHex(out, "01010001");
+  } else {
+    pushHex(out, even ? "1841" : "4542");
+    out.push(count & 0xff);
+    pushHex(out, "6E");
+    out.push(...p.damageBytes);
+    padTo(out, 4, 0);
+  }
+
+  pushHex(out, even ? "9A00" : "C701");
+  out.push(count & 0xff);
+  pushHex(out, "6A");
+  out.push(...p.normalBytes);
+  padTo(out, 4, 0);
+
+  pushHex(out, even ? "9800000406000014" : "C501000406000014");
+  return padTo(out, 16, 0);
 }
 
 type MeshStream = { blocks: number[][]; vertexCount: number };
@@ -612,6 +676,58 @@ function makePckFile(streams: MeshStream[], virtualOffset: number) {
 
   const mesh = [...meshHeader(mainPointers, groupCount, virtualOffset), ...tail];
   return new Uint8Array([...fileHeader(mesh.length, virtualOffset), ...mesh]);
+}
+
+/**
+ * Re-encodes a mesh.pck this converter (or the precedent Python tool) wrote, with compactStreams
+ * on, keeping its geometry, UVs, normals, header, piece ID and shader IDs. It first rebuilds the
+ * file with compaction off and requires that to match the input byte for byte, so anything that
+ * isn't exactly this converter's layout is refused instead of being rewritten by guesswork.
+ */
+export function compactConvertedMeshPck(source: Uint8Array): Uint8Array {
+  const view = new DataView(source.buffer, source.byteOffset, source.byteLength);
+  const virtualOffset = view.getUint32(0, true);
+  const offsetOf = (address: number) => PAYLOAD_OFFSET + (address - virtualOffset);
+  const groupCount = view.getUint32(PAYLOAD_OFFSET + 0x08, true);
+  const groupTable = offsetOf(view.getUint32(PAYLOAD_OFFSET + 0x10, true));
+  if (groupCount < 1 || groupCount > 4096 || groupTable < PAYLOAD_OFFSET || groupTable + groupCount * 8 > source.length) throw new Error("Not a mesh.pck this converter wrote (group table).");
+  const groups: PacketData[][] = [];
+  for (let group = 0; group < groupCount; group += 1) {
+    if (view.getUint16(groupTable + group * 8 + 4, true) !== 1) throw new Error("Not a mesh.pck this converter wrote (block count).");
+    const entry = offsetOf(view.getUint32(groupTable + group * 8, true));
+    const start = offsetOf(view.getUint32(entry, true));
+    const end = start + view.getUint16(entry + 4, true) * 16;
+    if (start < PAYLOAD_OFFSET || end > source.length) throw new Error("Not a mesh.pck this converter wrote (block bounds).");
+    const packets: PacketData[] = [];
+    for (let cursor = start; cursor < end;) {
+      const count = view.getUint32(cursor + 0x14, true);
+      const even = packets.length % 2 === 0;
+      const at = (offset: number, hex: string) => { const expected: number[] = []; pushHex(expected, hex); if (!expected.every((value, i) => source[offset + i] === value)) throw new Error(`Not a mesh.pck this converter wrote (packet layout at 0x${offset.toString(16)}).`); };
+      at(cursor, even ? "9800026C" : "C501026C");
+      let offset = cursor + 0x24;
+      const stream = (hex: string, size: number) => { at(offset, hex); if (source[offset + 2] !== (count & 0xff)) throw new Error("Not a mesh.pck this converter wrote (stream count)."); const bytes = [...source.subarray(offset + 4, offset + 4 + size)]; offset = offset + 4 + padSize(size, 4); return bytes; };
+      const vertexBytes = stream(even ? "EE00" : "1B02", count * 6);
+      const uvBytes = stream(even ? "C400" : "F101", count * 4);
+      const damageBytes = stream(even ? "1841" : "4542", count * 4);
+      const normalBytes = stream(even ? "9A00" : "C701", count * 3);
+      at(offset, even ? "9800000406000014" : "C501000406000014");
+      packets.push({ count, header: [...source.subarray(cursor + 4, cursor + 0x24)], vertexBytes, uvBytes, damageBytes, normalBytes });
+      cursor = cursor + padSize(offset + 8 - cursor, 16);
+    }
+    groups.push(packets);
+  }
+  const rebuild = (compact: boolean) => {
+    const streams = groups.map((packets) => ({ blocks: packets.map((packet, index) => encodePacket(packet, index, compact)), vertexCount: packets.reduce((sum, packet) => sum + packet.count, 0) }));
+    const bytes = makePckFile(streams, virtualOffset);
+    // Piece ID and shader IDs come from the source; the layout above them is identical.
+    bytes[MESH_ID_OFFSET] = source[MESH_ID_OFFSET];
+    const materialTable = offsetOf(view.getUint32(PAYLOAD_OFFSET + 0x0c, true));
+    bytes.set(source.subarray(materialTable, materialTable + groupCount * 2), materialTable);
+    return bytes;
+  };
+  const plain = rebuild(false);
+  if (plain.length !== source.length || !plain.every((value, i) => value === source[i])) throw new Error("Not a mesh.pck this converter wrote: rebuilding it uncompacted doesn't reproduce it byte for byte.");
+  return rebuild(true);
 }
 
 // --- names and IDs -----------------------------------------------------------
