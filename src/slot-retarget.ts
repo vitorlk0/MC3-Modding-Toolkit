@@ -7,7 +7,7 @@ import { memoryReader } from "./iso9660";
 import { detectPackage, type PackageFile } from "./iso-install";
 import { PckDocument } from "./pck";
 import {
-  PAINT_ARRAYS, SLOT_REFERENCE, elfMentions, knownClass, referenceSlot, slotPaint, slotPlates, type SlotReference,
+  PAINT_ARRAYS, SLOT_REFERENCE, classLabel, elfMentions, knownClass, referenceSlot, slotPaint, slotPlates, type SlotReference,
 } from "./slot-reference";
 
 /**
@@ -276,9 +276,9 @@ export async function retargetPackage(label: string, source: RetargetSource, tar
   } else notes.add("warn", `The package has no ${from}.pck to check, so car versus bike wasn't checked.`);
 
   // ---- class and slots the game's code names
-  if (!source.className) notes.add("warn", `The class of ${from} is unknown (it isn't an original or a VIP slot), so it couldn't be compared with ${slot.name}'s (${slot.className}).`);
-  else if (source.className !== slot.className) notes.add("warn", `Class changes: ${from} is ${source.className}, ${slot.name} is ${slot.className}. What depends on the class (Zone, Agro, Roar, bike or SUV handling) follows the slot.`);
-  else notes.add("ok", `Same class: ${slot.className}.`);
+  if (!source.className) notes.add("warn", `The class of ${from} is unknown (it isn't an original or a VIP slot), so it couldn't be compared with ${slot.name}'s (${classLabel(slot.className)}).`);
+  else if (source.className !== slot.className) notes.add("warn", `Class changes: ${from} is ${classLabel(source.className)}, ${slot.name} is ${classLabel(slot.className)}. What depends on the class (Zone, Agro, Roar, bike or SUV handling) follows the slot.`);
+  else notes.add("ok", `Same class: ${classLabel(slot.className)}.`);
   for (const car of [from, slot.name]) for (const where of elfMentions(car)) notes.add("warn", `${car} is named in the game's code (${where}); what that special case does wasn't identified.`);
 
   // ---- menus

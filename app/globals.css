@@ -858,6 +858,9 @@ button { color:inherit; }
 .dat-file-list code { color:#b9c0b9; font:10.5px var(--mono); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .dat-file-list em { color:#6b736b; font-style:normal; }
 .retarget-pick { display:flex; flex-direction:column; gap:8px; padding:2px 18px 16px; }
+.retarget-filter { width:100%; max-width:420px; border:1px solid var(--line); border-radius:6px; padding:7px 9px; background:#0f120f; color:#d5dad5; font:500 11.5px var(--mono); outline:none; }
+.retarget-filter:focus { border-color:var(--lime); }
+.retarget-filter:disabled { color:#646c64; }
 .retarget-select { width:100%; max-width:420px; border:1px solid var(--line); border-radius:6px; padding:7px 9px; background:#0f120f; color:var(--lime); font:700 11.5px var(--mono); outline:none; cursor:pointer; }
 .retarget-select:focus { border-color:var(--lime); }
 .retarget-select:disabled { color:#646c64; cursor:default; }

@@ -38,7 +38,7 @@ const tools: Tool[] = [
   { id: "compact-iso", number: "08", name: "Compact ISO", blurb: "Pack the original dual-layer ISO into one layer", status: "active" },
   { id: "exhausts", number: "09", name: "Exhaust Tips", blurb: "Turn rear-bumper exhaust tips on or off", status: "active" },
   { id: "neon", number: "10", name: "Neon & Shadow", blurb: "Resize the colored neon and the ground shadow", status: "active" },
-  { id: "slot-retarget", number: "11", name: "Slot Retarget", blurb: "Move a car mod onto another car's slot", status: "active", experimental: true },
+  { id: "slot-retarget", number: "11", name: "Slot Retarget", blurb: "Move a car mod onto another car's slot", status: "active" },
 ];
 
 const statusBadges: Record<ToolStatus, string | null> = { active: null, next: "NEXT", planned: "SOON" };

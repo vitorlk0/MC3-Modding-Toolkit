@@ -17,6 +17,8 @@ const ported: Credit[] = [
   { who: "Performance Editor v1.1", what: "@ZNXee171 & @mc3rxx — the VehSim / VehGyro / VehZone layout behind the Performance tab." },
   { who: "dave.py", what: "EdnessP — the DAVE archive format, and the layout the Vehicle DAT Builder reproduces byte for byte." },
   { who: "MC3 ISO Direct Explorer", what: "RibeiroG — the first tool to patch ASSETS.DAT straight inside the ISO, and the reference for ISO Install." },
+  { who: "Audio Curve GUI · Texture Finder", what: "Mid Engine [@mid_engine] — the tools behind the Audio and Textures tabs." },
+  { who: "Carcfg, Flash Menu, Mesh Injector & ID Fix scripts", what: "Mid Engine [@mid_engine] — the scripts behind the Carcfg Randomizer, the Flash Menu Editor, the Mesh Injector and Mesh ID Sync." },
 ];
 
 export function AboutDialog({ onClose }: { onClose: () => void }) {

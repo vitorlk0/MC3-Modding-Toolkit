@@ -71,4 +71,7 @@ export const slotPlates = (slot: SlotReference) => slot.plates ?? SLOT_REFERENCE
 export const slotPaint = (slot: SlotReference) => slot.paint ?? SLOT_REFERENCE.paint;
 export const elfMentions = (name: string) => ELF_NAMED_SLOTS.filter((list) => list.slots.includes(name.toLowerCase())).map((list) => list.where);
 /** The class a slot has in vanilla, or in the VIP for slots only the VIP has; null when unknown. */
+/** A vehicle.lst class as the game's menus name it: CULTURE is the Tuner class. Display only;
+ *  comparisons keep using the raw name. */
+export const classLabel = (className: string) => className === "CULTURE" ? "TUNER" : className;
 export const knownClass = (name: string) => referenceSlot(name)?.className ?? SLOT_REFERENCE.vipClasses[name.toLowerCase()] ?? null;

@@ -6,7 +6,7 @@ import { readPackageFiles } from "../iso-io";
 import { readZip } from "../../src/zip-read";
 import { writeZip } from "../../src/zip-write";
 import { readRetargetSource, retargetPackage, retargetSlots, type RetargetLevel, type RetargetResult, type RetargetSource } from "../../src/slot-retarget";
-import { elfMentions, SLOT_REFERENCE } from "../../src/slot-reference";
+import { classLabel, elfMentions, SLOT_REFERENCE } from "../../src/slot-reference";
 import { basename, parentPath, pickFiles, sizeLabel, writeVerified } from "./toolkit-io";
 import { loadRecent, pushRecent, saveRecent } from "../recent-paths";
 import { RecentList } from "./toolkit-ui";
@@ -46,11 +46,20 @@ export function SlotRetargetTool({ dropped, onConsumeDrop, onStatus }: {
   const run = useRef(0);
 
   const slots = useMemo(() => retargetSlots(), []);
+  // Typing narrows the list: spaces, underscores and the vp_ prefix don't matter ("is 300" finds
+  // vp_is300_04), and the class counts too ("tuner"). Enter picks the first slot left.
+  const [filter, setFilter] = useState("");
+  const squash = (text: string) => text.toLowerCase().replace(/^vp_/, "").replace(/[^a-z0-9]/g, "");
   const byClass = useMemo(() => {
+    const query = squash(filter);
     const groups = new Map<string, typeof slots>();
-    for (const slot of [...slots].sort((a, b) => a.name.localeCompare(b.name))) groups.set(slot.className, [...(groups.get(slot.className) ?? []), slot]);
+    for (const slot of [...slots].sort((a, b) => a.name.localeCompare(b.name))) {
+      const label = classLabel(slot.className);
+      if (query && !squash(slot.name).includes(query) && !squash(label).includes(query)) continue;
+      groups.set(label, [...(groups.get(label) ?? []), slot]);
+    }
     return [...groups].sort(([a], [b]) => a.localeCompare(b));
-  }, [slots]);
+  }, [slots, filter]);
 
   const load = useCallback(async (path: string) => {
     try {
@@ -150,7 +159,7 @@ export function SlotRetargetTool({ dropped, onConsumeDrop, onStatus }: {
           <span className="toolkit-file-type">{tr("ZIP")}</span>
           <span className="toolkit-drop-copy">
             <strong>{loaded ? basename(loaded.path) : busy ? tr("Reading…") : tr("Choose a mod ZIP")}</strong>
-            <small>{source ? <Tx t="Made for {0} · {1} · {2} files" v={[<code>{source.car}</code>, source.className ?? tr("class unknown"), source.files.length]} /> : tr("Click to browse, or drop it on the window")}</small>
+            <small>{source ? <Tx t="Made for {0} · {1} · {2} files" v={[<code>{source.car}</code>, source.className ? classLabel(source.className) : tr("class unknown"), source.files.length]} /> : tr("Click to browse, or drop it on the window")}</small>
           </span>
           <span className="toolkit-drop-action">{loaded ? tr("CHANGE") : tr("+ OPEN")}</span>
         </button>
@@ -163,14 +172,21 @@ export function SlotRetargetTool({ dropped, onConsumeDrop, onStatus }: {
         <div><span className="step-number">02</span><div><h3>{tr("Choose the slot to replace")}</h3><p>{tr("One of the original game's cars. It is replaced entirely by the mod; only its save identity is kept.")}</p></div></div>
         {targetSlot && <div className="toolkit-chips">
           <span><Tx t="index {0}" v={[<strong>{targetSlot.index}</strong>]} /></span>
-          <span className={source?.className && source.className !== targetSlot.className ? "prior" : ""}><strong>{targetSlot.className}</strong></span>
+          <span className={source?.className && source.className !== targetSlot.className ? "prior" : ""}><strong>{classLabel(targetSlot.className)}</strong></span>
           <span><Tx t="{0} wheels" v={[<strong>{targetSlot.wheels}</strong>]} /></span>
         </div>}
       </div>
       <div className="retarget-pick">
+        <input className="retarget-filter" type="search" value={filter} disabled={!loaded || busy} placeholder={tr("Type to filter: is 300, charger, tuner…")} aria-label={tr("Filter slots")}
+          onChange={(event) => setFilter(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key !== "Enter") return;
+            const first = byClass.flatMap(([, group]) => group).find((slot) => slot.name !== source?.car);
+            if (first) { event.preventDefault(); void chooseTarget(first.name); }
+          }} />
         <select className="retarget-select" value={target} disabled={!loaded || busy} onChange={(event) => void chooseTarget(event.target.value)} aria-label={tr("Target slot")}>
           <option value="">{loaded ? tr("Choose a slot…") : tr("Open a mod first")}</option>
-          {byClass.map(([className, group]) => <optgroup key={className} label={className}>
+          {byClass.map(([label, group]) => <optgroup key={label} label={label}>
             {group.map((slot) => <option key={slot.name} value={slot.name} disabled={slot.name === source?.car}>
               {slot.name}{slot.wheels === 2 ? ` · ${tr("bike")}` : ""}{elfMentions(slot.name).length ? " · ELF" : ""}
             </option>)}
