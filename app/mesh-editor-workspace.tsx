@@ -25,7 +25,7 @@ function defaultVisibleNames(meshes: MeshGeometry[], document: PckDocument | nul
     && !isLowLodOnly(mesh, document) && !isShadowPlane(mesh.name)).map((mesh) => mesh.name));
 }
 
-export function MeshEditorWorkspace({ document, activeRole, slots, onSelectRole, meshes, onEditPieceId, onEditGroupShader, onUpdateEmbedded, onUpdateAllEmbedded, onConvertObjs, zeroShellId, onSetZeroShellId, onExportObj, embeddedUnreadable, embeddedEmpty, objFolder, describeEmbedTarget, describePieceSize, onUndo, onRedo, canUndo, canRedo, vehicleBase, loadedCount, onOpenFolder, recentVehicleFolders, onOpenRecentFolder, onClearRecentFolders, listWidth, onResizeList }: {
+export function MeshEditorWorkspace({ document, activeRole, slots, onSelectRole, meshes, onEditPieceId, onEditGroupShader, onUpdateEmbedded, onUpdateAllEmbedded, onConvertObjs, zeroShellId, onSetZeroShellId, compactStreams, onSetCompactStreams, onExportObj, embeddedUnreadable, embeddedEmpty, objFolder, describeEmbedTarget, describePieceSize, onUndo, onRedo, canUndo, canRedo, vehicleBase, loadedCount, onOpenFolder, recentVehicleFolders, onOpenRecentFolder, onClearRecentFolders, listWidth, onResizeList }: {
   document: PckDocument | null;
   activeRole: VehicleRole | null;
   slots: VehicleSlots;
@@ -38,6 +38,9 @@ export function MeshEditorWorkspace({ document, activeRole, slots, onSelectRole,
   onConvertObjs(): void;
   /** Sync (and Convert OBJs' embed) sets the table ID of pieces named "shell" to 0 first. */
   zeroShellId: boolean;
+  /** Convert OBJs with the compact stream layout (smaller pieces, same geometry). */
+  compactStreams: boolean;
+  onSetCompactStreams(value: boolean): void;
   onSetZeroShellId(value: boolean): void;
   onExportObj(mesh: MeshGeometry): void;
   /** Embedded-only pieces the parser couldn't read, so they're missing from the list. */
@@ -134,6 +137,10 @@ export function MeshEditorWorkspace({ document, activeRole, slots, onSelectRole,
         <label className="sync-option" title={tr("When syncing or converting OBJs, pieces with 'shell' in their name get ID 0 in every loaded PCK and in the embedded copy. Clears an ID a shell borrowed to preview.")}>
           <input type="checkbox" checked={zeroShellId} onChange={(event) => onSetZeroShellId(event.target.checked)} />
           <span>{tr("Zero shell ID")}</span>
+        </label>
+        <label className="sync-option" title={tr("Convert OBJs into ~16% smaller pieces with the same geometry: the constant damage stream is written the way the game writes it for its own bikes, with no per-vertex data, and UVs as small steps where that is shorter. Tested in game on loose and embedded pieces.")}>
+          <input type="checkbox" checked={compactStreams} onChange={(event) => onSetCompactStreams(event.target.checked)} />
+          <span>{tr("Compact")}</span>
         </label>
         <button className="folder-button" onClick={onOpenFolder}>{tr("Open folder…")}</button>
       </section>

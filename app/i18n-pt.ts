@@ -552,6 +552,8 @@ export const PT: Record<string, string> = {
   "Bring every loose mesh.pck in line at once: update the ones already baked in, and insert the ones that only have an empty table row waiting. Stays in memory until you save.": "Sincroniza todos os mesh.pck soltos de uma vez: atualiza os que já estão embutidos e insere os que só têm uma linha vazia esperando na tabela. Fica na memória até você salvar.",
   "Sync all": "Sincronizar tudo",
   "Zero shell ID": "Zerar ID da shell",
+  "Compact": "Compacto",
+  "Convert OBJs into ~16% smaller pieces with the same geometry: the constant damage stream is written the way the game writes it for its own bikes, with no per-vertex data, and UVs as small steps where that is shorter. Tested in game on loose and embedded pieces.": "Converte OBJs em peças ~16% menores com a mesma geometria: o stream de damage constante é gravado como o jogo grava nas próprias motos, sem dado por vértice, e os UVs como pequenos passos onde fica menor. Testado no jogo em peças soltas e embutidas.",
   "When syncing or converting OBJs, pieces with 'shell' in their name get ID 0 in every loaded PCK and in the embedded copy. Clears an ID a shell borrowed to preview.": "Ao sincronizar ou converter OBJs, peças com 'shell' no nome recebem ID 0 em todos os PCKs carregados e na cópia embutida. Limpa um ID que a carroceria emprestou para aparecer na prévia.",
   "Takes up {0} of this PCK{1}": "Ocupa {0} deste PCK{1}",
   "{0} by {1} — was {2} on disk, will be {3} once saved{4}": "{0} em {1} — era {2} no disco, será {3} depois de salvo{4}",

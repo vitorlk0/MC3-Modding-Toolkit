@@ -214,6 +214,7 @@ const PPF_RECENTS_KEY = "mc3pae.recentPpfFolders";
 
 const PANEL_WIDTHS_KEY = "mc3pae.panelWidths";
 const ZERO_SHELL_ID_KEY = "mc3pae.syncZeroShellId";
+const COMPACT_STREAMS_KEY = "mc3pae.compactStreams";
 const CAMERA_ASPECT_KEY = "mc3pae.shopCameraAspect";
 const TARGET_PLANE_KEY = "mc3pae.shopCameraTargetPlane";
 const SAFE_AREAS_KEY = "mc3pae.shopCameraSafeAreas";
@@ -406,6 +407,9 @@ export default function App() {
   const [panelWidths, setPanelWidths] = useState(() => loadPanelWidths());
   const [zeroShellId, setZeroShellId] = useState(() => { try { return localStorage.getItem(ZERO_SHELL_ID_KEY) !== "false"; } catch { return true; } });
   useEffect(() => { try { localStorage.setItem(ZERO_SHELL_ID_KEY, String(zeroShellId)); } catch { /* storage unavailable */ } }, [zeroShellId]);
+  // On unless turned off: the compact layout was validated in game (loose and embedded pieces).
+  const [compactStreams, setCompactStreams] = useState(() => { try { return localStorage.getItem(COMPACT_STREAMS_KEY) !== "false"; } catch { return true; } });
+  useEffect(() => { try { localStorage.setItem(COMPACT_STREAMS_KEY, String(compactStreams)); } catch { /* storage unavailable */ } }, [compactStreams]);
   const menuRef = useRef<HTMLDivElement>(null);
   const document = workingRole ? slots[workingRole]?.document ?? null : null;
   const loadedCount = roles.filter((role) => slots[role]).length;
@@ -626,7 +630,7 @@ export default function App() {
       for (const objName of objFiles) {
         try {
           const text = new TextDecoder().decode(await readFile(await join(folderPath, objName)));
-          const result = convertObjToMeshPck(text, objName);
+          const result = convertObjToMeshPck(text, objName, { compactStreams });
           const existing = nextMeshDocs.get(result.name);
           if (existing) {
             existing.replaceBytes(result.bytes);
@@ -667,7 +671,7 @@ export default function App() {
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "Could not read that OBJ folder.");
     }
-  }, [meshDocs, meshDocument, slots, updateEmbeddedMeshes]);
+  }, [compactStreams, meshDocs, meshDocument, slots, updateEmbeddedMeshes]);
 
   const chooseObjFolder = useCallback(async () => {
     try {
@@ -1605,7 +1609,7 @@ export default function App() {
       <ResizeHandle variant="resize-editor" onDrag={resizeEditor} />
       <MeshViewer document={document} selected={selected} multiSelected={selectedIndices} meshes={anchorMeshes} visibleAnchors={visibleMeshAnchors} referenceGeometry={referenceGeometry} rimSizeInches={rimSizeInches} revision={revision} onMoveSelection={moveSelection} onRotateSelection={rotateSelection} canRotate={document.rotationEditable && !positionLocked} cameraEdit={cameraMode && garage && cameraPoints ? { camera: garageToPck(cameraPoints.camera), target: garageToPck(cameraPoints.target), handle: cameraHandle, lookThrough, targetPlane, safeAreas, fov: garage.fov, aspect: cameraAspects[cameraAspect], onSelectHandle: setCameraHandle, onToggleLookThrough: () => setLookThrough((value) => !value), onMove: moveShopCamera } : null} />
     </main>)}
-    {workspace === "mesh" && <div className="mesh-editor-shell"><MeshEditorWorkspace document={meshDocument} activeRole={meshRole} slots={slots} onSelectRole={setMeshViewRole} meshes={meshEditorMeshes} onEditPieceId={editPieceId} onEditGroupShader={editGroupShader} onUpdateEmbedded={updateEmbeddedMesh} onUpdateAllEmbedded={updateAllEmbeddedMeshes} onConvertObjs={() => void chooseObjFolder()} zeroShellId={zeroShellId} onSetZeroShellId={setZeroShellId} onExportObj={(mesh) => void exportPieceObj(mesh)} embeddedUnreadable={embeddedOnly.unreadable} embeddedEmpty={embeddedOnly.empty} objFolder={objFolder} describeEmbedTarget={describeEmbedTarget} describePieceSize={describePieceSize} onUndo={meshUndo} onRedo={meshRedo} canUndo={pieceIdUndoRef.current.length > 0} canRedo={pieceIdRedoRef.current.length > 0} vehicleBase={vehicleBase} loadedCount={loadedCount} onOpenFolder={() => void openFolder()} recentVehicleFolders={recentVehicleFolders} onOpenRecentFolder={(path) => void openVehicleFolderAtPath(path)} onClearRecentFolders={clearVehicleRecents} listWidth={panelWidths.meshList} onResizeList={resizeMeshList} /></div>}
+    {workspace === "mesh" && <div className="mesh-editor-shell"><MeshEditorWorkspace document={meshDocument} activeRole={meshRole} slots={slots} onSelectRole={setMeshViewRole} meshes={meshEditorMeshes} onEditPieceId={editPieceId} onEditGroupShader={editGroupShader} onUpdateEmbedded={updateEmbeddedMesh} onUpdateAllEmbedded={updateAllEmbeddedMeshes} onConvertObjs={() => void chooseObjFolder()} zeroShellId={zeroShellId} onSetZeroShellId={setZeroShellId} compactStreams={compactStreams} onSetCompactStreams={setCompactStreams} onExportObj={(mesh) => void exportPieceObj(mesh)} embeddedUnreadable={embeddedOnly.unreadable} embeddedEmpty={embeddedOnly.empty} objFolder={objFolder} describeEmbedTarget={describeEmbedTarget} describePieceSize={describePieceSize} onUndo={meshUndo} onRedo={meshRedo} canUndo={pieceIdUndoRef.current.length > 0} canRedo={pieceIdRedoRef.current.length > 0} vehicleBase={vehicleBase} loadedCount={loadedCount} onOpenFolder={() => void openFolder()} recentVehicleFolders={recentVehicleFolders} onOpenRecentFolder={(path) => void openVehicleFolderAtPath(path)} onClearRecentFolders={clearVehicleRecents} listWidth={panelWidths.meshList} onResizeList={resizeMeshList} /></div>}
     {workspace === "performance" && <PerformanceWorkspace slots={slots} workingRole={workingRole} vehicleBase={vehicleBase} loadedCount={loadedCount} revision={revision} onApply={applyPerformance} onStatus={setStatus} onOpenFolder={() => void openFolder()} recentVehicleFolders={recentVehicleFolders} onOpenRecentFolder={(path) => void openVehicleFolderAtPath(path)} onClearRecentFolders={clearVehicleRecents} />}
     {workspace === "audio" && <AudioWorkspace slots={slots} workingRole={workingRole} vehicleBase={vehicleBase} loadedCount={loadedCount} revision={revision} onApply={applyAudio} onStatus={setStatus} onOpenFolder={() => void openFolder()} recentVehicleFolders={recentVehicleFolders} onOpenRecentFolder={(path) => void openVehicleFolderAtPath(path)} onClearRecentFolders={clearVehicleRecents} />}
     <div className="workspace-host" style={{ display: workspace === "textures" ? "contents" : "none" }}><TextureWorkspace active={workspace === "textures"} dropped={texturesDrop} onConsumeDrop={() => setTexturesDrop(null)} onStatus={setStatus} isPathBlocked={isVehiclePathBlocked} onPendingChange={setTexturesPending} menuRef={textureMenu} /></div>
