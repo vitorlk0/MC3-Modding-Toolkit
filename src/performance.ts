@@ -9,8 +9,10 @@
  * - Base and Mods never share a sub-block, so editing one mode can't leak into the other.
  * - The TBC sub-pointer (VehSim+0x7C) is a 0xCDCDCDxx sentinel in every file; the TBC fields are
  *   read inline from VehSim+0xBC, as the script does.
- * - 26 `vp_d_*` cars have no VehZone: the root at +0x44 points at another, unidentified structure
- *   (magic 0x007A2F80 or 0x007A1E78). VehZone is then reported unavailable, never written.
+ * - VehZone's type ID follows the PCK family (KB §8.4.6): 0x007A1C78 standard, 0x007A2F80 DUB/Remix,
+ *   0x007A1E78 SL500/SL55, all with the same 18 floats at +0x0C. The DUB one was confirmed in game
+ *   (2026-10-13: a standard car's VehZone payload written into a DUB tuner changed Zone), so both are
+ *   read and written. The SL one stays unavailable, never written, until it gets its own test.
  *
  * PSP `.psppck` files use an inline layout for the first eight sub-blocks and shifted VehSim
  * offsets. That layout is read (a PSP car can be an import donor) exactly as the script reads it.
@@ -161,7 +163,7 @@ export const perfSections: PerfSection[] = [
 export const perfGroups = [...new Set(perfSections.map((section) => section.group))];
 export const sectionById = new Map(perfSections.map((section) => [section.id, section]));
 
-const VEHZONE_MAGIC = 0x007a1c78;
+const VEHZONE_MAGICS = new Set([0x007a1c78, 0x007a2f80]);
 const fieldSize: Record<PerfFieldType, number> = { f32: 4, u32: 4, s8: 1 };
 const MODE_SLOTS: Record<PerfMode, { vehsim: number; gyro: number }> = { base: { vehsim: 0xb4, gyro: 0xbc }, mods: { vehsim: 0xb8, gyro: 0xc0 } };
 const ZONE_SLOT = 0xc4;
@@ -201,7 +203,7 @@ export class PerformanceLayout {
     // is unusable — which is also how a .psppck presents.
     this.inline = /\.psppck$/i.test(name) || (["base", "mods"] as PerfMode[]).some((mode) => this.subs[mode].slice(0, 8).some((offset) => offset === null));
     const zone = this.resolve(this.u32(ZONE_SLOT));
-    this.zoneOffset = zone !== null && this.inside(zone, 0x54) && this.u32(zone) === VEHZONE_MAGIC ? zone : null;
+    this.zoneOffset = zone !== null && this.inside(zone, 0x54) && VEHZONE_MAGICS.has(this.u32(zone)) ? zone : null;
   }
 
   private u32(offset: number) { return this.view.getUint32(offset, true); }
