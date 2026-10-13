@@ -88,7 +88,12 @@ export type LodMeshEntry = {
 type CompactionMove = { from: number; payloadOffset: number; used: number; to: number; reserved: number; oldReserved: number };
 /** `clear` lists the ranges rewritten from scratch (holes that take blocks, the new tail), which
  *  are zeroed before the blocks land so no stale bytes survive between them. */
-type CompactionPlan = { moves: CompactionMove[]; clear: [number, number][]; finalSize: number; stuckBytes: number };
+type CompactionPlan = { moves: CompactionMove[]; clear: [number, number][]; finalSize: number; stuckBytes: number; island?: { from: number; to: number; size: number } };
+/** Fields of a PS2 anchor row that hold pointers: name, next, child, parent, +0x40 data. */
+const ANCHOR_POINTER_FIELDS = [0x0c, 0x14, 0x18, 0x1c, 0x40];
+/** The new[] cookie in front of an anchor list: u32 count + CD × 12 (KB §7.2). */
+const ANCHOR_COOKIE_SIZE = 0x10;
+const ANCHOR_EXT_SIZE = 0x30;
 
 /** One relocatable pointer slot inside a standalone mesh piece: where the u32 lives within the
  *  piece, and the piece-relative offset it has to point at once the piece moves. */
@@ -351,6 +356,8 @@ export class PckDocument {
   redoStack: HistoryEntry[] = [];
   /** Collects history while groupEdits() runs, so its edits land as one compound undo step. */
   private pendingGroup: HistoryEntry[] | null = null;
+  /** movableAnchorIsland's answer for the bytes it was worked out on (it scans the whole file). */
+  private islandCache: { bytes: Uint8Array; size: number; listOffset: number; result: { start: number; end: number } | null } | null = null;
 
   constructor(name: string, source: ArrayBuffer) {
     this.name = name;
@@ -1053,6 +1060,11 @@ export class PckDocument {
     if (this.format !== "pck") return null;
     const blocks = this.toolBlocks();
     if (!blocks.length) return null;
+    const island = this.movableAnchorIsland(blocks[0].base);
+    if (island) {
+      const plan = this.planIslandRepack(blocks, island);
+      if (plan) return plan;
+    }
 
     // Walls cut the tool region into bins of fixed size; whatever follows the last wall is open.
     type Bin = { start: number; end: number; cursor: number; placed: CompactionMove[] };
@@ -1106,6 +1118,121 @@ export class PckDocument {
   }
 
   /**
+   * An anchor list Exhaust Tips (or insert_anchor.py --at-end) copied out of the game's data, as
+   * laid down there: new[] cookie, the list, then each appended anchor's name and +0x40 data back
+   * to back (KB §7.9.2). Compaction may carry it to the end of the file instead of treating it as a
+   * wall, but only when all of this holds, so a game file is never mistaken for one:
+   * - that exact layout, cookie count and CD padding included;
+   * - it lies inside the tool-block region (the game's own list, below it, never moves);
+   * - nothing outside it points in except the anchor header's list pointer. Checked against every
+   *   word of the file except geometry packets and tool blocks, whose pointers are all internal.
+   */
+  private movableAnchorIsland(firstToolBase: number): { start: number; end: number } | null {
+    const cache = this.islandCache;
+    if (cache && cache.bytes === this.bytes && cache.size === this.fileSize && cache.listOffset === this.layout.listOffset) return cache.result;
+    const result = this.findAnchorIsland(firstToolBase);
+    this.islandCache = { bytes: this.bytes, size: this.fileSize, listOffset: this.layout.listOffset, result };
+    return result;
+  }
+  private findAnchorIsland(firstToolBase: number): { start: number; end: number } | null {
+    const { listOffset, count, itemSize } = this.layout;
+    const start = listOffset - ANCHOR_COOKIE_SIZE;
+    if (this.format !== "pck" || start < firstToolBase || start % APPEND_ALIGNMENT) return null;
+    if (u32(this.view, start) !== count || this.bytes.subarray(start + 4, listOffset).some((value) => value !== 0xcd)) return null;
+    const listEnd = listOffset + count * itemSize;
+    const offsetOf = (pointer: number) => sentinel(pointer) ? null : virtualToFile(pointer, this.pointerBase);
+    // Appended anchors are the last rows, whose names come after the list.
+    let first = count;
+    while (first > 0 && (offsetOf(u32(this.view, listOffset + (first - 1) * itemSize + 0x0c)) ?? 0) >= listEnd) first -= 1;
+    let end = listEnd;
+    for (let row = first; row < count; row += 1) {
+      const o = listOffset + row * itemSize;
+      if (offsetOf(u32(this.view, o + 0x0c)) !== end) return null;
+      let terminator = end;
+      while (terminator < this.fileSize && this.bytes[terminator] !== 0) terminator += 1;
+      end = align(terminator + 1, APPEND_ALIGNMENT);
+      const ext = u32(this.view, o + 0x40);
+      if (ext) { if (offsetOf(ext) !== end) return null; end += ANCHOR_EXT_SIZE; }
+    }
+    if (end > this.fileSize) return null;
+    // The game's own rows keep their names and +0x40 data where the game put them.
+    for (let row = 0; row < first; row += 1) {
+      for (const field of [0x0c, 0x40]) { const target = offsetOf(u32(this.view, listOffset + row * itemSize + field)); if (target !== null && target >= start && target < end) return null; }
+    }
+    const skipped: [number, number][] = [[start, end] as [number, number], ...this.toolBlocks().map((block): [number, number] => [block.base, block.base + block.reservedSize]), ...this.embeddedPacketSpans()].sort((a, b) => a[0] - b[0]);
+    const listPointerSlot = this.layout.targetOffset + 8;
+    let span = 0;
+    for (let offset = 0; offset + 4 <= this.fileSize; offset += 4) {
+      while (span < skipped.length && skipped[span][1] <= offset) span += 1;
+      if (span < skipped.length && offset >= skipped[span][0]) { offset = skipped[span][1] - 4; continue; }
+      const target = offsetOf(u32(this.view, offset));
+      if (target !== null && target >= start && target < end && offset !== listPointerSlot) return null;
+    }
+    return { start, end };
+  }
+
+  /** Geometry packet spans of every embedded piece — data that holds no pointers but can look like them. */
+  private embeddedPacketSpans(): [number, number][] {
+    const spans: [number, number][] = [];
+    for (const entry of this.lodMeshes) {
+      if (entry.meshBlockOffset === null || !inside(entry.meshBlockOffset, 0x14, this.fileSize)) continue;
+      const groups = u32(this.view, entry.meshBlockOffset + 0x08);
+      const table = virtualToFile(u32(this.view, entry.meshBlockOffset + 0x10), this.pointerBase);
+      if (groups < 1 || groups > 4096 || !inside(table, groups * 8, this.fileSize)) continue;
+      for (let group = 0; group < groups; group += 1) {
+        const blocks = u16(this.view, table + group * 8 + 4);
+        const list = virtualToFile(u32(this.view, table + group * 8), this.pointerBase);
+        if (!blocks || !inside(list, blocks * 8, this.fileSize)) continue;
+        for (let block = 0; block < blocks; block += 1) {
+          const geometry = virtualToFile(u32(this.view, list + block * 8), this.pointerBase);
+          const size = u16(this.view, list + block * 8 + 4) * 16;
+          if (inside(geometry, size, this.fileSize)) spans.push([geometry, geometry + size]);
+        }
+      }
+    }
+    return spans;
+  }
+
+  /**
+   * Compaction with a movable anchor island (KB §17.7.1, "phase 2"): every live block back to back
+   * from the first tool block, then the island, where the file ends. Only taken when nothing else
+   * sits between the blocks — every gap is the island or 00/CD padding — so no other data moves;
+   * otherwise the wall plan below handles it as before. The list ending the file is also where
+   * Exhaust Tips rebuilds it in place on its next edit instead of copying it again.
+   */
+  private planIslandRepack(blocks: { base: number; payloadOffset: number; reservedSize: number; live: boolean }[], island: { start: number; end: number }): CompactionPlan | null {
+    const padding = (from: number, to: number) => {
+      for (let offset = from; offset < to; offset += 1) {
+        if (offset >= island.start && offset < island.end) { offset = island.end - 1; continue; }
+        if (this.bytes[offset] !== 0 && this.bytes[offset] !== 0xcd) return false;
+      }
+      return true;
+    };
+    let cursor = blocks[0].base;
+    for (const block of blocks) {
+      if (block.base < cursor || !padding(cursor, block.base)) return null;
+      cursor = block.base + block.reservedSize;
+    }
+    if (!padding(cursor, this.fileSize)) return null;
+    const moves: CompactionMove[] = [];
+    let writeCursor = blocks[0].base;
+    for (const block of blocks) {
+      if (!block.live) continue;
+      const raw = this.bytes.subarray(block.base, block.base + block.reservedSize);
+      let extent: number;
+      try { extent = meshPieceExtent(raw); } catch { return null; }
+      const used = raw.subarray(extent).every((value) => value === 0 || value === 0xcd) ? extent : block.reservedSize;
+      moves.push({ from: block.base, payloadOffset: block.payloadOffset, used, to: writeCursor, reserved: used, oldReserved: block.reservedSize });
+      writeCursor = align(writeCursor + used, APPEND_ALIGNMENT);
+    }
+    const size = island.end - island.start;
+    const islandTo = align(writeCursor, APPEND_ALIGNMENT);
+    const finalSize = islandTo + size;
+    if (finalSize >= this.fileSize) return null;
+    return { moves, clear: [[blocks[0].base, finalSize]], finalSize, stuckBytes: 0, island: { from: island.start, to: islandTo, size } };
+  }
+
+  /**
    * The size this file will have once saved.
    *
    * Editing leaves dead copies behind — a piece that changed size is appended and its old block
@@ -1124,7 +1251,7 @@ export class PckDocument {
    * rewritten are each block's own graph and the LOD slots that point at it. Returns null when
    * there's nothing to do or when it isn't safe, so the caller can just skip it.
    */
-  compactToolBlocks(): { reclaimedBytes: number; movedBlocks: number; sizeBefore: number; sizeAfter: number; stuckBytes: number } | null {
+  compactToolBlocks(): { reclaimedBytes: number; movedBlocks: number; sizeBefore: number; sizeAfter: number; stuckBytes: number; anchorListMoved: boolean } | null {
     const plan = this.planCompaction();
     if (!plan) return null;
 
@@ -1155,14 +1282,49 @@ export class PckDocument {
       }
     });
 
+    if (plan.island) this.moveAnchorIsland(source, output, view, plan.island);
+
     this.bytes = output;
     this.view = view;
     this.view.setUint32(0x0c, (this.fileSize - MESH_PAYLOAD_OFFSET) >>> 0, true);
     this.appendedBlocks.clear();
     this.refreshMeshBlobDirty();
-    // Compaction runs as part of saving, not as a user edit — it deliberately leaves undo history
-    // alone, since there's nothing meaningful to step back to once the file is on disk.
-    return { reclaimedBytes: sizeBefore - this.fileSize, movedBlocks: plan.moves.filter((move) => move.from !== move.to).length, sizeBefore, sizeAfter: this.fileSize, stuckBytes: plan.stuckBytes };
+    // Compaction runs as part of saving, not as a user edit, so it normally leaves undo history
+    // alone. Moving the anchor list is the exception: earlier mesh snapshots hold the old layout,
+    // and restoring one now would put the list back under rows that point at the new place.
+    if (plan.island) { this.undoStack = []; this.redoStack = []; }
+    return { reclaimedBytes: sizeBefore - this.fileSize, movedBlocks: plan.moves.filter((move) => move.from !== move.to).length, sizeBefore, sizeAfter: this.fileSize, stuckBytes: plan.stuckBytes, anchorListMoved: Boolean(plan.island) };
+  }
+
+  /** Copies the anchor island to its new place and rewrites every pointer into it: the header's
+   *  list pointer and, in each row, the links and the appended anchors' name / +0x40 data. The
+   *  cookie travels with it and no count changes. The in-memory rows follow. */
+  private moveAnchorIsland(source: Uint8Array, output: Uint8Array, view: DataView, island: { from: number; to: number; size: number }) {
+    const { from, to, size } = island;
+    output.set(source.subarray(from, from + size), to);
+    const delta = to - from;
+    const moved = (pointer: number) => { if (sentinel(pointer)) return null; const target = virtualToFile(pointer, this.pointerBase); return target >= from && target < from + size ? (pointer + delta) >>> 0 : null; };
+    const slot = this.layout.targetOffset + 8;
+    const listPointer = moved(u32(view, slot));
+    if (listPointer === null) throw new Error("The anchor header doesn't point into the anchor list being moved.");
+    view.setUint32(slot, listPointer, true);
+    const newList = this.layout.listOffset + delta;
+    for (let row = 0; row < this.layout.count; row += 1) {
+      for (const field of ANCHOR_POINTER_FIELDS) {
+        const next = moved(u32(view, newList + row * this.layout.itemSize + field));
+        if (next !== null) view.setUint32(newList + row * this.layout.itemSize + field, next, true);
+      }
+    }
+    this.layout.listOffset = newList;
+    this.layout.listPointer = listPointer;
+    for (const piece of this.pieces) {
+      piece.fileOffset += delta;
+      piece.virtualAddress = (piece.virtualAddress + delta) >>> 0;
+      piece.namePointer = moved(piece.namePointer) ?? piece.namePointer;
+      piece.nextPointer = moved(piece.nextPointer) ?? piece.nextPointer;
+      piece.childPointer = moved(piece.childPointer) ?? piece.childPointer;
+      piece.parentPointer = moved(piece.parentPointer) ?? piece.parentPointer;
+    }
   }
 
   private applyPieceIdTargets(targets: PieceIdTarget[], ids: number[]) {

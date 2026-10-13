@@ -1021,9 +1021,10 @@ export default function App() {
       // account for, in which case the document is simply saved as-is.
       let reclaimedBytes = 0;
       let stuckBytes = 0;
+      const anchorListMoved: string[] = [];
       for (const role of roles) {
         const target = prepared[role]; if (!target) continue;
-        try { const compaction = target.document.compactToolBlocks(); reclaimedBytes += compaction?.reclaimedBytes ?? 0; stuckBytes += compaction?.stuckBytes ?? 0; }
+        try { const compaction = target.document.compactToolBlocks(); reclaimedBytes += compaction?.reclaimedBytes ?? 0; stuckBytes += compaction?.stuckBytes ?? 0; if (compaction?.anchorListMoved) anchorListMoved.push(target.document.name); }
         catch (error) { console.warn(`Compaction skipped for ${roleLabels[role]}:`, error); }
       }
       const loaded = roles.filter((role) => prepared[role]); const outputPaths: Partial<Record<VehicleRole, string>> = {};
@@ -1074,7 +1075,7 @@ export default function App() {
       const meshNote = dirtyMeshDocs.length ? ` · ${dirtyMeshDocs.length} mesh.pck file${dirtyMeshDocs.length === 1 ? "" : "s"} updated` : "";
       // Space before data that isn't a mesh (an anchor list moved by Exhaust Tips) can only be reused
       // by later embeds, not cut out, so say how much is still held that way.
-      const reclaimNote = `${reclaimedBytes ? ` · ${sizeLabel(reclaimedBytes)} reclaimed` : ""}${stuckBytes ? ` · ${sizeLabel(stuckBytes)} unused before non-mesh data, kept for later embeds` : ""}`;
+      const reclaimNote = `${reclaimedBytes ? ` · ${sizeLabel(reclaimedBytes)} reclaimed` : ""}${stuckBytes ? ` · ${sizeLabel(stuckBytes)} unused before non-mesh data, kept for later embeds` : ""}${anchorListMoved.length ? ` · anchor list moved to the end of ${anchorListMoved.join(", ")} so its space could be reclaimed; undo history of ${anchorListMoved.length === 1 ? "that file" : "those files"} cleared` : ""}`;
       if (shaderSyncWarnings.length) console.warn("Shader sync warnings:", shaderSyncWarnings);
       const garageNoteText = garageCameras ? ` · ${garageCameras} shop camera${garageCameras === 1 ? "" : "s"} saved to ${garage!.document.name}` : "";
       setStatus(`${loaded.length} vehicle PCK${loaded.length === 1 ? "" : "s"} ${destination} · ${changed.length} changed anchor${changed.length === 1 ? "" : "s"} synchronized on save${pieceIdNote}${shaderNote}${shaderWarnNote}${meshNote}${reclaimNote}${garageNoteText}`);
