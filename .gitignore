@@ -6,5 +6,5 @@ dist-portable/
 
 # Internal development notes -- kept locally, not published
 handoff.md
-HANDOFF-CODEX.md
+HANDOFF-*.md
 .claude/
