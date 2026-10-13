@@ -6,7 +6,7 @@ import {
   type CarReport, type InstallPlan, type IsoSession, type ModCategory, type ModPackage, type RandomFile,
 } from "../src/iso-install";
 import { SECTOR } from "../src/iso9660";
-import { DAT_BYTE_LIMIT } from "../src/iso-install";
+import { DAT_BYTE_LIMIT, isOpponentCarcfg } from "../src/iso-install";
 import { checkWritable, explainIsoError, readPackageFiles, tauriIsoFs } from "./iso-io";
 import { loadRecent, pushRecent, saveRecent } from "./recent-paths";
 import { RecentList } from "./mod-toolkit/toolkit-ui";
@@ -340,7 +340,7 @@ function CarCardView({ card, report, hasIso, busy, onToggle, onRemove }: {
         const present = files.length > 0;
         // A "complete" set is the four menu files / the numbered variants; reward_ and the plain
         // vp_x.carcfg install too but are extras, shown next to the count instead of inflating it.
-        const counted = files.filter((file) => category === "flash" ? !file.name.startsWith("reward_") : category === "carcfg" ? /_\d+\.carcfg$/.test(file.name) : true);
+        const counted = files.filter((file) => category === "flash" ? !file.name.startsWith("reward_") : category === "carcfg" ? isOpponentCarcfg(file.name, pkg.car) : true);
         const extras = files.length - counted.length;
         const partial = present && expected !== undefined && category !== "dat" && category !== "garage" && counted.length < expected;
         const count = category === "dat" || category === "garage" ? null : `${counted.length}${expected !== undefined ? `/${expected}` : ""}${extras ? ` +${extras}` : ""}`;

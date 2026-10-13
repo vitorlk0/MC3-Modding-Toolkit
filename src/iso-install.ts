@@ -59,6 +59,10 @@ export type ModPackage = {
 const baseName = (path: string) => path.replace(/^.*[\\/]/, "");
 const CAR_ID = "vp_[a-z0-9_]+";
 
+/** vp_x_1.carcfg … vp_x_10.carcfg. Not the car's own vp_x.carcfg, whose name also ends in "_<digits>"
+ *  (every slot name does: vp_is300_04), so a bare /_\d+\.carcfg$/ counts it too. */
+export const isOpponentCarcfg = (name: string, car: string) => name.toLowerCase().startsWith(`${car.toLowerCase()}_`) && /^\d+\.carcfg$/i.test(name.slice(car.length + 1));
+
 export function targetFor(category: ModCategory, car: string, name: string) {
   switch (category) {
     case "dat": return `${car}.dat`;
@@ -250,7 +254,7 @@ export function checkPackage(session: IsoSession, pkg: ModPackage): CarReport {
   }
   // reward_ is an optional extra; "complete" means the four menu files.
   const flash = categories.flash.files.filter((file) => !file.name.startsWith("reward_")).length;
-  const carcfg = categories.carcfg.files.filter((file) => /_\d+\.carcfg$/.test(file.name)).length;
+  const carcfg = categories.carcfg.files.filter((file) => isOpponentCarcfg(file.name, car)).length;
   if (flash > 0 && flash < expectedFlash) warnings.push(`Only ${flash} of ${expectedFlash} flash files are in the package — the missing ones keep the original car's menus, which may not match.`);
   if (carcfg > 0 && carcfg < expectedCarcfg) warnings.push(`Only ${carcfg} of ${expectedCarcfg} carcfg files are in the package — the rest keep the original car's opponent setups.`);
   return { pkg, errors, warnings, categories };
