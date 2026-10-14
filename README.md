@@ -27,9 +27,9 @@ dropped onto the window. Keep a backup of your files anyway.
 
 | Tab | What it does |
 | --- | --- |
-| **Tools** | Loose-file tools: Visual Shop menu editor, Carcfg Randomizer, Flash Parts Mapper, Car PCK Mesh Injector, Mesh ID Sync, Car PCK Cleaner, Vehicle DAT Builder, Compact ISO, Exhaust Tips, Neon & Shadow and Slot Retarget (experimental) |
-| **Anchors** | Anchor positions with a 3D preview, multi-select, mirroring and wheel/exhaust sync, plus the garage shop cameras |
-| **Meshes** | Piece IDs, shader IDs, re-embedding loose `mesh.pck` files and OBJ export |
+| **Tools** | Loose-file tools: Visual Shop menu editor, Carcfg Randomizer, Flash Parts Mapper, Car PCK Mesh Injector, Mesh ID Sync, Car PCK Cleaner, Vehicle DAT Builder, Compact ISO, Exhaust Tips, Neon & Shadow and Slot Retarget |
+| **Anchors** | Anchor positions and rotations with a 3D preview and move/rotate gizmo, multi-select, mirroring and wheel/exhaust sync, plus the garage shop cameras |
+| **Meshes** | Piece IDs, shader IDs, OBJ conversion (compact by default), re-embedding loose `mesh.pck` files and OBJ export |
 | **Performance** | Vehicle physics and performance values across all three PCKs at once |
 | **Textures** | Finds, previews and replaces PS2 textures in a PCK |
 | **Audio** | Engine audio curves and values, with an audible preview from the game's sound banks |
@@ -40,7 +40,8 @@ dropped onto the window. Keep a backup of your files anyway.
 Built on the community's investigation of the game's files: Bruno (@offlbruno) and ZNX (@znxee)
 for the research and base code behind the PCK format; @ZNXee171 and @mc3rxx (Performance Editor);
 EdnessP (`dave.py`); RibeiroG (MC3 ISO Direct Explorer). Special thanks to Almightypear, Rato.jpg and
-RibeiroG. Toolkit by [@mid_engine](https://youtube.com/@mid_engine). The full list is in
+RibeiroG. Toolkit, Audio Curve GUI, Texture Finder and the carcfg / flash menu / injector / ID fix
+scripts by [@mid_engine](https://youtube.com/@mid_engine). The full list is in
 **Help ▸ About**.
 
 ## How it edits
@@ -55,6 +56,8 @@ before the document is marked as saved.
 - Detects PS2 `0x44` and PSP `0x60` anchor layouts, reading the parent/child/next hierarchy.
 - Edits A1 and A2 as little-endian `float32` values, with undo/redo, clipboard actions and
   dedicated `Copy Values` / `Paste Values` controls per anchor.
+- Edits each anchor's rotation in degrees (stored as radians), from the Rotation card or the 3D
+  gizmo (`R` toggles move/rotate, `Shift` snaps to 15°); Mirror flips position and rotation.
 - Supports horizontal value scrubbing in every coordinate field (`Shift` fine, `Ctrl` fast),
   recorded as one undo step per drag.
 - Accepts arithmetic in the coordinate fields — `1.5+0.25`, `10-5`, `2*1.5`, `10/4`, parentheses.
