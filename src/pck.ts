@@ -348,6 +348,9 @@ export class PckDocument {
   /** Every field span ever written this session, dirty or not — a restored snapshot can bring back
    *  a value that was undone, so each one is re-checked after a restore rather than only the dirty ones. */
   private fieldKeys = new Set<string>();
+  /** Same, for embedded shader-table slots: undoing an embed or a removal restores a whole snapshot,
+   *  which can take away or bring back a block whose shader slots were edited. */
+  private shaderKeys = new Set<string>();
   /** Blocks this session appended at EOF, keyed by `${lod}:${index}` — space we know we own, so a
    *  repeat update of the same piece can reuse it instead of growing the file again. Never covers
    *  game-shipped embedded blobs, which are only ever abandoned in place, never overwritten. */
@@ -849,7 +852,7 @@ export class PckDocument {
     const before = targets.map((target) => u16(this.view, target.slotOffset));
     if (before.every((id) => id === newId)) return false;
     for (const target of targets) this.view.setUint16(target.slotOffset, newId, true);
-    for (const target of targets) this.refreshShaderDirty(target);
+    for (const target of targets) this.refreshShaderDirty(target.slotOffset);
     if (record) {
       this.undoStack.push({ kind: "shaderId", targets, before, after: newId });
       if (this.undoStack.length > MAX_HISTORY) this.undoStack.shift();
@@ -877,10 +880,12 @@ export class PckDocument {
     const unchanged = offset + length <= this.savedBytes.byteLength && this.bytes.subarray(offset, offset + length).every((value, i) => value === this.savedBytes[offset + i]);
     unchanged ? this.dirtyFieldKeys.delete(key) : this.dirtyFieldKeys.add(key);
   }
-  private refreshShaderDirty(target: ShaderIdTarget) {
-    const key = String(target.slotOffset);
-    const current = u16(this.view, target.slotOffset);
-    const original = u16(new DataView(this.savedBytes.buffer, this.savedBytes.byteOffset), target.slotOffset);
+  private refreshShaderDirty(slotOffset: number) {
+    const key = String(slotOffset);
+    this.shaderKeys.add(key);
+    // A slot inside a block appended this session isn't in the saved bytes at all.
+    const current = inside(slotOffset, 2, this.fileSize) ? u16(this.view, slotOffset) : null;
+    const original = inside(slotOffset, 2, this.savedBytes.byteLength) ? u16(new DataView(this.savedBytes.buffer, this.savedBytes.byteOffset), slotOffset) : null;
     current === original ? this.dirtyShaderKeys.delete(key) : this.dirtyShaderKeys.add(key);
   }
 
@@ -910,12 +915,19 @@ export class PckDocument {
     // from the restored bytes rather than leaving them as they were before the undo.
     for (const entry of this.lodMeshes) this.refreshLodDirty(entry);
     for (const key of this.fieldKeys) this.refreshFieldDirty(key);
+    for (const key of this.shaderKeys) this.refreshShaderDirty(Number(key));
   }
   /** Recomputes which embedded meshes differ from the last-saved bytes. File length alone can't
    *  tell us which piece changed, so this compares each entry's current pointer/blob against the
    *  saved image and treats "can't be found in the saved bytes" as dirty. */
   private refreshMeshBlobDirty() {
     this.dirtyMeshBlobs.clear();
+    const savedView = new DataView(this.savedBytes.buffer, this.savedBytes.byteOffset);
+    // A row whose embedded copy was removed (removeEmbeddedMesh) holds no block of ours, so only
+    // its pointer tells it apart from the saved file.
+    for (const entry of this.lodMeshes) {
+      if (inside(entry.meshPointerSlotOffset, 4, this.savedBytes.byteLength) && u32(this.view, entry.meshPointerSlotOffset) !== u32(savedView, entry.meshPointerSlotOffset)) this.dirtyMeshBlobs.add(entry.name || lodKey(entry.lod, entry.index));
+    }
     if (this.bytes.byteLength !== this.savedBytes.byteLength) {
       for (const key of this.appendedBlocks.keys()) {
         const [lod, indexText] = key.split(":") as [LodLevel, string];
@@ -924,14 +936,13 @@ export class PckDocument {
       }
       return;
     }
-    const savedView = new DataView(this.savedBytes.buffer, this.savedBytes.byteOffset);
     for (const [key, block] of this.appendedBlocks) {
       const [lod, indexText] = key.split(":") as [LodLevel, string];
       const entry = this.lodMeshes.find((item) => item.lod === lod && item.index === Number(indexText));
       if (!entry) continue;
       // A same-size re-embed (a UV-only change, say) rewrites its block in place and leaves the
       // pointer alone, so the block's own bytes have to be compared too.
-      if (u32(this.view, entry.meshPointerSlotOffset) !== u32(savedView, entry.meshPointerSlotOffset) || !sameRange(this.bytes, this.savedBytes, block.offset, block.reservedSize)) this.dirtyMeshBlobs.add(entry.name || key);
+      if (!sameRange(this.bytes, this.savedBytes, block.offset, block.reservedSize)) this.dirtyMeshBlobs.add(entry.name || key);
     }
   }
 
@@ -1028,6 +1039,37 @@ export class PckDocument {
       this.redoStack = [];
     }
     return { blockOffset, payloadOffset: blockOffset + MESH_PAYLOAD_OFFSET, payloadVa: newPayloadVa, bytesWritten: piece.byteLength, reservedSize, placement, inserting, reused: placement !== "appended", relocations: relocs.length, fileSize: this.bytes.byteLength };
+  }
+
+  /**
+   * Takes the embedded copy out of LOD rows: PTR_Mesh goes to 0, the NULL the game uses for a piece
+   * it loads from the loose mesh.pck instead (KB §4.3, §6.3). No byte moves. A block a tool wrote is
+   * left unreferenced and the Save compaction reclaims it like any orphan (§17.7); a copy the game
+   * shipped stays where it is as dead bytes, which only the Car PCK Cleaner cuts out (§17.8).
+   * The row itself (name, ID) stays: the tables never grow or shrink here.
+   */
+  removeEmbeddedMesh(entries: LodMeshEntry[], record = true) {
+    if (this.format !== "pck") throw new Error("Removing an embedded piece is only supported for PS2 .pck files.");
+    const before = this.captureState();
+    let removed = 0;
+    for (const entry of entries) {
+      const target = this.lodMeshes.find((item) => item.lod === entry.lod && item.index === entry.index);
+      if (!target || target.meshBlockOffset === null) continue;
+      this.view.setUint32(target.meshPointerSlotOffset, 0, true);
+      target.meshPointer = 0;
+      target.meshBlockOffset = null;
+      // The block a tool wrote for this row is no longer the row's to reuse; it's an orphan now.
+      this.appendedBlocks.delete(lodKey(target.lod, target.index));
+      removed += 1;
+    }
+    if (!removed) return 0;
+    this.refreshMeshBlobDirty();
+    if (record) {
+      this.undoStack.push({ kind: "meshBlob", before, after: this.captureState() });
+      if (this.undoStack.length > MAX_HISTORY) this.undoStack.shift();
+      this.redoStack = [];
+    }
+    return removed;
   }
 
   /**
@@ -1377,7 +1419,7 @@ export class PckDocument {
     if (entry.kind === "meshBlob") { this.restoreState(entry.before); return null; }
     if (entry.kind === "shaderId") {
       entry.targets.forEach((target, i) => this.view.setUint16(target.slotOffset, entry.before[i], true));
-      for (const target of entry.targets) this.refreshShaderDirty(target);
+      for (const target of entry.targets) this.refreshShaderDirty(target.slotOffset);
       return null;
     }
     this.applyPieceIdTargets(entry.targets, entry.before);
@@ -1402,7 +1444,7 @@ export class PckDocument {
     if (entry.kind === "meshBlob") { this.restoreState(entry.after); return null; }
     if (entry.kind === "shaderId") {
       for (const target of entry.targets) this.view.setUint16(target.slotOffset, entry.after, true);
-      for (const target of entry.targets) this.refreshShaderDirty(target);
+      for (const target of entry.targets) this.refreshShaderDirty(target.slotOffset);
       return null;
     }
     this.applyPieceIdTargets(entry.targets, entry.targets.map(() => entry.after));

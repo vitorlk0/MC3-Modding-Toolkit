@@ -600,6 +600,38 @@ export default function App() {
   }, [updateEmbeddedMeshes]);
 
   /**
+   * Takes a piece's embedded copy out of every loaded PCK that has one (PckDocument.removeEmbeddedMesh),
+   * so the game goes back to the loose mesh.pck of that name. One Undo step for all of them; the
+   * blocks a tool wrote are reclaimed by the compaction when saving.
+   */
+  const removeEmbeddedPiece = useCallback((meshName: string) => {
+    const label = meshName.replace(/\.mesh\.pck$/i, "");
+    const targets: MeshBlobAction["targets"] = [];
+    const sizeBefore = new Map<VehicleRole, number>();
+    let removedRows = 0;
+    for (const role of roles) {
+      const document = slots[role]?.document; if (!document) continue;
+      const entries = matchLodEntries(meshName, document).filter((entry) => entry.meshBlockOffset !== null);
+      if (!entries.length) continue;
+      const before = document.captureState();
+      sizeBefore.set(role, document.projectedSize);
+      const removed = document.removeEmbeddedMesh(entries, false);
+      if (!removed) continue;
+      removedRows += removed;
+      targets.push({ role, before, after: document.captureState() });
+    }
+    if (!targets.length) { setStatus(`${label} is not embedded in any loaded PCK — nothing to remove.`); return; }
+    pieceIdUndoRef.current.push({ kind: "meshBlob", meshName: label, targets });
+    if (pieceIdUndoRef.current.length > 20) pieceIdUndoRef.current.shift();
+    pieceIdRedoRef.current = [];
+    refresh();
+    const where = targets.map(({ role }) => roleLabels[role]).join(", ");
+    const freed = targets.reduce((sum, { role }) => sum + ((sizeBefore.get(role) ?? 0) - slots[role]!.document.projectedSize), 0);
+    const loose = meshDocs.has(meshName) ? "the loose mesh.pck is used again" : "no loose mesh.pck with this name is loaded, so the piece won't show";
+    setStatus(`${label} · removed from ${where} (${removedRows} LOD row${removedRows === 1 ? "" : "s"}) · ${loose}${freed > 0 ? ` · −${sizeLabel(freed)} once saved` : ""}`);
+  }, [meshDocs, refresh, slots]);
+
+  /**
    * Converts a folder of OBJs into loose mesh.pck pieces and embeds them, in one action.
    *
    * The OBJs are expected to come out of Blender production-ready — this only does the format work
@@ -1609,7 +1641,7 @@ export default function App() {
       <ResizeHandle variant="resize-editor" onDrag={resizeEditor} />
       <MeshViewer document={document} selected={selected} multiSelected={selectedIndices} meshes={anchorMeshes} visibleAnchors={visibleMeshAnchors} referenceGeometry={referenceGeometry} rimSizeInches={rimSizeInches} revision={revision} onMoveSelection={moveSelection} onRotateSelection={rotateSelection} canRotate={document.rotationEditable && !positionLocked} cameraEdit={cameraMode && garage && cameraPoints ? { camera: garageToPck(cameraPoints.camera), target: garageToPck(cameraPoints.target), handle: cameraHandle, lookThrough, targetPlane, safeAreas, fov: garage.fov, aspect: cameraAspects[cameraAspect], onSelectHandle: setCameraHandle, onToggleLookThrough: () => setLookThrough((value) => !value), onMove: moveShopCamera } : null} />
     </main>)}
-    {workspace === "mesh" && <div className="mesh-editor-shell"><MeshEditorWorkspace document={meshDocument} activeRole={meshRole} slots={slots} onSelectRole={setMeshViewRole} meshes={meshEditorMeshes} onEditPieceId={editPieceId} onEditGroupShader={editGroupShader} onUpdateEmbedded={updateEmbeddedMesh} onUpdateAllEmbedded={updateAllEmbeddedMeshes} onConvertObjs={() => void chooseObjFolder()} zeroShellId={zeroShellId} onSetZeroShellId={setZeroShellId} compactStreams={compactStreams} onSetCompactStreams={setCompactStreams} onExportObj={(mesh) => void exportPieceObj(mesh)} embeddedUnreadable={embeddedOnly.unreadable} embeddedEmpty={embeddedOnly.empty} objFolder={objFolder} describeEmbedTarget={describeEmbedTarget} describePieceSize={describePieceSize} onUndo={meshUndo} onRedo={meshRedo} canUndo={pieceIdUndoRef.current.length > 0} canRedo={pieceIdRedoRef.current.length > 0} vehicleBase={vehicleBase} loadedCount={loadedCount} onOpenFolder={() => void openFolder()} recentVehicleFolders={recentVehicleFolders} onOpenRecentFolder={(path) => void openVehicleFolderAtPath(path)} onClearRecentFolders={clearVehicleRecents} listWidth={panelWidths.meshList} onResizeList={resizeMeshList} /></div>}
+    {workspace === "mesh" && <div className="mesh-editor-shell"><MeshEditorWorkspace document={meshDocument} activeRole={meshRole} slots={slots} onSelectRole={setMeshViewRole} meshes={meshEditorMeshes} onEditPieceId={editPieceId} onEditGroupShader={editGroupShader} onUpdateEmbedded={updateEmbeddedMesh} onRemoveEmbedded={removeEmbeddedPiece} onUpdateAllEmbedded={updateAllEmbeddedMeshes} onConvertObjs={() => void chooseObjFolder()} zeroShellId={zeroShellId} onSetZeroShellId={setZeroShellId} compactStreams={compactStreams} onSetCompactStreams={setCompactStreams} onExportObj={(mesh) => void exportPieceObj(mesh)} embeddedUnreadable={embeddedOnly.unreadable} embeddedEmpty={embeddedOnly.empty} objFolder={objFolder} describeEmbedTarget={describeEmbedTarget} describePieceSize={describePieceSize} onUndo={meshUndo} onRedo={meshRedo} canUndo={pieceIdUndoRef.current.length > 0} canRedo={pieceIdRedoRef.current.length > 0} vehicleBase={vehicleBase} loadedCount={loadedCount} onOpenFolder={() => void openFolder()} recentVehicleFolders={recentVehicleFolders} onOpenRecentFolder={(path) => void openVehicleFolderAtPath(path)} onClearRecentFolders={clearVehicleRecents} listWidth={panelWidths.meshList} onResizeList={resizeMeshList} /></div>}
     {workspace === "performance" && <PerformanceWorkspace slots={slots} workingRole={workingRole} vehicleBase={vehicleBase} loadedCount={loadedCount} revision={revision} onApply={applyPerformance} onStatus={setStatus} onOpenFolder={() => void openFolder()} recentVehicleFolders={recentVehicleFolders} onOpenRecentFolder={(path) => void openVehicleFolderAtPath(path)} onClearRecentFolders={clearVehicleRecents} />}
     {workspace === "audio" && <AudioWorkspace slots={slots} workingRole={workingRole} vehicleBase={vehicleBase} loadedCount={loadedCount} revision={revision} onApply={applyAudio} onStatus={setStatus} onOpenFolder={() => void openFolder()} recentVehicleFolders={recentVehicleFolders} onOpenRecentFolder={(path) => void openVehicleFolderAtPath(path)} onClearRecentFolders={clearVehicleRecents} />}
     <div className="workspace-host" style={{ display: workspace === "textures" ? "contents" : "none" }}><TextureWorkspace active={workspace === "textures"} dropped={texturesDrop} onConsumeDrop={() => setTexturesDrop(null)} onStatus={setStatus} isPathBlocked={isVehiclePathBlocked} onPendingChange={setTexturesPending} menuRef={textureMenu} /></div>

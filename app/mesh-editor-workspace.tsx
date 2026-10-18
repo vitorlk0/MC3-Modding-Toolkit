@@ -25,7 +25,7 @@ function defaultVisibleNames(meshes: MeshGeometry[], document: PckDocument | nul
     && !isLowLodOnly(mesh, document) && !isShadowPlane(mesh.name)).map((mesh) => mesh.name));
 }
 
-export function MeshEditorWorkspace({ document, activeRole, slots, onSelectRole, meshes, onEditPieceId, onEditGroupShader, onUpdateEmbedded, onUpdateAllEmbedded, onConvertObjs, zeroShellId, onSetZeroShellId, compactStreams, onSetCompactStreams, onExportObj, embeddedUnreadable, embeddedEmpty, objFolder, describeEmbedTarget, describePieceSize, onUndo, onRedo, canUndo, canRedo, vehicleBase, loadedCount, onOpenFolder, recentVehicleFolders, onOpenRecentFolder, onClearRecentFolders, listWidth, onResizeList }: {
+export function MeshEditorWorkspace({ document, activeRole, slots, onSelectRole, meshes, onEditPieceId, onEditGroupShader, onUpdateEmbedded, onRemoveEmbedded, onUpdateAllEmbedded, onConvertObjs, zeroShellId, onSetZeroShellId, compactStreams, onSetCompactStreams, onExportObj, embeddedUnreadable, embeddedEmpty, objFolder, describeEmbedTarget, describePieceSize, onUndo, onRedo, canUndo, canRedo, vehicleBase, loadedCount, onOpenFolder, recentVehicleFolders, onOpenRecentFolder, onClearRecentFolders, listWidth, onResizeList }: {
   document: PckDocument | null;
   activeRole: VehicleRole | null;
   slots: VehicleSlots;
@@ -34,6 +34,8 @@ export function MeshEditorWorkspace({ document, activeRole, slots, onSelectRole,
   onEditPieceId(meshName: string, entries: LodMeshEntry[], newId: number): void;
   onEditGroupShader(meshName: string, group: number, newId: number): void;
   onUpdateEmbedded(meshName: string): void;
+  /** Takes the piece's embedded copy out of every loaded PCK; its table row stays. */
+  onRemoveEmbedded(meshName: string): void;
   onUpdateAllEmbedded(): void;
   onConvertObjs(): void;
   /** Sync (and Convert OBJs' embed) sets the table ID of pieces named "shell" to 0 first. */
@@ -73,12 +75,14 @@ export function MeshEditorWorkspace({ document, activeRole, slots, onSelectRole,
   const openPieceMenu = (mesh: MeshGeometry, x: number, y: number) => {
     const plan = describeEmbedTarget(mesh.name);
     const where = plan.targets.map((role) => roleLabels[role as VehicleRole] ?? role).join(", ");
+    const embeddedIn = roles.filter((role) => slots[role] && matchLodEntries(mesh.name, slots[role]!.document).some((entry) => entry.meshBlockOffset !== null));
     const syncBlocked = mesh.origin === "embedded"
       ? "This piece only exists inside the car PCKs — there is no loose mesh.pck to sync from."
       : !plan.hasRow ? "No HLOD/MLOD/LLOD row in any loaded PCK, so there is no slot to sync it into."
       : !plan.targets.length ? "No loaded PCK to sync this piece into." : null;
     setContextMenu({ x, y, heading: mesh.name.replace(/\.mesh\.pck$/i, ""), items: [
       { label: plan.inserting ? "Sync piece (insert)" : "Sync piece", disabled: syncBlocked !== null, title: syncBlocked ?? `Bring the copy baked into ${where} in line with the loose mesh.pck. Stays in memory until you save.`, onSelect: () => onUpdateEmbedded(mesh.name) },
+      { label: "Remove embedded copy", disabled: !embeddedIn.length, title: embeddedIn.length ? `Take the copy baked into ${embeddedIn.map((role) => roleLabels[role]).join(", ")} out, so the game loads the loose mesh.pck of this name again (or shows nothing if there is none). The table row and its ID stay. The space a tool used is reclaimed when you save; until then it stays in memory and can be undone.` : "This piece isn't embedded in any loaded PCK, so there is nothing to remove.", onSelect: () => onRemoveEmbedded(mesh.name) },
       { label: "Export as OBJ…", title: "Write this piece to an OBJ the OBJ converter reads back as-is: piece ID in the filename, one material per group named by shader ID, normals and UVs.", onSelect: () => onExportObj(mesh) },
     ] });
   };
