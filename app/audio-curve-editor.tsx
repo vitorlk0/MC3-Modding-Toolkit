@@ -27,8 +27,9 @@ const HEIGHT = 330;
 const M = { l: 50, r: 18, t: 16, b: 46 };
 const HIT = 10;
 
-export function CurveEditor({ block, buf, saved, sourceName, onWrite, onStatus, playhead = null }: {
+export function CurveEditor({ block, levels, buf, saved, sourceName, onWrite, onStatus, playhead = null }: {
   block: AudioBlock;
+  levels: AudioBlock[];
   buf: Uint8Array;
   saved: Uint8Array;
   sourceName: string;
@@ -198,6 +199,31 @@ export function CurveEditor({ block, buf, saved, sourceName, onWrite, onStatus, 
     } catch (caught) { onStatus(caught instanceof Error ? caught.message : "Could not paste curves."); }
   };
 
+  /**
+   * The shown curves onto every other level of a category, as one undo step. A level only receives the
+   * curves it already uses (storage and at least one row) and has room for — the others are listed as
+   * skipped, never created. Curves shared between levels are written once.
+   */
+  const copyToAll = (category: string) => {
+    const seen = new Set<number>(); const writes: Write[] = []; const reached: string[] = []; const skipped: string[] = [];
+    for (const level of levels.filter((b) => b.category === category && b.fileOff !== block.fileOff)) {
+      const got: string[] = [];
+      for (const key of shown) {
+        const target = level.curves[key]; const rows = activeCurveRows(block.curves[key]);
+        if (target?.pointsFileOff === block.curves[key].pointsFileOff) continue;
+        if (!target || target.pointsFileOff === null || target.pointCount === 0) { skipped.push(`${level.label} ${labelOf(key)}: not used`); continue; }
+        if (seen.has(target.pointsFileOff)) continue;
+        const capacity = curveCapacity(buf.length, target);
+        if (rows.length > capacity) { skipped.push(`${level.label} ${labelOf(key)}: ${rows.length} rows, room for ${capacity}`); continue; }
+        seen.add(target.pointsFileOff);
+        writes.push(...curveEditWrites(buf.length, target, rows)); got.push(key);
+      }
+      if (got.length) reached.push(level.label);
+    }
+    if (writes.length) onWrite(writes, `${block.label} curves → all ${category} levels`);
+    onStatus(`Copied ${shown.map(labelOf).join(", ")} to ${reached.length} ${category} level${reached.length === 1 ? "" : "s"}${skipped.length ? ` · skipped ${skipped.join("; ")}` : ""}`);
+  };
+
   // --- Drawing ---------------------------------------------------------------------------------------
   const xTicks = Array.from({ length: 6 }, (_, i) => frame.xmin + (i / 5) * (frame.xmax - frame.xmin));
   const yTicks = Array.from({ length: 5 }, (_, i) => frame.ymax - (i / 4) * (frame.ymax - frame.ymin));
@@ -231,6 +257,8 @@ export function CurveEditor({ block, buf, saved, sourceName, onWrite, onStatus, 
       <span className="au-curve-spacer" />
       <button className="au-mini" disabled={!shown.length} onClick={() => void copyCurves()} title={tr("Copy the shown curves as JSON — the Audio Curve GUI's format, so it pastes there too")}>{tr("Copy curves")}</button>
       <button className="au-mini" onClick={() => void pasteCurves()} title={tr("Paste curves from the clipboard into the shown curves of this block")}>{tr("Paste")}</button>
+      {["Engine", "Exhaust"].map((category) => <button key={category} className="au-mini" disabled={!shown.length} onClick={() => copyToAll(category)}
+        title={tr("Copy the shown curves to every other level of this category — only into curves that level already uses, one undo step")}>{tr(`→ All ${category}`)}</button>)}
     </div>
 
     <div className="au-plot" ref={boxRef}>

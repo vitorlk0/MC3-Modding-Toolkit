@@ -691,6 +691,11 @@ button { color:inherit; }
 .au-row.inactive { opacity:.5; }
 .au-row .perf-input { height:26px; }
 .au-ranges .au-row { grid-template-columns:24px minmax(0,1.6fr) 110px 110px 110px; }
+.au-apply-all { display:flex; gap:6px; }
+.au-rescale { display:grid; grid-template-columns:minmax(0,1fr) 110px auto auto;align-items:center; gap:14px; margin-bottom:9px; padding:8px 10px; border:1px solid var(--line-soft); border-radius:8px; background:var(--panel); }
+.au-rescale label { display:flex; align-items:center; gap:7px; color:#a9b0a9; font-size:11px; cursor:pointer; }
+.au-rescale input[type=checkbox] { margin:0; accent-color:var(--lime); }
+@media (max-width:760px) { .au-rescale { grid-template-columns:1fr; } }
 .au-floats .au-row { grid-template-columns:80px 150px 110px minmax(0,1fr); }
 .au-floats .au-row>span:last-child { color:#6b736b; font-size:10px; }
 .au-row.changed .perf-input { color:var(--lime-soft); border-color:#3d4c29; }

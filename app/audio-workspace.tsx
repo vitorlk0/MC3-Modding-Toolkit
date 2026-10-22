@@ -351,12 +351,12 @@ export function AudioWorkspace({ slots, workingRole, vehicleBase, loadedCount, r
       <div className="editor-scroll perf-editor" ref={editorRef}>
         {view?.doc && <div className="au-root-line"><Tx t="audio_root {0} · {1} · {2}" v={[hex(view.doc.rootOff), view.doc.rootName || tr("unnamed"), view.doc.warnings.length ? view.doc.warnings.join(" · ") : tr("no warnings")]} /></div>}
         {!selected || !view ? <div className="perf-empty">{view?.error || tr("Nothing to show.")}</div>
-          : selected.type === "block" ? <BlockEditor block={selected} buf={view.buf} onBank={(value) => editBank(selected, value)} onF32={editF32}
+          : selected.type === "block" ? <BlockEditor block={selected} buf={view.buf} onBank={(value) => editBank(selected, value)} onF32={editF32} onWrites={apply} onStatus={onStatus} levels={view.doc?.blocks ?? []}
             onPlaySample={bankShown.status === "ready" ? playSample : null}
             listen={perfState && <ListenPanel block={selected} bank={bankShown} perf={perfState} banksFolder={banksFolder} searched={searched} playing={playback?.label ?? null}
               onPlayRender={playRender} onPlaySample={playSample} onStop={stop} onExport={(render) => void exportRender(render)}
               onChooseFolder={() => void chooseBanksFolder()} onClearFolder={clearBanksFolder} onStatus={onStatus} />}
-            curves={<CurveEditor block={selected} buf={view.buf} saved={view.saved} sourceName={slots[view.role]!.path.replace(/^.*[\\/]/, "")} onWrite={apply} onStatus={onStatus}
+            curves={<CurveEditor block={selected} levels={view.doc?.blocks ?? []} buf={view.buf} saved={view.saved} sourceName={slots[view.role]!.path.replace(/^.*[\\/]/, "")} onWrite={apply} onStatus={onStatus}
               playhead={playback?.rpmAt && playback.rootRel === selected.rootRel && playback.role === view.role ? playback : null} />} />
             : selected.type === "raw" ? <RawEditor raw={selected} buf={view.buf} saved={view.saved} limit={auxEditLimit(view.doc!, selected, view.buf.length)}
               candidates={savedDocs.get(view.role)?.rawAux.find((r) => r.rootRel === selected.rootRel)?.floatPreview ?? selected.floatPreview}
@@ -404,8 +404,40 @@ export function AudioWorkspace({ slots, workingRole, vehicleBase, loadedCount, r
   </main>;
 }
 
-function BlockEditor({ block, buf, onBank, onF32, curves, listen, onPlaySample }: {
-  block: AudioBlock; buf: Uint8Array; onBank(value: string): string | null; onF32(offset: number, value: number, label: string): string | null;
+/** The active ranges and the RPM span they cover, from the lowest Min to the highest Max. */
+function rangeSpan(block: AudioBlock) {
+  const active = block.ranges.filter((range) => range.active);
+  return { active, base: Math.min(...active.map((range) => range.minRpm)), top: Math.max(...active.map((range) => range.maxRpm)) };
+}
+
+/**
+ * Rescaling maps [base, top] onto [base, next] for Min, Mid and Max of each active range, so idle keeps
+ * its RPM and the overlaps between ranges keep their proportions. Placeholders aren't touched. `seen`
+ * holds offsets already written, so two levels pointing at the same block aren't scaled twice.
+ */
+function rescaleWrites(block: AudioBlock, next: number, withBlockMax: boolean, seen: Set<number>) {
+  const { active, base, top } = rangeSpan(block);
+  if (!active.length) return "no active ranges";
+  if (seen.has(block.fileOff)) return [];
+  if (!(next > base)) return `Must be above the lowest Min RPM (${fmt(base)}).`;
+  if (!(top > base)) return "The active ranges have no span to rescale.";
+  seen.add(block.fileOff);
+  const map = (rpm: number) => base + (rpm - base) * (next - base) / (top - base);
+  const writes = active.filter((range) => !seen.has(range.fileOff)).flatMap((range) => {
+    seen.add(range.fileOff);
+    return [
+      { offset: range.fileOff + 0x20, bytes: f32Bytes(map(range.minRpm)) },
+      { offset: range.fileOff + 0x24, bytes: f32Bytes(map(range.maxRpm)) },
+      { offset: range.fileOff + 0x28, bytes: f32Bytes(map(range.midRpm)) },
+    ];
+  });
+  if (withBlockMax) writes.push({ offset: block.fileOff + 0x28, bytes: f32Bytes(next) });
+  return writes;
+}
+
+function BlockEditor({ block, levels, buf, onBank, onF32, onWrites, onStatus, curves, listen, onPlaySample }: {
+  block: AudioBlock; levels: AudioBlock[]; buf: Uint8Array; onBank(value: string): string | null; onF32(offset: number, value: number, label: string): string | null;
+  onWrites(writes: { offset: number; bytes: Uint8Array }[], label: string): void; onStatus(message: string): void;
   curves: ReactNode; listen: ReactNode; onPlaySample: ((name: string) => void) | null;
 }) {
   void buf;
@@ -417,6 +449,25 @@ function BlockEditor({ block, buf, onBank, onF32, curves, listen, onPlaySample }
     ["Boost mix percent / rate", `${fmt(block.boostMixPercent)} / ${fmt(block.boostMixRate)}`], ["High Pitch engage gear", String(block.highPitchCurveEngageGear)],
     ["EngineRevSound", block.engineRevSound || "—"],
   ];
+  const [withBlockMax, setWithBlockMax] = useState(true);
+  const { active, top } = rangeSpan(block);
+  const rescale = (next: number) => {
+    const result = rescaleWrites(block, next, withBlockMax, new Set());
+    if (typeof result === "string") return result;
+    onWrites(result, `${block.label} · RPM ranges rescaled to ${fmt(Math.fround(next))}`);
+    return null;
+  };
+  /** The same top on every level of a category; each level rescales from its own lowest Min. */
+  const rescaleAll = (category: string) => {
+    const seen = new Set<number>(); const writes: { offset: number; bytes: Uint8Array }[] = []; const done: string[] = []; const skipped: string[] = [];
+    for (const level of levels.filter((b) => b.category === category)) {
+      const result = rescaleWrites(level, top, withBlockMax, seen);
+      if (typeof result === "string") skipped.push(`${level.label}: ${result}`);
+      else { writes.push(...result); done.push(level.label); }
+    }
+    if (writes.length) onWrites(writes, `${category} levels · RPM ranges rescaled to ${fmt(top)}`);
+    onStatus(`Top RPM ${fmt(top)} applied to ${done.length} ${category} level${done.length === 1 ? "" : "s"}${skipped.length ? ` · skipped ${skipped.join("; ")}` : ""}`);
+  };
   return <>
     <header className="perf-section-head">
       <div>
@@ -437,6 +488,15 @@ function BlockEditor({ block, buf, onBank, onF32, curves, listen, onPlaySample }
     {curves}
 
     <h3 className="au-subhead"><Tx t="RPM ranges {0}" v={[<small><Tx t="{0} active · inactive rows are placeholders the engine skips" v={[block.activeRangeCount]} /></small>]} /></h3>
+    {active.length > 0 && <div className="au-rescale">
+      <div className="perf-field-label"><strong>{tr("Top RPM")}</strong><small>{tr("rescales every active range — the lowest Min stays put")}</small></div>
+      <NumberField value={top} onCommit={rescale} title={tr("The Max RPM of the highest active range. Type a new top and every active Min, Mid and Max stretches in proportion between the lowest Min and it.")} />
+      <label><input type="checkbox" checked={withBlockMax} onChange={(event) => setWithBlockMax(event.target.checked)} />{tr("Also set the block's Max RPM (+0x28)")}</label>
+      <div className="au-apply-all">
+        {["Engine", "Exhaust"].map((category) => <button key={category} className="au-mini" onClick={() => rescaleAll(category)}
+          title={tr("Rescale every level of this category to this Top RPM, each from its own lowest Min — one undo step")}>{tr(`Apply to all ${category}`)}</button>)}
+      </div>
+    </div>}
     <div className="au-table au-ranges">
       <div className="au-row head"><span>#</span><span>{tr("SAMPLE")}</span><span>{tr("MIN RPM")}</span><span>{tr("MID RPM")}</span><span>{tr("MAX RPM")}</span></div>
       {block.ranges.map((range) => <div key={range.index} className={`au-row${range.active ? "" : " inactive"}`}>
