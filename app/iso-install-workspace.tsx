@@ -3,8 +3,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import {
   applyPlan, buildPlan, CATEGORY_ORDER, checkPackage, detectPackage, openIsoSession,
-  type CarReport, type InstallPlan, type IsoSession, type ModCategory, type ModPackage, type RandomFile,
+  type CarReport, type InstallPlan, type IsoSession, type ModCategory, type ModPackage, type PackageFile, type RandomFile,
 } from "../src/iso-install";
+import { BIKE_CLASSES, elfMentions, knownClass, type SlotCatalog } from "../src/slot-reference";
+import { readIsoCatalog } from "../src/slot-reference-iso";
+import { retargetPackage, type RetargetResult } from "../src/slot-retarget";
+import { RetargetNotes, SlotPicker } from "./mod-toolkit/slot-picker";
 import { SECTOR } from "../src/iso9660";
 import { DAT_BYTE_LIMIT, isOpponentCarcfg } from "../src/iso-install";
 import { checkWritable, explainIsoError, readPackageFiles, tauriIsoFs } from "./iso-io";
@@ -16,7 +20,13 @@ import { basename, parentFolder, sizeLabel } from "./mod-toolkit/toolkit-io";
  * ISO Install — the last step of a mod: writing finished car files into a compiled MC3 ISO.
  *
  * The user opens one ISO and adds any number of mod ZIPs (or extracted folders), one car each. Every
- * car shows which of its four file kinds the package brings, and each kind can be left out. The
+ * car shows which of its four file kinds the package brings, and each kind can be left out.
+ *
+ * Each car installs into a slot of the opened ISO: the slot the mod was made for when the ISO has
+ * it, or any other slot the user picks — then the package is converted in memory by Slot Retarget
+ * (src/slot-retarget.ts) against the ISO's own catalogues (src/slot-reference-iso.ts), exactly as
+ * Tools 11 would, and the converted files are what gets installed. A mod for a car the ISO doesn't
+ * have (a VIP or DLC car) has to be given a slot. Two cars can't take the same slot. The
  * install plan is recomputed whenever that changes, and Install writes every selected car in one
  * pass over the opened ISO — in place when everything fits, otherwise by rebuilding the image with
  * a larger ASSETS.DAT (see src/iso-install.ts). There is no undo: the tab says so up front.
@@ -35,12 +45,34 @@ const categoryLabels: Record<ModCategory, { title: string; blurb: string }> = {
 };
 
 type CarCard = {
+  /** Unique per added package; `key` (the car) is what a re-added package replaces. */
+  id: number;
   key: string;
   source: string;
   pkg: ModPackage | null;
+  /** The package's files, for converting it to another slot. */
+  files: PackageFile[];
+  /** The slot chosen by the user; null = the mod's own slot when the ISO has it. */
+  target: string | null;
   error: string | null;
   enabled: Record<ModCategory, boolean>;
 };
+
+/** A package converted to another slot, for one card and one target. */
+type Conversion = { target: string; running: boolean; result: RetargetResult | null; pkg: ModPackage | null; error: string | null };
+
+/** What a card installs, once its slot is resolved against the opened ISO. */
+type CardState = {
+  /** Slot it installs into: null while no ISO (or its slot list) is ready, "" when none is chosen. */
+  target: string | null;
+  /** The package that gets installed — the mod itself, or its conversion for `target`. */
+  pkg: ModPackage | null;
+  conversion: Conversion | null;
+  blockers: string[];
+  report: CarReport | null;
+};
+
+let nextCardId = 1;
 
 type Progress = { phase: string; done: number; total: number };
 
@@ -59,6 +91,9 @@ export function IsoInstallWorkspace({ dropped, onConsumeDrop, onStatus, onBusyCh
   const reader = useRef<RandomFile | null>(null);
   const [recents, setRecents] = useState<string[]>(() => loadRecent(ISO_RECENTS_KEY));
   const [cars, setCars] = useState<CarCard[]>([]);
+  const [catalog, setCatalog] = useState<SlotCatalog | null>(null);
+  const [catalogError, setCatalogError] = useState("");
+  const [conversions, setConversions] = useState<Map<number, Conversion>>(() => new Map());
   const [plan, setPlan] = useState<InstallPlan | null>(null);
   const [planError, setPlanError] = useState("");
   const [planning, setPlanning] = useState(false);
@@ -104,10 +139,11 @@ export function IsoInstallWorkspace({ dropped, onConsumeDrop, onStatus, onBusyCh
     for (const path of paths) {
       const source = basename(path);
       try {
-        const pkg = await detectPackage(source, await readPackageFiles(path));
-        added.push({ key: pkg.car, source, pkg, error: null, enabled: allOn() });
+        const files = await readPackageFiles(path);
+        const pkg = await detectPackage(source, files);
+        added.push({ id: nextCardId++, key: pkg.car, source, pkg, files, target: null, error: null, enabled: allOn() });
       } catch (caught) {
-        added.push({ key: `error:${path}`, source, pkg: null, error: caught instanceof Error ? caught.message : "Could not read this package.", enabled: allOn() });
+        added.push({ id: nextCardId++, key: `error:${path}`, source, pkg: null, files: [], target: null, error: caught instanceof Error ? caught.message : "Could not read this package.", enabled: allOn() });
       }
     }
     setCars((current) => {
@@ -133,14 +169,89 @@ export function IsoInstallWorkspace({ dropped, onConsumeDrop, onStatus, onBusyCh
     if (packages.length) void addPackages(packages);
   }, [dropped, onConsumeDrop, openIso, addPackages, writing]);
 
-  const reports = useMemo(() => new Map(cars.filter((card) => card.pkg).map((card) => [card.key, session ? checkPackage(session, card.pkg!) : null] as const)), [cars, session]);
+  // The opened ISO's slots and catalogues, for choosing where each car goes.
+  useEffect(() => {
+    setCatalog(null); setCatalogError(""); setConversions(new Map());
+    if (!session) return;
+    let cancelled = false;
+    readIsoCatalog(session)
+      .then((read) => { if (!cancelled) setCatalog(read); })
+      .catch((caught) => { if (!cancelled) setCatalogError(caught instanceof Error ? caught.message : String(caught)); });
+    return () => { cancelled = true; };
+  }, [session]);
+
+  const targetOf = useCallback((card: CarCard) => {
+    if (!card.pkg || !catalog) return null;
+    return card.target ?? (catalog.listing.some((slot) => slot.name === card.pkg!.car) ? card.pkg.car : "");
+  }, [catalog]);
+
+  // Convert every card that goes to another slot than its own, once per card and target.
+  useEffect(() => {
+    if (!catalog || writing) return;
+    for (const card of cars) {
+      const target = targetOf(card);
+      const pkg = card.pkg;
+      if (!pkg || !target || target === pkg.car || conversions.get(card.id)?.target === target) continue;
+      const pending: Conversion = { target, running: true, result: null, pkg: null, error: null };
+      setConversions((current) => new Map(current).set(card.id, pending));
+      void (async () => {
+        let done: Conversion;
+        try {
+          const result = await retargetPackage(card.source, { car: pkg.car, className: knownClass(pkg.car), files: card.files, notes: pkg.notes }, target, catalog);
+          const converted = result.blocked ? null : await detectPackage(card.source, result.files.map((file) => ({ path: file.path, size: file.bytes.length, read: async () => file.bytes })));
+          done = { target, running: false, result, pkg: converted, error: null };
+        } catch (caught) {
+          done = { target, running: false, result: null, pkg: null, error: `Converting ${pkg.car} for ${target} failed: ${caught instanceof Error ? caught.message : caught}` };
+        }
+        // Only if nothing newer replaced this conversion meanwhile.
+        setConversions((current) => current.get(card.id) === pending ? new Map(current).set(card.id, done) : current);
+      })();
+    }
+  }, [cars, catalog, conversions, writing, targetOf]);
+
+  const states = useMemo(() => {
+    const out = new Map<number, CardState>();
+    const claimed = new Set<string>();
+    for (const card of cars) {
+      if (!card.pkg) continue;
+      const car = card.pkg.car;
+      const target = targetOf(card);
+      const blockers: string[] = [];
+      let pkg: ModPackage | null = card.pkg;
+      let conversion: Conversion | null = null;
+      // No slot yet: the card's slot row asks for one; nothing installs meanwhile.
+      if (target === "") pkg = null;
+      else if (target && !catalog!.listing.some((slot) => slot.name === target)) {
+        blockers.push(`${target} isn't a car of this ISO. Choose another slot.`);
+        pkg = null;
+      } else if (target && target !== car) {
+        const current = conversions.get(card.id);
+        conversion = current?.target === target ? current : null;
+        pkg = conversion && !conversion.running ? conversion.pkg : null;
+        if (conversion?.error) blockers.push(conversion.error);
+        else if (conversion?.result?.blocked) blockers.push(`${car} can't be moved onto ${target} — see the blocked items in the conversion report.`);
+      }
+      if (target) {
+        if (claimed.has(target)) blockers.push(`Another mod in the list already installs into ${target}. Remove one of them or choose another slot.`);
+        claimed.add(target);
+      }
+      // Without the slot list there is nothing to check against yet (or, if it failed, only the own slot).
+      const ready = !!session && (!!catalog || !!catalogError);
+      const report = ready && pkg && !blockers.length ? checkPackage(session!, pkg) : null;
+      out.set(card.id, { target, pkg, conversion, blockers, report });
+    }
+    return out;
+  }, [cars, conversions, catalog, catalogError, session, targetOf]);
+
+  const converting = [...states.values()].filter((state) => state.conversion?.running).length;
 
   const selections = useMemo(() => cars.flatMap((card) => {
-    const report = reports.get(card.key);
-    if (!card.pkg || !report || report.errors.length) return [];
+    const state = states.get(card.id);
+    if (!state?.pkg || !state.report || state.report.errors.length || state.blockers.length) return [];
+    const report = state.report;
     const files = CATEGORY_ORDER.filter((category) => card.enabled[category]).flatMap((category) => report.categories[category].files);
-    return files.length ? [{ car: card.pkg.car, files }] : [];
-  }), [cars, reports]);
+    return files.length ? [{ car: state.pkg.car, files }] : [];
+  }), [cars, states]);
 
   useEffect(() => {
     setPlan(null); setPlanError("");
@@ -200,8 +311,9 @@ export function IsoInstallWorkspace({ dropped, onConsumeDrop, onStatus, onBusyCh
     void addPackages(Array.isArray(selection) ? selection : [selection]);
   };
 
-  const toggle = (key: string, category: ModCategory) => setCars((current) => current.map((card) => card.key === key ? { ...card, enabled: { ...card.enabled, [category]: !card.enabled[category] } } : card));
-  const removeCar = (key: string) => setCars((current) => current.filter((card) => card.key !== key));
+  const toggle = (id: number, category: ModCategory) => setCars((current) => current.map((card) => card.id === id ? { ...card, enabled: { ...card.enabled, [category]: !card.enabled[category] } } : card));
+  const removeCar = (id: number) => setCars((current) => current.filter((card) => card.id !== id));
+  const chooseTarget = (id: number, target: string) => setCars((current) => current.map((card) => card.id === id ? { ...card, target: target || null } : card));
 
   const changedCount = plan ? plan.items.filter((item) => item.action !== "unchanged").length : 0;
   const busy = loading || writing;
@@ -217,6 +329,7 @@ export function IsoInstallWorkspace({ dropped, onConsumeDrop, onStatus, onBusyCh
         <div>
           <h2>{tr("Put finished car mods into a compiled ISO")}</h2>
           <p className="toolkit-hero-copy"><Tx t="Add mod ZIPs — one car each — and they are written into {0} of the opened ISO, replacing the original car. The {1} and the {2} are required; {3}, {4} and {5} files are installed when the package has them. Textures, readmes and scripts in a package are ignored." v={[<code>ASSETS.DAT</code>, <strong>{tr("garage PCK")}</strong>, <strong>{tr("vehicle DAT")}</strong>, <strong>{tr("flash menus")}</strong>, <strong>{tr("carcfg")}</strong>, <strong>{tr("tune")}</strong>]} /></p>
+          <p className="toolkit-hero-copy"><Tx t="A car goes into the slot it was made for. Pick another {0} to put it over a different car, or to give a slot to a car the ISO doesn't have (a VIP or DLC car): the mod is converted for that slot the way {1} does, and the car takes that slot's name, logo, price and class." v={[<strong>{tr("slot")}</strong>, <strong>{tr("Tools › 11 Slot Retarget")}</strong>]} /></p>
         </div>
         <div className="toolkit-facts">
           <div><span>{tr("INPUT")}</span><strong>{tr(".iso + mod .zip / folder")}</strong></div>
@@ -269,7 +382,9 @@ export function IsoInstallWorkspace({ dropped, onConsumeDrop, onStatus, onBusyCh
         {!cars.length ? (
           <div className="toolkit-empty"><span>{tr("ZIP")}</span><strong>{tr("No mods added yet")}</strong><p><Tx t="Drop mod ZIPs on the window. Each needs the car's {0} and {1}; files can sit anywhere inside the ZIP." v={[<code>vp_*.dat</code>, <code>vp_*_g.pck</code>]} /></p></div>
         ) : <div className="iso-car-list">
-          {cars.map((card) => <CarCardView key={card.key} card={card} report={reports.get(card.key) ?? null} hasIso={!!session} busy={busy} onToggle={(category) => toggle(card.key, category)} onRemove={() => removeCar(card.key)} />)}
+          {catalogError && <p className="carcfg-warning"><Tx t="This ISO's car list couldn't be read, so cars can only go into the slot they were made for: {0}" v={[tr(catalogError)]} /></p>}
+          {cars.map((card) => <CarCardView key={card.id} card={card} state={states.get(card.id) ?? null} catalog={catalog} hasIso={!!session} busy={busy}
+            onTarget={(target) => chooseTarget(card.id, target)} onToggle={(category) => toggle(card.id, category)} onRemove={() => removeCar(card.id)} />)}
         </div>}
       </section>
 
@@ -283,7 +398,9 @@ export function IsoInstallWorkspace({ dropped, onConsumeDrop, onStatus, onBusyCh
           </div>}
         </div>
         {!session || !selections.length ? (
-          <div className="toolkit-empty"><span>{tr("PLAN")}</span><strong>{!session ? tr("Open an ISO first") : tr("Add a car mod")}</strong><p>{tr("The plan appears once an ISO is open and at least one car has files selected.")}</p></div>
+          converting && session
+            ? <div className="toolkit-empty"><span>…</span><strong>{tr("Converting")}</strong><p>{tr("Converting the mods for the slots they go into.")}</p></div>
+            : <div className="toolkit-empty"><span>{tr("PLAN")}</span><strong>{!session ? tr("Open an ISO first") : tr("Add a car mod")}</strong><p>{tr("The plan appears once an ISO is open and at least one car has files selected.")}</p></div>
         ) : planning && !plan ? (
           <div className="toolkit-empty"><span>…</span><strong>{tr("Planning")}</strong><p>{tr("Comparing the mod files with the ISO.")}</p></div>
         ) : planError ? (
@@ -316,9 +433,9 @@ export function IsoInstallWorkspace({ dropped, onConsumeDrop, onStatus, onBusyCh
   </div>;
 }
 
-function CarCardView({ card, report, hasIso, busy, onToggle, onRemove }: {
-  card: CarCard; report: CarReport | null; hasIso: boolean; busy: boolean;
-  onToggle: (category: ModCategory) => void; onRemove: () => void;
+function CarCardView({ card, state, catalog, hasIso, busy, onTarget, onToggle, onRemove }: {
+  card: CarCard; state: CardState | null; catalog: SlotCatalog | null; hasIso: boolean; busy: boolean;
+  onTarget: (target: string) => void; onToggle: (category: ModCategory) => void; onRemove: () => void;
 }) {
   if (!card.pkg) {
     return <article className="iso-car refused">
@@ -326,13 +443,44 @@ function CarCardView({ card, report, hasIso, busy, onToggle, onRemove }: {
       <p className="iso-car-error">{card.error}</p>
     </article>;
   }
-  const pkg = card.pkg;
-  const refused = !!report?.errors.length;
+  const source = card.pkg;
+  const report = state?.report ?? null;
+  const target = state?.target ?? null;
+  const moved = !!target && target !== source.car;
+  const conversion = state?.conversion ?? null;
+  // The files shown: the converted package once it exists, else the mod's own.
+  const pkg = state?.pkg ?? source;
+  const refused = !!report?.errors.length || !!state?.blockers.length;
+  const result = conversion?.result ?? null;
+  const counts = result && {
+    converted: result.files.filter((file) => file.change === "converted").length,
+    renamed: result.files.filter((file) => file.change === "renamed").length,
+  };
+  const notes = result?.notes ?? [];
+  const warnings = notes.filter((note) => note.level === "warn").length;
   return <article className={refused ? "iso-car refused" : "iso-car"}>
     <header>
-      <div><strong>{pkg.car}</strong><small>{card.source}{pkg.ignored.length > 0 && tr(` · ${pkg.ignored.length} other file${pkg.ignored.length === 1 ? "" : "s"} ignored`)}</small></div>
+      <div><strong>{source.car}{moved && <em className="iso-car-moved"> → {target}</em>}</strong><small>{card.source}{source.ignored.length > 0 && tr(` · ${source.ignored.length} other file${source.ignored.length === 1 ? "" : "s"} ignored`)}</small></div>
       <button className="link-button" type="button" disabled={busy} onClick={onRemove}>{tr("Remove")}</button>
     </header>
+    {catalog && <div className="iso-slot">
+      <span className="iso-slot-label">{tr("SLOT")}</span>
+      <SlotPicker compact value={target ?? ""} disabled={busy} placeholder={tr("Choose the car it replaces…")} onChange={onTarget}
+        slots={catalog.listing.map((slot) => ({
+          name: slot.name, className: slot.className,
+          // Moving a mod needs the slot's own menus; its own slot always installs as it is.
+          disabled: !slot.menus && slot.name !== source.car,
+          label: slot.name === source.car ? tr(`${slot.name} (this mod's slot)`) : undefined,
+          tags: [...(BIKE_CLASSES.has(slot.className) ? ["bike"] : []), ...(elfMentions(slot.name).length ? ["ELF"] : []), ...(!slot.menus ? ["no menus"] : [])],
+        }))} />
+      <p className={target ? "iso-slot-status" : "iso-slot-status needed"}>{
+        !target ? <Tx t="{0} isn't in this ISO — choose the car it replaces." v={[<code>{source.car}</code>]} />
+          : !moved ? <Tx t="Replaces {0}, the slot this mod was made for." v={[<code>{target}</code>]} />
+          : !result && !conversion?.error ? <Tx t="Converting the mod for {0}…" v={[<code>{target}</code>]} />
+          : counts && !result!.blocked ? <Tx t="Converted for {0}: {1} files changed, {2} renamed. The car takes {3}'s name, logo, price and class." v={[<code>{target}</code>, counts.converted, counts.renamed, <code>{target}</code>]} />
+          : <Tx t="Can't go into {0}." v={[<code>{target}</code>]} />
+      }</p>
+    </div>}
     <div className="iso-car-kinds">
       {CATEGORY_ORDER.map((category) => {
         const files = report ? report.categories[category].files : pkg.files.filter((file) => file.category === category);
@@ -351,8 +499,12 @@ function CarCardView({ card, report, hasIso, busy, onToggle, onRemove }: {
       })}
     </div>
     {!hasIso && <p className="iso-car-note">{tr("Open an ISO to check this car against it.")}</p>}
+    {state?.blockers.map((message) => <p className="iso-car-error" key={tr(message)}>{tr(message)}</p>)}
     {report?.errors.map((message) => <p className="iso-car-error" key={tr(message)}>{tr(message)}</p>)}
     {report?.warnings.map((message) => <p className="iso-car-warning" key={tr(message)}>{tr(message)}</p>)}
+    {notes.length > 0 && <details className="iso-retarget" open={result?.blocked}>
+      <summary><strong>{tr("Conversion report")}</strong><small><Tx t="{0} notes · {1} warnings" v={[notes.length, warnings]} /></small></summary>
+      <div className="retarget-report"><RetargetNotes notes={notes} fixTitle="Converted for this ISO" /></div>
+    </details>}
   </article>;
 }
-

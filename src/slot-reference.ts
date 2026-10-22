@@ -47,6 +47,28 @@ export type SlotReferenceData = {
   vipClasses: Record<string, string>;
 };
 
+/** A slot as a picker lists it, before its own data is read. `menus`: it has a vs_ menu. */
+export type SlotListing = { name: string; index: number; className: string; menus: boolean };
+
+/**
+ * The game a mod is converted for: its catalogues and its slots. Tools 11 uses the original game
+ * (ORIGINAL_CATALOG, embedded); ISO Install uses the opened ISO (src/slot-reference-iso.ts), which
+ * reads a slot's own data only when it is asked for.
+ */
+export type SlotCatalog = {
+  /** What the report calls this game: "the original game" or "this ISO". */
+  where: string;
+  rims: string[];
+  namedRims: number;
+  exhausts: string[];
+  stringKeys: string[];
+  /** Plates and paint arrays for a slot that has no ds_ / ps_ of its own. */
+  plates: string[];
+  paint: PaintArrays;
+  listing: SlotListing[];
+  slot: (name: string) => Promise<SlotReference | null>;
+};
+
 /** Paint arrays restored from the target slot, in the order the approved test wrote them. */
 export const PAINT_ARRAYS = ["UpgradeTypesNames", "UpgradeTypesStatus", "UpgradeTypesPrice", "ColorUpgradeOrder"];
 
@@ -67,11 +89,22 @@ export const SLOT_REFERENCE: SlotReferenceData = SLOT_REFERENCE_DATA;
 
 const bySlot = new Map(SLOT_REFERENCE.slots.map((slot) => [slot.name, slot]));
 export const referenceSlot = (name: string) => bySlot.get(name.toLowerCase()) ?? null;
-export const slotPlates = (slot: SlotReference) => slot.plates ?? SLOT_REFERENCE.plates;
-export const slotPaint = (slot: SlotReference) => slot.paint ?? SLOT_REFERENCE.paint;
+
+export const ORIGINAL_CATALOG: SlotCatalog = {
+  where: "the original game",
+  rims: SLOT_REFERENCE.rims, namedRims: SLOT_REFERENCE.namedRims, exhausts: SLOT_REFERENCE.exhausts, stringKeys: SLOT_REFERENCE.stringKeys,
+  plates: SLOT_REFERENCE.plates, paint: SLOT_REFERENCE.paint,
+  listing: SLOT_REFERENCE.slots.map(({ name, index, className, flash }) => ({ name, index, className, menus: flash.vs })),
+  slot: async (name) => referenceSlot(name),
+};
+
+export const slotPlates = (slot: SlotReference, catalog: SlotCatalog = ORIGINAL_CATALOG) => slot.plates ?? catalog.plates;
+export const slotPaint = (slot: SlotReference, catalog: SlotCatalog = ORIGINAL_CATALOG) => slot.paint ?? catalog.paint;
 export const elfMentions = (name: string) => ELF_NAMED_SLOTS.filter((list) => list.slots.includes(name.toLowerCase())).map((list) => list.where);
-/** The class a slot has in vanilla, or in the VIP for slots only the VIP has; null when unknown. */
 /** A vehicle.lst class as the game's menus name it: CULTURE is the Tuner class. Display only;
  *  comparisons keep using the raw name. */
 export const classLabel = (className: string) => className === "CULTURE" ? "TUNER" : className;
+/** vehicle.lst classes of the motorbikes (KB §26.2). */
+export const BIKE_CLASSES = new Set(["CHOPPER", "SPORTBIKE", "COPBIKE"]);
+/** The class a slot has in vanilla, or in the VIP for slots only the VIP has; null when unknown. */
 export const knownClass = (name: string) => referenceSlot(name)?.className ?? SLOT_REFERENCE.vipClasses[name.toLowerCase()] ?? null;

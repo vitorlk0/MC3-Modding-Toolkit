@@ -5,11 +5,12 @@ import { join } from "@tauri-apps/api/path";
 import { readPackageFiles } from "../iso-io";
 import { readZip } from "../../src/zip-read";
 import { writeZip } from "../../src/zip-write";
-import { readRetargetSource, retargetPackage, retargetSlots, type RetargetLevel, type RetargetResult, type RetargetSource } from "../../src/slot-retarget";
+import { readRetargetSource, retargetPackage, retargetSlots, type RetargetResult, type RetargetSource } from "../../src/slot-retarget";
 import { classLabel, elfMentions, SLOT_REFERENCE } from "../../src/slot-reference";
 import { basename, parentPath, pickFiles, sizeLabel, writeVerified } from "./toolkit-io";
 import { loadRecent, pushRecent, saveRecent } from "../recent-paths";
 import { RecentList } from "./toolkit-ui";
+import { RetargetNotes, SlotPicker } from "./slot-picker";
 
 /**
  * Slot Retarget — takes a downloaded car mod (ZIP) made for one slot and writes a new ZIP that
@@ -20,14 +21,6 @@ import { RecentList } from "./toolkit-ui";
 
 const RECENTS_KEY = "mc3pae.recentRetargetPackages";
 const zipFilters = [{ name: "Car mod package", extensions: ["zip"] }];
-const LEVELS: { level: RetargetLevel; title: string }[] = [
-  { level: "block", title: "Blocked" },
-  { level: "warn", title: "Warnings" },
-  { level: "fix", title: "Converted for the original MC3" },
-  { level: "ok", title: "Checks passed" },
-  { level: "info", title: "Notes" },
-];
-const levelTag: Record<RetargetLevel, string> = { block: "BLOCK", warn: "WARN", fix: "FIX", ok: "OK", info: "INFO" };
 
 type Loaded = { path: string; source: RetargetSource };
 
@@ -46,20 +39,6 @@ export function SlotRetargetTool({ dropped, onConsumeDrop, onStatus }: {
   const run = useRef(0);
 
   const slots = useMemo(() => retargetSlots(), []);
-  // Typing narrows the list: spaces, underscores and the vp_ prefix don't matter ("is 300" finds
-  // vp_is300_04), and the class counts too ("tuner"). Enter picks the first slot left.
-  const [filter, setFilter] = useState("");
-  const squash = (text: string) => text.toLowerCase().replace(/^vp_/, "").replace(/[^a-z0-9]/g, "");
-  const byClass = useMemo(() => {
-    const query = squash(filter);
-    const groups = new Map<string, typeof slots>();
-    for (const slot of [...slots].sort((a, b) => a.name.localeCompare(b.name))) {
-      const label = classLabel(slot.className);
-      if (query && !squash(slot.name).includes(query) && !squash(label).includes(query)) continue;
-      groups.set(label, [...(groups.get(label) ?? []), slot]);
-    }
-    return [...groups].sort(([a], [b]) => a.localeCompare(b));
-  }, [slots, filter]);
 
   const load = useCallback(async (path: string) => {
     try {
@@ -177,21 +156,11 @@ export function SlotRetargetTool({ dropped, onConsumeDrop, onStatus }: {
         </div>}
       </div>
       <div className="retarget-pick">
-        <input className="retarget-filter" type="search" value={filter} disabled={!loaded || busy} placeholder={tr("Type to filter: is 300, charger, tuner…")} aria-label={tr("Filter slots")}
-          onChange={(event) => setFilter(event.target.value)}
-          onKeyDown={(event) => {
-            if (event.key !== "Enter") return;
-            const first = byClass.flatMap(([, group]) => group).find((slot) => slot.name !== source?.car);
-            if (first) { event.preventDefault(); void chooseTarget(first.name); }
-          }} />
-        <select className="retarget-select" value={target} disabled={!loaded || busy} onChange={(event) => void chooseTarget(event.target.value)} aria-label={tr("Target slot")}>
-          <option value="">{loaded ? tr("Choose a slot…") : tr("Open a mod first")}</option>
-          {byClass.map(([label, group]) => <optgroup key={label} label={label}>
-            {group.map((slot) => <option key={slot.name} value={slot.name} disabled={slot.name === source?.car}>
-              {slot.name}{slot.wheels === 2 ? ` · ${tr("bike")}` : ""}{elfMentions(slot.name).length ? " · ELF" : ""}
-            </option>)}
-          </optgroup>)}
-        </select>
+        <SlotPicker value={target} disabled={!loaded || busy} placeholder={loaded ? tr("Choose a slot…") : tr("Open a mod first")} onChange={(name) => void chooseTarget(name)}
+          slots={slots.map((slot) => ({
+            name: slot.name, className: slot.className, disabled: slot.name === source?.car,
+            tags: [...(slot.wheels === 2 ? ["bike"] : []), ...(elfMentions(slot.name).length ? ["ELF"] : [])],
+          }))} />
         <p className="retarget-hint">{tr(`Original game: ${SLOT_REFERENCE.slots.length} slots, ${SLOT_REFERENCE.rims.length} rims, ${SLOT_REFERENCE.exhausts.length} exhaust tips. Slots marked ELF are named in the game's code for a special case that wasn't identified.`)}</p>
       </div>
     </section>
@@ -208,14 +177,7 @@ export function SlotRetargetTool({ dropped, onConsumeDrop, onStatus }: {
       {!result ? (
         <div className="toolkit-empty"><span>{tr("SLOT")}</span><strong>{busy && target ? tr("Converting…") : tr("No conversion yet")}</strong><p>{tr("The report appears once a mod and a slot are chosen.")}</p></div>
       ) : <div className="retarget-report">
-        {LEVELS.map(({ level, title }) => {
-          const notes = result.notes.filter((note) => note.level === level);
-          if (!notes.length) return null;
-          return <div key={level} className={`retarget-group ${level}`}>
-            <h4>{tr(title)}</h4>
-            {notes.map((note, index) => <p key={index}><em>{levelTag[level]}</em><span>{tr(note.text)}</span></p>)}
-          </div>;
-        })}
+        <RetargetNotes notes={result.notes} />
         <details className="toolkit-category">
           <summary>
             <span className="toolkit-category-index">{tr("ZIP")}</span>

@@ -7,7 +7,7 @@ import { memoryReader } from "./iso9660";
 import { detectPackage, type PackageFile } from "./iso-install";
 import { PckDocument } from "./pck";
 import {
-  PAINT_ARRAYS, SLOT_REFERENCE, classLabel, elfMentions, knownClass, referenceSlot, slotPaint, slotPlates, type SlotReference,
+  ORIGINAL_CATALOG, PAINT_ARRAYS, SLOT_REFERENCE, classLabel, elfMentions, knownClass, slotPaint, slotPlates, type SlotCatalog, type SlotReference,
 } from "./slot-reference";
 
 /**
@@ -28,6 +28,8 @@ import {
  *   ps_  paint categories the target's menu doesn't have → the target's paint arrays;
  *   .carcfg  TypeName = T, ProfileName = T's, RimMdlIdx / ExhaustRear outside the original
  *        catalogues (or pointing at a replaced stock item) → T's stock.
+ * The catalogues and the target slot come from a SlotCatalog: the original game (Tools 11) or the
+ * ISO the mod is being installed into (ISO Install), whose catalogues may hold more than the original.
  * Flash edits use the VIP's append technique (src/avm1-append.ts), byte-identical to the test that
  * was approved in game. Global files (vehicle.lst, .strtbl, toplevel/garage.pck) are never touched,
  * so the slot keeps its name, logo, price and class.
@@ -84,7 +86,8 @@ function pckFamily(bytes: Uint8Array) {
   return { magic, name: magic === 0x007a9420 ? "standard" : magic === 0x007aa728 ? "DUB" : magic === 0x007a9620 ? "SL" : "unknown" };
 }
 
-type Notes = { add: (level: RetargetLevel, text: string) => void };
+/** `game`: how the report names the catalogue's game ("the original game", "this ISO"). */
+type Notes = { add: (level: RetargetLevel, text: string) => void; game: string };
 
 // ---------------------------------------------------------------------------------------------
 // Menus
@@ -97,10 +100,10 @@ type Stock = { token: string; brand: string; why: string };
 /** The item a missing stock rim / exhaust tip becomes. Rims: the target's stock rim. Exhaust tips:
  *  the target's stock tip — or, for the 42 original slots whose menu has no exhaust tips, the tip its
  *  .carcfg already fits (ExhaustRear), labelled with the car's make like every stock menu item. */
-function stockFor(slot: SlotReference, kind: "rim" | "exhaust"): Stock | null {
+function stockFor(slot: SlotReference, kind: "rim" | "exhaust", catalog: SlotCatalog): Stock | null {
   if (kind === "rim") return slot.stockRim && { ...slot.stockRim, why: `${slot.name}'s stock rim` };
   if (slot.stockExhaust) return { ...slot.stockExhaust, why: `${slot.name}'s stock exhaust tip` };
-  const token = slot.exhaustRear !== null ? SLOT_REFERENCE.exhausts[slot.exhaustRear] : undefined;
+  const token = slot.exhaustRear !== null ? catalog.exhausts[slot.exhaustRear] : undefined;
   return token && slot.stockRim ? { token, brand: slot.stockRim.brand, why: `the exhaust tip ${slot.name}'s .carcfg fits (ExhaustRear ${slot.exhaustRear}), since ${slot.name}'s own menu has no exhaust tips` } : null;
 }
 
@@ -118,8 +121,8 @@ function convertCatalogue(file: string, arrays: FlashArrays, base: string, label
   let keep = tokens.flatMap((token, index) => token !== null && valid.has(token) ? [index] : []);
   let replaced = false;
   if (tokens.length && (tokens[0] === null || !valid.has(tokens[0]))) {
-    if (!stock) { notes.add("block", `${file}: the stock ${label} ${tokens[0] ?? "(empty)"} doesn't exist in the original game, and ${target} has no stock ${label} to take its place.`); return false; }
-    notes.add("fix", `${file}: the stock ${label} ${tokens[0] ?? "(empty)"} doesn't exist in the original game; it becomes ${stock.token}, ${stock.why}.`);
+    if (!stock) { notes.add("block", `${file}: the stock ${label} ${tokens[0] ?? "(empty)"} doesn't exist in ${notes.game}, and ${target} has no stock ${label} to take its place.`); return false; }
+    notes.add("fix", `${file}: the stock ${label} ${tokens[0] ?? "(empty)"} doesn't exist in ${notes.game}; it becomes ${stock.token}, ${stock.why}.`);
     columns.get(`${base}Names`)![0] = { kind: "string", value: stock.token };
     if (columns.has(`${base}Brand`)) columns.get(`${base}Brand`)![0] = { kind: "string", value: stock.brand };
     // The new stock item may already be on the menu further down; one entry per item.
@@ -130,21 +133,21 @@ function convertCatalogue(file: string, arrays: FlashArrays, base: string, label
   }
   const dropped = tokens.filter((token, index) => !keep.includes(index) && !(replaced && index > 0 && token === stock?.token)).map((token) => token ?? "(empty)");
   if (dropped.length || keep.length !== tokens.length) {
-    if (dropped.length) notes.add("fix", `${file}: ${dropped.length} ${label} items that don't exist in the original game leave the menu: ${list(dropped)}.`);
+    if (dropped.length) notes.add("fix", `${file}: ${dropped.length} ${label} items that don't exist in ${notes.game} leave the menu: ${list(dropped)}.`);
     for (const key of parallel) plan.arrays.push([key, keep.map((index) => columns.get(key)![index])]);
   } else if (replaced) {
     for (const key of parallel) plan.arrays.push([key, columns.get(key)!]);
   } else {
-    notes.add("ok", `${file}: ${names.length} ${label} items, all in the original game.`);
+    notes.add("ok", `${file}: ${names.length} ${label} items, all in ${notes.game}.`);
   }
   return replaced;
 }
 
-function planFlash(prefix: string, file: string, arrays: FlashArrays, slot: SlotReference, notes: Notes): FlashPlan {
+function planFlash(prefix: string, file: string, arrays: FlashArrays, slot: SlotReference, catalog: SlotCatalog, notes: Notes): FlashPlan {
   const plan: FlashPlan = { arrays: [], stockRimReplaced: false, stockExhaustReplaced: false };
   if (prefix === "vs") {
-    plan.stockRimReplaced = convertCatalogue(file, arrays, "Rims", "rim", new Set(SLOT_REFERENCE.rims), stockFor(slot, "rim"), slot.name, notes, plan);
-    plan.stockExhaustReplaced = convertCatalogue(file, arrays, "BodyUpgradeExhaustTips", "exhaust tip", new Set(SLOT_REFERENCE.exhausts), stockFor(slot, "exhaust"), slot.name, notes, plan);
+    plan.stockRimReplaced = convertCatalogue(file, arrays, "Rims", "rim", new Set(catalog.rims), stockFor(slot, "rim", catalog), slot.name, notes, plan);
+    plan.stockExhaustReplaced = convertCatalogue(file, arrays, "BodyUpgradeExhaustTips", "exhaust tip", new Set(catalog.exhausts), stockFor(slot, "exhaust", catalog), slot.name, notes, plan);
   } else if (prefix === "ds") {
     const base = "LicencePlatesStyle";
     const names = arrays.get(`${base}Names`);
@@ -152,7 +155,7 @@ function planFlash(prefix: string, file: string, arrays: FlashArrays, slot: Slot
       const parallel = ["Names", "Price", "Status"].map((suffix) => `${base}${suffix}`).filter((key) => arrays.has(key));
       if (parallel.some((key) => arrays.get(key)!.length !== names.length)) notes.add("block", `${file}: the ${base} arrays don't have the same number of items.`);
       else {
-        const valid = new Set(slotPlates(slot));
+        const valid = new Set(slotPlates(slot, catalog));
         const tokens = strings(names);
         const keep = tokens.flatMap((token, index) => token !== null && valid.has(token) ? [index] : []);
         if (keep.length !== tokens.length) {
@@ -163,7 +166,7 @@ function planFlash(prefix: string, file: string, arrays: FlashArrays, slot: Slot
     }
   } else if (prefix === "ps") {
     const names = strings(arrays.get("UpgradeTypesNames"));
-    const paint = slotPaint(slot);
+    const paint = slotPaint(slot, catalog);
     const own = new Set(strings(paint.UpgradeTypesNames));
     const extra = names.filter((name) => name === null || !own.has(name)).map((name) => name ?? "(empty)");
     if (extra.length) {
@@ -174,9 +177,9 @@ function planFlash(prefix: string, file: string, arrays: FlashArrays, slot: Slot
   return plan;
 }
 
-/** Part tokens of a vs_ with no menu text in the original game (modding KB §20.4). */
-function untranslatedTokens(arrays: FlashArrays) {
-  const keys = new Set(SLOT_REFERENCE.stringKeys);
+/** Part tokens of a vs_ with no menu text in the catalogue's mcstrings08.strtbl (modding KB §20.4). */
+function untranslatedTokens(arrays: FlashArrays, catalog: SlotCatalog) {
+  const keys = new Set(catalog.stringKeys);
   const missing = new Set<string>();
   for (const [name, items] of arrays) {
     if (!name.endsWith("Names")) continue;
@@ -188,7 +191,7 @@ function untranslatedTokens(arrays: FlashArrays) {
 // ---------------------------------------------------------------------------------------------
 // .carcfg
 
-function convertCarcfg(file: string, bytes: Uint8Array, source: string, slot: SlotReference, main: boolean, stock: { rim: boolean; exhaust: boolean }, notes: Notes) {
+function convertCarcfg(file: string, bytes: Uint8Array, source: string, slot: SlotReference, catalog: SlotCatalog, main: boolean, stock: { rim: boolean; exhaust: boolean }, notes: Notes) {
   const decoded = decodeCarcfg(bytes);
   let text = decoded.text;
   let blocked = false;
@@ -206,13 +209,13 @@ function convertCarcfg(file: string, bytes: Uint8Array, source: string, slot: Sl
   const field = (key: string) => { const match = new RegExp(`^\\s*${key}\\s+(-?\\d+)`, "m").exec(text); return match ? Number(match[1]) : null; };
   const set = (key: string, value: number) => { text = text.replace(new RegExp(`^(\\s*${key}\\s+)(-?\\d+)`, "m"), `$1${value}`); };
   const rim = field("RimMdlIdx");
-  if (rim !== null && (rim < 0 || rim >= SLOT_REFERENCE.namedRims || (main && stock.rim))) {
-    if (slot.rimMdlIdx === null) notes.add("warn", `${file}: RimMdlIdx ${rim} is outside the original game's rims, and ${slot.name} has no stock value to use.`);
+  if (rim !== null && (rim < 0 || rim >= catalog.namedRims || (main && stock.rim))) {
+    if (slot.rimMdlIdx === null) notes.add("warn", `${file}: RimMdlIdx ${rim} is outside ${notes.game}'s rims, and ${slot.name} has no stock value to use.`);
     else { set("RimMdlIdx", slot.rimMdlIdx); notes.add("fix", `${file}: RimMdlIdx ${rim} → ${slot.rimMdlIdx} (${slot.name}'s stock rim).`); }
   }
   const exhaust = field("ExhaustRear");
-  if (exhaust !== null && (exhaust < 0 || exhaust >= SLOT_REFERENCE.exhausts.length || (main && stock.exhaust))) {
-    if (slot.exhaustRear === null) notes.add("warn", `${file}: ExhaustRear ${exhaust} is outside the original game's exhausts, and ${slot.name} has no stock value to use.`);
+  if (exhaust !== null && (exhaust < 0 || exhaust >= catalog.exhausts.length || (main && stock.exhaust))) {
+    if (slot.exhaustRear === null) notes.add("warn", `${file}: ExhaustRear ${exhaust} is outside ${notes.game}'s exhausts, and ${slot.name} has no stock value to use.`);
     else { set("ExhaustRear", slot.exhaustRear); notes.add("fix", `${file}: ExhaustRear ${exhaust} → ${slot.exhaustRear} (${slot.name}'s stock exhaust).`); }
   }
   return blocked ? null : encodeCarcfg(text, decoded.encoding, decoded.hasBom);
@@ -242,13 +245,13 @@ async function retargetDat(bytes: Uint8Array, label: string, from: string, to: s
 
 // ---------------------------------------------------------------------------------------------
 
-export async function retargetPackage(label: string, source: RetargetSource, target: string): Promise<RetargetResult> {
+export async function retargetPackage(label: string, source: RetargetSource, target: string, catalog: SlotCatalog = ORIGINAL_CATALOG): Promise<RetargetResult> {
   const notesList: RetargetNote[] = [];
-  const notes: Notes = { add: (level, text) => notesList.push({ level, text }) };
+  const notes: Notes = { add: (level, text) => notesList.push({ level, text }), game: catalog.where };
   const from = source.car;
-  const slot = referenceSlot(target);
+  const slot = await catalog.slot(target);
   const finish = (files: RetargetFile[]) => ({ source: from, target, files, notes: notesList, blocked: notesList.some((note) => note.level === "block") });
-  if (!slot || !retargetSlots().includes(slot)) { notes.add("block", `${target} is not a slot of the original game that a mod can take.`); return finish([]); }
+  if (!slot || !slot.flash.vs || !slot.stockRim) { notes.add("block", `${target} is not a slot of ${notes.game} that a mod can take.`); return finish([]); }
   if (slot.name === from) { notes.add("block", `The mod is already for ${from}.`); return finish([]); }
   for (const note of source.notes) notes.add("info", note);
 
@@ -276,8 +279,9 @@ export async function retargetPackage(label: string, source: RetargetSource, tar
   } else notes.add("warn", `The package has no ${from}.pck to check, so car versus bike wasn't checked.`);
 
   // ---- class and slots the game's code names
-  if (!source.className) notes.add("warn", `The class of ${from} is unknown (it isn't an original or a VIP slot), so it couldn't be compared with ${slot.name}'s (${classLabel(slot.className)}).`);
-  else if (source.className !== slot.className) notes.add("warn", `Class changes: ${from} is ${classLabel(source.className)}, ${slot.name} is ${classLabel(slot.className)}. What depends on the class (Zone, Agro, Roar, bike or SUV handling) follows the slot.`);
+  const sourceClass = catalog.listing.find((item) => item.name === from)?.className ?? source.className;
+  if (!sourceClass) notes.add("warn", `The class of ${from} is unknown (it isn't an original or a VIP slot), so it couldn't be compared with ${slot.name}'s (${classLabel(slot.className)}).`);
+  else if (sourceClass !== slot.className) notes.add("warn", `Class changes: ${from} is ${classLabel(sourceClass)}, ${slot.name} is ${classLabel(slot.className)}. What depends on the class (Zone, Agro, Roar, bike or SUV handling) follows the slot.`);
   else notes.add("ok", `Same class: ${classLabel(slot.className)}.`);
   for (const car of [from, slot.name]) for (const where of elfMentions(car)) notes.add("warn", `${car} is named in the game's code (${where}); what that special case does wasn't identified.`);
 
@@ -293,7 +297,7 @@ export async function retargetPackage(label: string, source: RetargetSource, tar
       if (prefix === "ms" || prefix === "reward") { out.push({ path: item.path, sourcePath: item.file.path, bytes, change: "renamed" }); continue; }
       try {
         const arrays = runFlashArrays(bytes, name);
-        const plan = planFlash(prefix, name, arrays, slot, notes);
+        const plan = planFlash(prefix, name, arrays, slot, catalog, notes);
         stock.rim ||= plan.stockRimReplaced;
         stock.exhaust ||= plan.stockExhaustReplaced;
         let final = arrays, written = bytes, change: RetargetChange = "renamed";
@@ -303,9 +307,9 @@ export async function retargetPackage(label: string, source: RetargetSource, tar
           written = rewrite.bytes; change = "converted"; final = runFlashArrays(written, name);
         }
         if (prefix === "vs") {
-          const missing = untranslatedTokens(final);
-          if (missing.length) notes.add("warn", `${name}: ${missing.length} part tokens have no text in the original game's mcstrings08.strtbl, so the shop shows them without a name: ${list(missing)}.`);
-          else notes.add("ok", `${name}: every part token has text in the original game.`);
+          const missing = untranslatedTokens(final, catalog);
+          if (missing.length) notes.add("warn", `${name}: ${missing.length} part tokens have no text in ${notes.game}'s mcstrings08.strtbl, so the shop shows them without a name: ${list(missing)}.`);
+          else notes.add("ok", `${name}: every part token has text in ${notes.game}.`);
         }
         out.push({ path: item.path, sourcePath: item.file.path, bytes: written, change });
       } catch (caught) {
@@ -320,7 +324,7 @@ export async function retargetPackage(label: string, source: RetargetSource, tar
   for (const item of carcfgs) {
     const name = baseName(item.path);
     const main = name.toLowerCase() === `${slot.name}.carcfg`;
-    const bytes = convertCarcfg(name, await item.file.read(), from, slot, main, stock, notes);
+    const bytes = convertCarcfg(name, await item.file.read(), from, slot, catalog, main, stock, notes);
     if (bytes) out.push({ path: item.path, sourcePath: item.file.path, bytes, change: "converted" });
   }
   const profile = String.fromCharCode(...slot.profile).replace(/\0.*$/s, "").trimEnd();
