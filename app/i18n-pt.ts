@@ -1804,7 +1804,7 @@ export const PT: Record<string, string> = {
   "Not a dealership type.": "Não é um tipo da concessionária.",
   "shared files": "arquivos compartilhados",
   "Real class": "Classe real",
-  "Special ability · class-only career events not tested": "Habilidade especial · eventos da carreira por classe não testados",
+  "Sets the special ability · class-only career events not tested yet": "Define a habilidade especial · eventos de carreira só de uma classe ainda não testados",
   "ForceITZ: this slot always has Zone": "ForceITZ: este slot sempre tem Zone",
   "Not a class a slot can take.": "Não é uma classe que um slot possa ter.",
   "{0} is a {1} — a car's class can't become a bike's, nor the other way round.": "O {0} é {1} — a classe de um carro não pode virar a de uma moto, nem o contrário.",

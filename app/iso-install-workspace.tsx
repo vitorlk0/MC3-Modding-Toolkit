@@ -651,7 +651,7 @@ function SlotDetailsPanel({ slot, details, logos, edits, busy, onEdit }: {
         }}>
         {!classes.some((item) => item.value === current.carClass) && <option value={current.carClass}>{current.carClass}</option>}
         {classes.map((item) => <option key={item.value} value={item.value}>{`${tr(item.label)} · ${item.ability}`}</option>)}
-      </select>, current.forceZone ? "ForceITZ: this slot always has Zone" : "Special ability · class-only career events not tested")}
+      </select>, current.forceZone ? "ForceITZ: this slot always has Zone" : "Sets the special ability · class-only career events not tested yet")}
     </div>
     {!art && <p className="iso-detail-note">{tr(`The icon of this slot can't be changed: ${current.artProblem}`)}</p>}
     <p className="iso-detail-note">{tr("Real class changes the special ability; the other fields change what the game shows. Group and unlock stay the slot's. A car already bought in a save may keep the name it was bought with.")}</p>
