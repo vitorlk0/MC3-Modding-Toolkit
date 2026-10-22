@@ -32,8 +32,8 @@ dropped onto the window. Keep a backup of your files anyway.
 | **Meshes** | Piece IDs, shader IDs, OBJ conversion (compact by default), re-embedding loose `mesh.pck` files, removing an embedded copy, and OBJ export |
 | **Performance** | Vehicle physics and performance values across all three PCKs at once |
 | **Textures** | Finds, previews and replaces PS2 textures in a PCK |
-| **Audio** | Engine audio curves and values, with an audible preview from the game's sound banks |
-| **ISO Install** | Installs the finished cars straight into the game's ISO |
+| **Audio** | Engine audio curves and values, with an audible preview from the game's sound banks; RPM ranges rescale to a new top RPM, and curves copy across levels |
+| **ISO Install** | Installs the finished cars straight into the game's ISO, into the slot each was made for or any other; can rename the slot and change its dealership card, icon and special ability |
 
 ## Credits
 
@@ -105,6 +105,19 @@ before the document is marked as saved.
   `Chrome_02` → 0x02) and gives faces before the first `usemtl` shader 0xDE; here those OBJs fail
   and are listed in a dialog. Every name both accept gets the same ID. The same dialog flags any
   converted shader ID above the highest one the car's own pieces use.
+
+## ISO Install
+
+- Each car goes into the slot it was made for, or into another slot you pick. A car the ISO doesn't
+  have (a VIP or DLC car) has to be given one. Moving a car converts its package the way
+  **Tools ▸ 11 Slot Retarget** does, against the opened ISO's own rims, exhausts and text.
+- **Slot details** edit what the game shows for that slot: name and short name, the dealership's
+  shown price, class letter and type, the icon's brand logo and REMIX badge (from the logos the game
+  has; the logo also sets the garage's bottom band), and the slot's real class, which picks its
+  special ability (Zone, Agro or Roar). These live in files every car shares, so the edits of all
+  the cars in an install are written together. The Mercedes/AMG icons can't be changed yet.
+- Not tested: whether the purchase charges the shown price, and career events open to one class only
+  after a class change.
 
 ## Building
 
