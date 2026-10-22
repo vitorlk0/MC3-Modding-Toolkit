@@ -96,6 +96,15 @@ before the document is marked as saved.
   alone. `Sync all` does both in one pass.
 - Re-embedding is idempotent: repeating it reuses the block the piece already occupies instead of
   appending a duplicate, and saving reclaims space left by earlier copies.
+- **Converts OBJs** to `mesh.pck`: the piece ID comes from the filename (`4C - name.mesh.obj`) and
+  each group's shader ID from its material name (`05 - Carpaint`; also `06`, `06 00`, `0x0006`,
+  `shader_0006`, `slot_000_shader_0006`, `bytes_06_00`). Output is byte for byte that of
+  `mc3_obj_to_pck.py`, with one deliberate difference: a material name without an explicit ID is
+  refused instead of guessed. The Python tool reads hex letters out of ordinary words
+  (`M_Opaque_PlasticSmoothBlack_Max` → 0xAC from "Black", `Default` → 0xDE, `Material.001` → 0x0E,
+  `Chrome_02` → 0x02) and gives faces before the first `usemtl` shader 0xDE; here those OBJs fail
+  and are listed in a dialog. Every name both accept gets the same ID. The same dialog flags any
+  converted shader ID above the highest one the car's own pieces use.
 
 ## Building
 

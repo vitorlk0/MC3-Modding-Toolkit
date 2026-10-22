@@ -8,7 +8,8 @@
  *
  * The pipeline is self-describing — nothing has to be supplied alongside the OBJ:
  * - the filename's hex prefix (`5D - name.mesh.obj`) becomes the piece ID at `0x86`;
- * - each material name's leading two hex characters (`05 - Carpaint`) become that group's shader ID;
+ * - each material name's leading two hex characters (`05 - Carpaint`) become that group's shader ID,
+ *   and a name without an explicit ID fails the conversion (see parseShaderIdFromMaterial);
  * - `usemtl` groups become the mesh's material groups, in first-seen order.
  */
 
@@ -155,6 +156,11 @@ function parseFaceRef(token: string, vertexCount: number, uvCount: number, norma
   };
 }
 
+/** Group key of faces that come before the first `usemtl`. `usemtl` always carries a name, so no
+ *  material can collide with it. The reference tool calls this group "default", which its shader
+ *  rule reads as 0xDE. */
+export const NO_MATERIAL = "";
+
 /** Reads an OBJ, grouping faces by material (the precedent tool's `group_by=material` default).
  *  Quads and n-gons are fan-triangulated, matching how the reference tool reads them. */
 export function readObj(text: string): ObjData {
@@ -162,7 +168,7 @@ export function readObj(text: string): ObjData {
   const uvs: Vec2[] = [];
   const normals: Vec3[] = [];
   const groups = new Map<string, Face[]>();
-  let material = "default";
+  let material = NO_MATERIAL;
   groups.set(material, []);
 
   const lines = text.split(/\r?\n/);
@@ -748,23 +754,52 @@ export function parseObjFileName(fileName: string): { meshId: number; stem: stri
   return { meshId: value, stem: rest };
 }
 
-/** `05 - Carpaint` → shader 0x05. Several legacy spellings are still accepted, mirroring the
- *  reference tool, because older exports used them. */
+/** A run of A-F letters long enough to be part of a word ("Face", "Bead", "Default"), not an ID. */
+const hexLetterWord = (text: string) => /^[a-f]{3,}$/i.test(text);
+
+/**
+ * `05 - Carpaint` → shader 0x05. The legacy spellings older exports used are still accepted:
+ * `06`, `06 00`, `0x0006`, `shader_0006`, `slot_000_shader_0006`, `bytes_06_00`.
+ *
+ * The rules are the reference Python tool's, in its order, and any name accepted here gets the
+ * value that tool gives it. What differs is that the tool also takes hex letters out of ordinary
+ * words — "M_Opaque_PlasticSmoothBlack_Max" became shader 0xAC from the "ac" in "Black",
+ * "Default" 0xDE, "Material.001" 0x0E — and a name like that is refused here instead, since a
+ * shader the car doesn't define is a silent bad piece in game rather than a visible error.
+ */
 export function parseShaderIdFromMaterial(materialName: string): number {
   const name = materialName.trim();
   if (!name) throw new Error("Empty material name.");
-  if (/^[0-9a-f]{2}$/i.test(name.slice(0, 2))) return parseInt(name.slice(0, 2), 16) & 0xffff;
-  let match = /^0[xX]([0-9A-Fa-f]{1,4})$/.exec(name);
-  if (match) return parseInt(match[1], 16) & 0xffff;
-  match = /^[0-9A-Fa-f]{1,4}$/.exec(name);
-  if (match) return parseInt(name, 16) & 0xffff;
-  match = /(?:shader|shd|material|mat|id)[_\-\s:]*([0-9A-Fa-f]{1,4})(?![0-9A-Fa-f])/i.exec(name);
-  if (match?.[1]) return parseInt(match[1], 16) & 0xffff;
-  const tokens = name.match(/(?<![0-9A-Fa-f])([0-9A-Fa-f]{2})(?![0-9A-Fa-f])/g) ?? [];
-  const [low, high] = tokens;
-  if (low !== undefined && high !== undefined) return (parseInt(low, 16) | (parseInt(high, 16) << 8)) & 0xffff;
-  if (low !== undefined) return parseInt(low, 16) & 0xffff;
-  throw new Error(`Material name "${materialName}" does not start with a two-character hex shader ID. Use names like "02 - Carpaint".`);
+  const refuse = (detail: string): never => {
+    throw new Error(`Material "${name}" has no explicit shader ID (${detail}). Start its name with the ID, like "02 - Carpaint".`);
+  };
+
+  // Two leading hex characters, the documented form. Two A-F letters running into more letters
+  // or digits are the start of a word ("Default", "Accent", "ABS_Plastic").
+  if (/^[0-9a-f]{2}/i.test(name)) {
+    if (/^[a-f]{2}[0-9a-z]/i.test(name)) refuse(`"${name.slice(0, 2)}" starts a word`);
+    return parseInt(name.slice(0, 2), 16);
+  }
+  let match = /^0x([0-9a-f]{1,4})$/i.exec(name);
+  if (match) return parseInt(match[1], 16);
+  if (/^[0-9a-f]$/i.test(name)) return parseInt(name, 16);
+
+  // `shader_0006` and the PCK->OBJ exporters' `slot_000_shader_0006`. The keyword has to start a
+  // token and the ID has to end one, so "Material.001" or "Rapid_Black" don't count.
+  match = /(?:shader|shd|material|mat|id)[_\-\s:]*([0-9a-f]{1,4})(?![0-9a-f])/i.exec(name);
+  if (match) {
+    const before = name[match.index - 1] ?? "";
+    const after = name[match.index + match[0].length] ?? "";
+    if (/[0-9a-z]/i.test(before) || /[0-9a-z]/i.test(after) || hexLetterWord(match[1])) refuse(`"${match[0]}" is part of a word`);
+    return parseInt(match[1], 16);
+  }
+
+  // Raw little-endian bytes: `bytes_06_00`. Only as the whole name — the reference tool takes the
+  // first lone pair of hex characters from anywhere, which is how "Black" became 0xAC.
+  match = /^bytes[_\-\s]*([0-9a-f]{2})(?:[_\-\s]+([0-9a-f]{2}))?$/i.exec(name);
+  if (match) return (parseInt(match[1], 16) | (match[2] ? parseInt(match[2], 16) << 8 : 0)) & 0xffff;
+  const stray = /(?<![0-9a-f])[0-9a-f]{2}(?![0-9a-f])/i.exec(name);
+  return refuse(stray ? `the "${stray[0]}" inside it is not an ID` : "no ID found");
 }
 
 // --- entry point -------------------------------------------------------------
@@ -779,11 +814,18 @@ export function convertObjToMeshPck(objText: string, fileName: string, options?:
   const { meshId, stem } = parseObjFileName(fileName);
 
   const names: string[] = [];
+  const shaderIds: number[] = [];
   const streams: MeshStream[] = [];
   let triangles = 0;
   for (const [groupName, faces] of obj.groups) {
+    // Parsed before the geometry so a bad name fails fast, and from the material name itself: the
+    // reference tool parses the `__part001` names of a split group, which turns spellings such as
+    // `0x0A06` or `6` into errors there.
+    if (groupName === NO_MATERIAL) throw new Error(`${faces.length} triangle${faces.length === 1 ? " comes" : "s come"} before the first usemtl, so they have no material and no shader ID. Assign them a material such as "02 - Carpaint" before exporting.`);
+    const shaderId = parseShaderIdFromMaterial(groupName);
     const split = buildAutoSplitStreams(groupName, faces, obj, t);
     names.push(...split.names);
+    shaderIds.push(...split.names.map(() => shaderId));
     streams.push(...split.streams);
     triangles += faces.length;
   }
@@ -797,7 +839,6 @@ export function convertObjToMeshPck(objText: string, fileName: string, options?:
   const materialPointer = view.getUint32(0x8c, true);
   const materialTable = PAYLOAD_OFFSET + (materialPointer - view.getUint32(0x00, true));
   if (materialTable < 0 || materialTable + streams.length * 2 > bytes.byteLength) throw new Error("The generated material table is out of bounds.");
-  const shaderIds = names.map((name) => parseShaderIdFromMaterial(name));
   shaderIds.forEach((id, index) => view.setUint16(materialTable + index * 2, id & 0xffff, true));
 
   return { name: `${stem}.pck`, bytes, meshId, shaderIds, groupNames: names, triangles };

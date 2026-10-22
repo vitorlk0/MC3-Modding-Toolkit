@@ -656,6 +656,7 @@ export default function App() {
       const nextMeshDocs = new Map(meshDocs);
       const convertedNames: string[] = [];
       const failures: string[] = [];
+      const converted: { objName: string; result: ReturnType<typeof convertObjToMeshPck> }[] = [];
       let created = 0;
       let replaced = 0;
 
@@ -663,6 +664,7 @@ export default function App() {
         try {
           const text = new TextDecoder().decode(await readFile(await join(folderPath, objName)));
           const result = convertObjToMeshPck(text, objName, { compactStreams });
+          converted.push({ objName, result });
           const existing = nextMeshDocs.get(result.name);
           if (existing) {
             existing.replaceBytes(result.bytes);
@@ -685,11 +687,33 @@ export default function App() {
       // user wants to see — show every one that sits on an anchor.
       const convertedAnchors = convertedNames.map((name) => nextMeshDocs.get(name)?.geometry.anchorIndex).filter((index): index is number => typeof index === "number");
       if (convertedAnchors.length) setVisibleMeshAnchors((current) => new Set([...current, ...convertedAnchors]));
+      // A converted group whose shader ID is above every ID the car's own pieces use most likely
+      // names a shader the car doesn't have (a typo, or an ID borrowed from another car), which the
+      // game doesn't report. The reference is the pieces the game shipped embedded plus the loose
+      // pieces this batch didn't replace; a loose piece converted in an earlier session counts too,
+      // since once saved it can't be told apart from a stock one.
+      const batch = new Set(convertedNames.map((name) => name.toLowerCase()));
+      const references = [
+        ...roles.flatMap((role) => slots[role]?.document.gameEmbeddedShaderIds() ?? []),
+        ...[...meshDocs].filter(([name]) => !batch.has(name.toLowerCase())).flatMap(([name, document]) => document.geometry.groupShaderIds.map((id) => ({ id, meshName: name }))),
+      ];
+      const reference = references.reduce<{ id: number; meshName: string } | null>((best, item) => (!best || item.id > best.id ? item : best), null);
+      const shaderWarnings: string[] = [];
+      if (reference) for (const { objName, result } of converted) result.shaderIds.forEach((id, group) => {
+        if (id > reference.id) shaderWarnings.push(`${objName}: "${result.groupNames[group]}" → shader 0x${id.toString(16).toUpperCase().padStart(2, "0")}`);
+      });
+
       // The embed status below replaces this one, so a failed OBJ (e.g. a piece too far from the
-      // origin for the s16 grid) gets a dialog instead of a note that would scroll away.
-      if (failures.length) {
-        console.warn("OBJ conversion failures:", failures);
-        void messageDialog(`Could not convert (these pieces were left unchanged):\n\n${failures.join("\n")}`, { title: "OBJ conversion", kind: "warning" });
+      // origin for the s16 grid, or a material name without a shader ID) gets a dialog instead of
+      // a note that would scroll away.
+      if (failures.length || shaderWarnings.length) {
+        if (failures.length) console.warn("OBJ conversion failures:", failures);
+        if (shaderWarnings.length) console.warn("OBJ shader IDs above the car's own:", shaderWarnings);
+        const sections = [
+          failures.length ? `Could not convert (these pieces were left unchanged):\n\n${failures.join("\n")}` : null,
+          shaderWarnings.length && reference ? `Converted, but with a shader ID above 0x${reference.id.toString(16).toUpperCase().padStart(2, "0")}, the highest the car's own pieces use (${reference.meshName}). Check that this car has these shaders:\n\n${shaderWarnings.join("\n")}` : null,
+        ].filter(Boolean);
+        void messageDialog(sections.join("\n\n"), { title: "OBJ conversion", kind: "warning" });
       }
       if (!convertedNames.length) { setStatus(`No OBJ could be converted · ${failures[0] ?? "unknown error"}`); return; }
 

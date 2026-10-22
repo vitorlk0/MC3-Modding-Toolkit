@@ -823,6 +823,23 @@ export class PckDocument {
     return u16(this.view, info.materialTableOffset + group * 2);
   }
 
+  /** Every shader ID used by a piece the game shipped embedded in this PCK, with one piece using it.
+   *  Tool-written blocks are left out: their IDs came from a conversion, which is what this is
+   *  checked against. */
+  gameEmbeddedShaderIds(): { id: number; meshName: string }[] {
+    const output: { id: number; meshName: string }[] = [];
+    const seen = new Set<number>();
+    for (const entry of this.lodMeshes) {
+      const offset = entry.meshBlockOffset;
+      if (offset === null || seen.has(offset) || this.toolBlockAt(offset)) continue;
+      seen.add(offset);
+      const info = this.materialTableInfo(offset);
+      if (!info) continue;
+      for (let group = 0; group < info.groupCount; group += 1) output.push({ id: u16(this.view, info.materialTableOffset + group * 2), meshName: entry.name });
+    }
+    return output;
+  }
+
   /** True when this embedded copy's group slot has a pending (unsaved) shader-ID edit — used to
    *  drive the "pending save" UI indicator without exposing the internal dirtyShaderKeys format. */
   isGroupShaderDirty(meshBlockOffset: number, group: number): boolean {
