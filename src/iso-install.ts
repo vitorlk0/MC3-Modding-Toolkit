@@ -42,15 +42,19 @@ export type ModCategory = "dat" | "garage" | "flash" | "carcfg" | "tune";
 export const CATEGORY_ORDER: ModCategory[] = ["garage", "dat", "flash", "carcfg", "tune"];
 
 export type PackageFile = { path: string; size: number; read: () => Promise<Uint8Array> };
+/** "shared": a global game file every car uses (string tables, the dealership's toplevel.pck),
+ *  rewritten with this install's slot details — never part of a package. */
 export type ModFile = {
-  category: ModCategory; name: string; sourcePath: string; target: string; size: number; read: () => Promise<Uint8Array>;
+  category: ModCategory | "shared"; name: string; sourcePath: string; target: string; size: number; read: () => Promise<Uint8Array>;
   /** Set when the DAT was compiled from a loose vehicle folder: how many PCKs went into it. */
   compiledFrom?: number;
 };
+/** A file a package brings: always one of the per-car kinds. */
+export type PackageModFile = ModFile & { category: ModCategory };
 export type ModPackage = {
   car: string;
   source: string;
-  files: ModFile[];
+  files: PackageModFile[];
   /** Files the package carries that are deliberately not installed. */
   ignored: string[];
   notes: string[];
@@ -117,7 +121,7 @@ export async function detectPackage(source: string, files: PackageFile[]): Promi
   const vehicle = vehicles[0] ?? null;
   const looseVehicle = new Set(vehicle?.included.map((file) => file.path) ?? []);
 
-  const byTarget = new Map<string, ModFile>();
+  const byTarget = new Map<string, PackageModFile>();
   const ignored: string[] = [];
   const notes: string[] = [];
   for (const file of files) {
@@ -131,7 +135,7 @@ export async function detectPackage(source: string, files: PackageFile[]): Promi
     }
     const category = match[0];
     const target = targetFor(category, car, name);
-    const modFile: ModFile = { category, name, sourcePath: file.path, target, size: file.size, read: file.read };
+    const modFile: PackageModFile = { category, name, sourcePath: file.path, target, size: file.size, read: file.read };
     const previous = byTarget.get(target);
     if (previous) {
       const [a, b] = await Promise.all([previous.read(), file.read()]);
@@ -299,10 +303,11 @@ const record12 = (offset: number, full: number, stored: number) => {
   return out;
 };
 
-/** The text tune files (.carcfg, cameras, .mcgarage, .damage, .mccarcustom) are stored compressed,
+/** The text tune files (.carcfg, cameras, .mcgarage, .damage, .mccarcustom) and the shared string
+ *  tables are stored compressed,
  *  and only where the original entry is — vehicle DATs, PCKs and flash stay raw like the original
  *  game keeps them. */
-const shouldCompress = (file: ModFile, entries: DaveEntry[]) => (file.category === "carcfg" || file.category === "tune") && entries.every(isCompressed);
+const shouldCompress = (file: ModFile, entries: DaveEntry[]) => (file.category === "carcfg" || file.category === "tune" || file.category === "shared") && entries.every(isCompressed);
 
 export async function buildPlan(session: IsoSession, selections: { car: string; files: ModFile[] }[]): Promise<InstallPlan> {
   const { archive, assets, iso } = session;

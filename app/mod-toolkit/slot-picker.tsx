@@ -46,7 +46,7 @@ export type SlotOption = {
 
 const squash = (text: string) => text.toLowerCase().replace(/^vp_/, "").replace(/[^a-z0-9]/g, "");
 
-export function SlotPicker({ slots, value, onChange, disabled, placeholder, compact }: {
+export function SlotPicker({ slots, value, onChange, disabled, placeholder, compact, filter: showFilter = true }: {
   slots: SlotOption[];
   value: string;
   onChange: (name: string) => void;
@@ -54,6 +54,8 @@ export function SlotPicker({ slots, value, onChange, disabled, placeholder, comp
   placeholder: string;
   /** Filter and select side by side, for a car card. */
   compact?: boolean;
+  /** Show the filter box (default); without it the select is the whole picker. */
+  filter?: boolean;
 }) {
   const [filter, setFilter] = useState("");
   const byClass = useMemo(() => {
@@ -69,13 +71,13 @@ export function SlotPicker({ slots, value, onChange, disabled, placeholder, comp
   }, [slots, filter, value]);
 
   return <div className={compact ? "slot-picker compact" : "slot-picker"}>
-    <input className="retarget-filter" type="search" value={filter} disabled={disabled} placeholder={tr("Type to filter: is 300, charger, tuner…")} aria-label={tr("Filter slots")}
+    {showFilter && <input className="retarget-filter" type="search" value={filter} disabled={disabled} placeholder={tr("Type to filter: is 300, charger, tuner…")} aria-label={tr("Filter slots")}
       onChange={(event) => setFilter(event.target.value)}
       onKeyDown={(event) => {
         if (event.key !== "Enter") return;
         const first = byClass.flatMap(([, group]) => group).find((slot) => !slot.disabled && slot.name !== value);
         if (first) { event.preventDefault(); onChange(first.name); }
-      }} />
+      }} />}
     <select className="retarget-select" value={value} disabled={disabled} onChange={(event) => onChange(event.target.value)} aria-label={tr("Target slot")}>
       <option value="">{placeholder}</option>
       {byClass.map(([label, group]) => <optgroup key={label} label={label}>

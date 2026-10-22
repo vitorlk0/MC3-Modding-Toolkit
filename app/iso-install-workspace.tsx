@@ -1,5 +1,5 @@
 import { tr, Tx, confirmDialog } from "./i18n";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import {
   applyPlan, buildPlan, CATEGORY_ORDER, checkPackage, detectPackage, openIsoSession,
@@ -9,6 +9,10 @@ import { BIKE_CLASSES, elfMentions, knownClass, type SlotCatalog } from "../src/
 import { readIsoCatalog } from "../src/slot-reference-iso";
 import { retargetPackage, type RetargetResult } from "../src/slot-retarget";
 import { RetargetNotes, SlotPicker } from "./mod-toolkit/slot-picker";
+import {
+  DETAIL_KEYS, NAME_MAX, SHORT_NAME_MAX, SHOWROOM_LETTERS, SHOWROOM_TYPES, detailProblem, openSlotDetails,
+  type SlotDetails, type SlotDetailsEdit, type SlotDetailsSource,
+} from "../src/slot-details";
 import { SECTOR } from "../src/iso9660";
 import { DAT_BYTE_LIMIT, isOpponentCarcfg } from "../src/iso-install";
 import { checkWritable, explainIsoError, readPackageFiles, tauriIsoFs } from "./iso-io";
@@ -54,9 +58,37 @@ type CarCard = {
   files: PackageFile[];
   /** The slot chosen by the user; null = the mod's own slot when the ISO has it. */
   target: string | null;
+  /** Slot details the user typed, as typed; a field left alone keeps the ISO's value. Cleared
+   *  when the slot changes. */
+  edits: DetailInputs;
   error: string | null;
   enabled: Record<ModCategory, boolean>;
 };
+
+type DetailInputs = Partial<Record<keyof SlotDetails, string>>;
+/** A slot's current details, or why they couldn't be read. */
+type DetailsState = { details: SlotDetails | null; error: string | null };
+
+/** The typed fields as values to write, or the problems that stop them. */
+function parseEdits(inputs: DetailInputs): { edit: SlotDetailsEdit; problems: string[] } {
+  const edit: SlotDetailsEdit = {};
+  const problems: string[] = [];
+  for (const key of DETAIL_KEYS) {
+    const raw = inputs[key];
+    if (raw === undefined) continue;
+    const value = key === "name" || key === "shortName" || key === "letter" ? raw : Number(raw.trim().replace(/^\$/, "").replace(/,/g, ""));
+    const problem = raw.trim() === "" && key !== "name" && key !== "shortName" ? "Can't be empty." : detailProblem(key, value);
+    if (problem) problems.push(`${DETAIL_LABELS[key]}: ${problem}`);
+    else (edit as Record<string, string | number>)[key] = value;
+  }
+  return { edit, problems };
+}
+
+const DETAIL_LABELS: Record<keyof SlotDetails, string> = {
+  name: "Name", shortName: "Short name", price: "Price shown", letter: "Class letter", showroomType: "Type",
+};
+/** How a current value fills its field. */
+const detailText = (key: keyof SlotDetails, details: SlotDetails) => String(details[key]);
 
 /** A package converted to another slot, for one card and one target. */
 type Conversion = { target: string; running: boolean; result: RetargetResult | null; pkg: ModPackage | null; error: string | null };
@@ -73,6 +105,8 @@ type CardState = {
 };
 
 let nextCardId = 1;
+/** The plan's "car" for the global files the slot details rewrite. */
+const SHARED_FILES = "shared files";
 
 type Progress = { phase: string; done: number; total: number };
 
@@ -94,6 +128,8 @@ export function IsoInstallWorkspace({ dropped, onConsumeDrop, onStatus, onBusyCh
   const [catalog, setCatalog] = useState<SlotCatalog | null>(null);
   const [catalogError, setCatalogError] = useState("");
   const [conversions, setConversions] = useState<Map<number, Conversion>>(() => new Map());
+  const [detailsSource, setDetailsSource] = useState<SlotDetailsSource | null>(null);
+  const [slotDetails, setSlotDetails] = useState<Map<string, DetailsState>>(() => new Map());
   const [plan, setPlan] = useState<InstallPlan | null>(null);
   const [planError, setPlanError] = useState("");
   const [planning, setPlanning] = useState(false);
@@ -141,9 +177,9 @@ export function IsoInstallWorkspace({ dropped, onConsumeDrop, onStatus, onBusyCh
       try {
         const files = await readPackageFiles(path);
         const pkg = await detectPackage(source, files);
-        added.push({ id: nextCardId++, key: pkg.car, source, pkg, files, target: null, error: null, enabled: allOn() });
+        added.push({ id: nextCardId++, key: pkg.car, source, pkg, files, target: null, edits: {}, error: null, enabled: allOn() });
       } catch (caught) {
-        added.push({ id: nextCardId++, key: `error:${path}`, source, pkg: null, files: [], target: null, error: caught instanceof Error ? caught.message : "Could not read this package.", enabled: allOn() });
+        added.push({ id: nextCardId++, key: `error:${path}`, source, pkg: null, files: [], target: null, edits: {}, error: caught instanceof Error ? caught.message : "Could not read this package.", enabled: allOn() });
       }
     }
     setCars((current) => {
@@ -172,6 +208,7 @@ export function IsoInstallWorkspace({ dropped, onConsumeDrop, onStatus, onBusyCh
   // The opened ISO's slots and catalogues, for choosing where each car goes.
   useEffect(() => {
     setCatalog(null); setCatalogError(""); setConversions(new Map());
+    setDetailsSource(session ? openSlotDetails(session) : null); setSlotDetails(new Map());
     if (!session) return;
     let cancelled = false;
     readIsoCatalog(session)
@@ -209,6 +246,19 @@ export function IsoInstallWorkspace({ dropped, onConsumeDrop, onStatus, onBusyCh
     }
   }, [cars, catalog, conversions, writing, targetOf]);
 
+  // What the game shows for each chosen slot today, read from the ISO once per slot.
+  useEffect(() => {
+    if (!detailsSource || !catalog) return;
+    for (const card of cars) {
+      const target = targetOf(card);
+      if (!target || slotDetails.has(target) || !catalog.listing.some((slot) => slot.name === target)) continue;
+      setSlotDetails((current) => new Map(current).set(target, { details: null, error: null }));
+      detailsSource.details(target)
+        .then((details) => setSlotDetails((current) => new Map(current).set(target, { details, error: null })))
+        .catch((caught) => setSlotDetails((current) => new Map(current).set(target, { details: null, error: caught instanceof Error ? caught.message : String(caught) })));
+    }
+  }, [cars, catalog, detailsSource, slotDetails, targetOf]);
+
   const states = useMemo(() => {
     const out = new Map<number, CardState>();
     const claimed = new Set<string>();
@@ -235,6 +285,7 @@ export function IsoInstallWorkspace({ dropped, onConsumeDrop, onStatus, onBusyCh
         if (claimed.has(target)) blockers.push(`Another mod in the list already installs into ${target}. Remove one of them or choose another slot.`);
         claimed.add(target);
       }
+      for (const problem of parseEdits(card.edits).problems) blockers.push(`Slot details — ${problem}`);
       // Without the slot list there is nothing to check against yet (or, if it failed, only the own slot).
       const ready = !!session && (!!catalog || !!catalogError);
       const report = ready && pkg && !blockers.length ? checkPackage(session!, pkg) : null;
@@ -250,8 +301,15 @@ export function IsoInstallWorkspace({ dropped, onConsumeDrop, onStatus, onBusyCh
     if (!state?.pkg || !state.report || state.report.errors.length || state.blockers.length) return [];
     const report = state.report;
     const files = CATEGORY_ORDER.filter((category) => card.enabled[category]).flatMap((category) => report.categories[category].files);
-    return files.length ? [{ car: state.pkg.car, files }] : [];
+    return files.length ? [{ car: state.pkg.car, files, edit: parseEdits(card.edits).edit }] : [];
   }), [cars, states]);
+
+  // The global files the slot details of the installable cars change, rebuilt from the ISO's copies.
+  const shared = useMemo(() => {
+    if (!detailsSource) return [];
+    const edits = selections.filter((item) => Object.keys(item.edit).length).map((item) => ({ slot: item.car, edit: item.edit }));
+    return edits.length ? detailsSource.sharedFiles(edits) : [];
+  }, [detailsSource, selections]);
 
   useEffect(() => {
     setPlan(null); setPlanError("");
@@ -259,13 +317,13 @@ export function IsoInstallWorkspace({ dropped, onConsumeDrop, onStatus, onBusyCh
     let cancelled = false;
     setPlanning(true);
     const timer = window.setTimeout(() => {
-      buildPlan(session, selections)
+      buildPlan(session, [...selections, ...(shared.length ? [{ car: SHARED_FILES, files: shared }] : [])])
         .then((built) => { if (!cancelled) setPlan(built); })
         .catch((caught) => { if (!cancelled) setPlanError(caught instanceof Error ? caught.message : "The install could not be planned."); })
         .finally(() => { if (!cancelled) setPlanning(false); });
     }, 250);
     return () => { cancelled = true; window.clearTimeout(timer); setPlanning(false); };
-  }, [session, selections, writing]);
+  }, [session, selections, shared, writing]);
 
   const install = useCallback(async () => {
     if (!plan || !session || !isoPath || plan.mode === "nothing") return;
@@ -313,7 +371,13 @@ export function IsoInstallWorkspace({ dropped, onConsumeDrop, onStatus, onBusyCh
 
   const toggle = (id: number, category: ModCategory) => setCars((current) => current.map((card) => card.id === id ? { ...card, enabled: { ...card.enabled, [category]: !card.enabled[category] } } : card));
   const removeCar = (id: number) => setCars((current) => current.filter((card) => card.id !== id));
-  const chooseTarget = (id: number, target: string) => setCars((current) => current.map((card) => card.id === id ? { ...card, target: target || null } : card));
+  const chooseTarget = (id: number, target: string) => setCars((current) => current.map((card) => card.id === id ? { ...card, target: target || null, edits: {} } : card));
+  const editDetail = (id: number, key: keyof SlotDetails, value: string | undefined) => setCars((current) => current.map((card) => {
+    if (card.id !== id) return card;
+    const edits = { ...card.edits };
+    if (value === undefined) delete edits[key]; else edits[key] = value;
+    return { ...card, edits };
+  }));
 
   const changedCount = plan ? plan.items.filter((item) => item.action !== "unchanged").length : 0;
   const busy = loading || writing;
@@ -383,8 +447,13 @@ export function IsoInstallWorkspace({ dropped, onConsumeDrop, onStatus, onBusyCh
           <div className="toolkit-empty"><span>{tr("ZIP")}</span><strong>{tr("No mods added yet")}</strong><p><Tx t="Drop mod ZIPs on the window. Each needs the car's {0} and {1}; files can sit anywhere inside the ZIP." v={[<code>vp_*.dat</code>, <code>vp_*_g.pck</code>]} /></p></div>
         ) : <div className="iso-car-list">
           {catalogError && <p className="carcfg-warning"><Tx t="This ISO's car list couldn't be read, so cars can only go into the slot they were made for: {0}" v={[tr(catalogError)]} /></p>}
-          {cars.map((card) => <CarCardView key={card.id} card={card} state={states.get(card.id) ?? null} catalog={catalog} hasIso={!!session} busy={busy}
-            onTarget={(target) => chooseTarget(card.id, target)} onToggle={(category) => toggle(card.id, category)} onRemove={() => removeCar(card.id)} />)}
+          {cars.map((card) => {
+            const state = states.get(card.id) ?? null;
+            return <CarCardView key={card.id} card={card} state={state} catalog={catalog} hasIso={!!session} busy={busy}
+              details={state?.target ? slotDetails.get(state.target) ?? null : null}
+              onTarget={(target) => chooseTarget(card.id, target)} onEdit={(key, value) => editDetail(card.id, key, value)}
+              onToggle={(category) => toggle(card.id, category)} onRemove={() => removeCar(card.id)} />;
+          })}
         </div>}
       </section>
 
@@ -409,7 +478,7 @@ export function IsoInstallWorkspace({ dropped, onConsumeDrop, onStatus, onBusyCh
           <div className="iso-plan-row head"><span>{tr("FILE")}</span><span>{tr("CAR")}</span><span>{tr("ORIGINAL")}</span><span>{tr("NEW")}</span><span>{tr("WRITE")}</span></div>
           {plan.items.map((item) => <div className={`iso-plan-row ${item.action}`} key={item.file.target}>
             <span title={item.file.target}>{item.file.target}</span>
-            <span>{item.car}</span>
+            <span>{tr(item.car)}</span>
             <span>{sizeLabel(item.oldStored)}</span>
             <span>{sizeLabel(item.stored.length)}{item.compressed && <small> {tr("deflated")}</small>}</span>
             <span><em>{item.action === "unchanged" ? tr("Unchanged") : item.action === "in-place" ? tr("In place") : tr("Appended")}</em></span>
@@ -433,9 +502,10 @@ export function IsoInstallWorkspace({ dropped, onConsumeDrop, onStatus, onBusyCh
   </div>;
 }
 
-function CarCardView({ card, state, catalog, hasIso, busy, onTarget, onToggle, onRemove }: {
-  card: CarCard; state: CardState | null; catalog: SlotCatalog | null; hasIso: boolean; busy: boolean;
-  onTarget: (target: string) => void; onToggle: (category: ModCategory) => void; onRemove: () => void;
+function CarCardView({ card, state, catalog, details, hasIso, busy, onTarget, onEdit, onToggle, onRemove }: {
+  card: CarCard; state: CardState | null; catalog: SlotCatalog | null; details: DetailsState | null; hasIso: boolean; busy: boolean;
+  onTarget: (target: string) => void; onEdit: (key: keyof SlotDetails, value: string | undefined) => void;
+  onToggle: (category: ModCategory) => void; onRemove: () => void;
 }) {
   if (!card.pkg) {
     return <article className="iso-car refused">
@@ -465,7 +535,7 @@ function CarCardView({ card, state, catalog, hasIso, busy, onTarget, onToggle, o
     </header>
     {catalog && <div className="iso-slot">
       <span className="iso-slot-label">{tr("SLOT")}</span>
-      <SlotPicker compact value={target ?? ""} disabled={busy} placeholder={tr("Choose the car it replaces…")} onChange={onTarget}
+      <SlotPicker compact filter={false} value={target ?? ""} disabled={busy} placeholder={tr("Choose the car it replaces…")} onChange={onTarget}
         slots={catalog.listing.map((slot) => ({
           name: slot.name, className: slot.className,
           // Moving a mod needs the slot's own menus; its own slot always installs as it is.
@@ -481,6 +551,7 @@ function CarCardView({ card, state, catalog, hasIso, busy, onTarget, onToggle, o
           : <Tx t="Can't go into {0}." v={[<code>{target}</code>]} />
       }</p>
     </div>}
+    {target && details && <SlotDetailsPanel slot={target} details={details} edits={card.edits} busy={busy} onEdit={onEdit} />}
     <div className="iso-car-kinds">
       {CATEGORY_ORDER.map((category) => {
         const files = report ? report.categories[category].files : pkg.files.filter((file) => file.category === category);
@@ -507,4 +578,49 @@ function CarCardView({ card, state, catalog, hasIso, busy, onTarget, onToggle, o
       <div className="retarget-report"><RetargetNotes notes={notes} fixTitle="Converted for this ISO" /></div>
     </details>}
   </article>;
+}
+
+/**
+ * What the game shows for the slot — name, short name and the dealership card — filled with the
+ * ISO's current values. A field the user leaves alone isn't written; a field set back to the current
+ * value writes nothing either.
+ */
+function SlotDetailsPanel({ slot, details, edits, busy, onEdit }: {
+  slot: string; details: DetailsState; edits: DetailInputs; busy: boolean;
+  onEdit: (key: keyof SlotDetails, value: string | undefined) => void;
+}) {
+  if (details.error) return <p className="iso-car-warning">{tr(`Slot details can't be edited: ${details.error}`)}</p>;
+  if (!details.details) return <p className="iso-car-note">{tr("Reading the slot's details…")}</p>;
+  const current = details.details;
+  const changed = DETAIL_KEYS.filter((key) => edits[key] !== undefined && edits[key] !== detailText(key, current));
+  const field = (key: keyof SlotDetails, input: ReactNode, hint?: string) => {
+    const edited = edits[key] !== undefined && edits[key] !== detailText(key, current);
+    const raw = edits[key];
+    const problem = raw === undefined ? null : parseEdits({ [key]: raw }).problems[0] ?? null;
+    return <label className={`iso-detail${edited ? " edited" : ""}${problem ? " invalid" : ""}`} key={key}>
+      <span>{tr(DETAIL_LABELS[key])}{edited && <button type="button" className="iso-detail-reset" disabled={busy} title={tr(`Back to ${detailText(key, current)}`)} onClick={(event) => { event.preventDefault(); onEdit(key, undefined); }}>↺</button>}</span>
+      {input}
+      <small>{problem ? tr(problem.replace(/^[^:]+: /, "")) : edited ? tr(`was ${detailText(key, current)}`) : hint ? tr(hint) : "\u00a0"}</small>
+    </label>;
+  };
+  const text = (key: keyof SlotDetails, max?: number) => <input className="perf-input" type="text" value={edits[key] ?? detailText(key, current)} maxLength={max} disabled={busy} spellCheck={false}
+    onChange={(event) => onEdit(key, event.target.value)} />;
+  return <details className="iso-details" open={changed.length > 0 || undefined}>
+    <summary>
+      <strong>{tr("Slot details")}</strong>
+      <small>{changed.length ? <Tx t="{0} changed — written into the shared name tables and dealership" v={[changed.length]} /> : <Tx t="what the game shows for {0}: name, dealership card" v={[slot]} />}</small>
+    </summary>
+    <div className="iso-detail-grid">
+      {field("name", text("name", NAME_MAX), `Dealership · up to ${NAME_MAX}`)}
+      {field("shortName", text("shortName", SHORT_NAME_MAX), `Garage, profile · up to ${SHORT_NAME_MAX}`)}
+      {field("price", text("price"), "Dollars · charge not confirmed")}
+      {field("letter", <select className="perf-input" value={edits.letter ?? current.letter} disabled={busy} onChange={(event) => onEdit("letter", event.target.value)}>
+        {SHOWROOM_LETTERS.map((letter) => <option key={letter} value={letter}>{letter}</option>)}
+      </select>, "As shown; real class unchanged")}
+      {field("showroomType", <select className="perf-input" value={edits.showroomType ?? String(current.showroomType)} disabled={busy} onChange={(event) => onEdit("showroomType", event.target.value)}>
+        {SHOWROOM_TYPES.map((type) => <option key={type.value} value={String(type.value)}>{tr(type.label)}</option>)}
+      </select>, "As shown; real class unchanged")}
+    </div>
+    <p className="iso-detail-note">{tr("These change what the game shows. The car's real class, group and unlock stay the slot's. A car already bought in a save may keep the name it was bought with.")}</p>
+  </details>;
 }
