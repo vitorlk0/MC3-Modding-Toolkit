@@ -11,7 +11,7 @@ import { retargetPackage, type RetargetResult } from "../src/slot-retarget";
 import { RetargetNotes, SlotPicker } from "./mod-toolkit/slot-picker";
 import {
   DETAIL_KEYS, NAME_MAX, SHORT_NAME_MAX, SHOWROOM_LETTERS, SHOWROOM_TYPES, detailProblem, openSlotDetails,
-  type SlotDetails, type SlotDetailsEdit, type SlotDetailsSource,
+  type LogoOption, type SlotDetails, type SlotDetailsEdit, type SlotDetailsSource,
 } from "../src/slot-details";
 import { SECTOR } from "../src/iso9660";
 import { DAT_BYTE_LIMIT, isOpponentCarcfg } from "../src/iso-install";
@@ -67,7 +67,7 @@ type CarCard = {
 
 type DetailInputs = Partial<Record<keyof SlotDetails, string>>;
 /** A slot's current details, or why they couldn't be read. */
-type DetailsState = { details: SlotDetails | null; error: string | null };
+type DetailsState = { details: (SlotDetails & { artProblem: string | null }) | null; error: string | null };
 
 /** The typed fields as values to write, or the problems that stop them. */
 function parseEdits(inputs: DetailInputs): { edit: SlotDetailsEdit; problems: string[] } {
@@ -76,16 +76,17 @@ function parseEdits(inputs: DetailInputs): { edit: SlotDetailsEdit; problems: st
   for (const key of DETAIL_KEYS) {
     const raw = inputs[key];
     if (raw === undefined) continue;
-    const value = key === "name" || key === "shortName" || key === "letter" ? raw : Number(raw.trim().replace(/^\$/, "").replace(/,/g, ""));
+    const value = key === "name" || key === "shortName" || key === "letter" ? raw : key === "remix" ? raw === "true" : Number(raw.trim().replace(/^\$/, "").replace(/,/g, ""));
     const problem = raw.trim() === "" && key !== "name" && key !== "shortName" ? "Can't be empty." : detailProblem(key, value);
     if (problem) problems.push(`${DETAIL_LABELS[key]}: ${problem}`);
-    else (edit as Record<string, string | number>)[key] = value;
+    else (edit as Record<string, string | number | boolean>)[key] = value;
   }
   return { edit, problems };
 }
 
 const DETAIL_LABELS: Record<keyof SlotDetails, string> = {
   name: "Name", shortName: "Short name", price: "Price shown", letter: "Class letter", showroomType: "Type",
+  logo: "Brand logo", remix: "REMIX badge",
 };
 /** How a current value fills its field. */
 const detailText = (key: keyof SlotDetails, details: SlotDetails) => String(details[key]);
@@ -130,6 +131,7 @@ export function IsoInstallWorkspace({ dropped, onConsumeDrop, onStatus, onBusyCh
   const [conversions, setConversions] = useState<Map<number, Conversion>>(() => new Map());
   const [detailsSource, setDetailsSource] = useState<SlotDetailsSource | null>(null);
   const [slotDetails, setSlotDetails] = useState<Map<string, DetailsState>>(() => new Map());
+  const [logos, setLogos] = useState<LogoOption[]>([]);
   const [plan, setPlan] = useState<InstallPlan | null>(null);
   const [planError, setPlanError] = useState("");
   const [planning, setPlanning] = useState(false);
@@ -208,7 +210,9 @@ export function IsoInstallWorkspace({ dropped, onConsumeDrop, onStatus, onBusyCh
   // The opened ISO's slots and catalogues, for choosing where each car goes.
   useEffect(() => {
     setCatalog(null); setCatalogError(""); setConversions(new Map());
-    setDetailsSource(session ? openSlotDetails(session) : null); setSlotDetails(new Map());
+    const source = session ? openSlotDetails(session) : null;
+    setDetailsSource(source); setSlotDetails(new Map()); setLogos([]);
+    source?.logos().then(setLogos).catch(() => setLogos([]));
     if (!session) return;
     let cancelled = false;
     readIsoCatalog(session)
@@ -450,7 +454,7 @@ export function IsoInstallWorkspace({ dropped, onConsumeDrop, onStatus, onBusyCh
           {cars.map((card) => {
             const state = states.get(card.id) ?? null;
             return <CarCardView key={card.id} card={card} state={state} catalog={catalog} hasIso={!!session} busy={busy}
-              details={state?.target ? slotDetails.get(state.target) ?? null : null}
+              details={state?.target ? slotDetails.get(state.target) ?? null : null} logos={logos}
               onTarget={(target) => chooseTarget(card.id, target)} onEdit={(key, value) => editDetail(card.id, key, value)}
               onToggle={(category) => toggle(card.id, category)} onRemove={() => removeCar(card.id)} />;
           })}
@@ -502,8 +506,8 @@ export function IsoInstallWorkspace({ dropped, onConsumeDrop, onStatus, onBusyCh
   </div>;
 }
 
-function CarCardView({ card, state, catalog, details, hasIso, busy, onTarget, onEdit, onToggle, onRemove }: {
-  card: CarCard; state: CardState | null; catalog: SlotCatalog | null; details: DetailsState | null; hasIso: boolean; busy: boolean;
+function CarCardView({ card, state, catalog, details, logos, hasIso, busy, onTarget, onEdit, onToggle, onRemove }: {
+  card: CarCard; state: CardState | null; catalog: SlotCatalog | null; details: DetailsState | null; logos: LogoOption[]; hasIso: boolean; busy: boolean;
   onTarget: (target: string) => void; onEdit: (key: keyof SlotDetails, value: string | undefined) => void;
   onToggle: (category: ModCategory) => void; onRemove: () => void;
 }) {
@@ -551,7 +555,7 @@ function CarCardView({ card, state, catalog, details, hasIso, busy, onTarget, on
           : <Tx t="Can't go into {0}." v={[<code>{target}</code>]} />
       }</p>
     </div>}
-    {target && details && <SlotDetailsPanel slot={target} details={details} edits={card.edits} busy={busy} onEdit={onEdit} />}
+    {target && details && <SlotDetailsPanel slot={target} details={details} logos={logos} edits={card.edits} busy={busy} onEdit={onEdit} />}
     <div className="iso-car-kinds">
       {CATEGORY_ORDER.map((category) => {
         const files = report ? report.categories[category].files : pkg.files.filter((file) => file.category === category);
@@ -585,22 +589,28 @@ function CarCardView({ card, state, catalog, details, hasIso, busy, onTarget, on
  * ISO's current values. A field the user leaves alone isn't written; a field set back to the current
  * value writes nothing either.
  */
-function SlotDetailsPanel({ slot, details, edits, busy, onEdit }: {
-  slot: string; details: DetailsState; edits: DetailInputs; busy: boolean;
+function SlotDetailsPanel({ slot, details, logos, edits, busy, onEdit }: {
+  slot: string; details: DetailsState; logos: LogoOption[]; edits: DetailInputs; busy: boolean;
   onEdit: (key: keyof SlotDetails, value: string | undefined) => void;
 }) {
   if (details.error) return <p className="iso-car-warning">{tr(`Slot details can't be edited: ${details.error}`)}</p>;
   if (!details.details) return <p className="iso-car-note">{tr("Reading the slot's details…")}</p>;
   const current = details.details;
+  const art = !current.artProblem;
+  /** A value as the user knows it: type and logo by name, the badge as on/off. */
+  const describe = (key: keyof SlotDetails, value: string) =>
+    key === "showroomType" ? tr(SHOWROOM_TYPES.find((type) => String(type.value) === value)?.label ?? value)
+      : key === "logo" ? logos.find((logo) => String(logo.character) === value)?.label ?? value
+      : key === "remix" ? tr(value === "true" ? "on" : "off") : value;
   const changed = DETAIL_KEYS.filter((key) => edits[key] !== undefined && edits[key] !== detailText(key, current));
   const field = (key: keyof SlotDetails, input: ReactNode, hint?: string) => {
     const edited = edits[key] !== undefined && edits[key] !== detailText(key, current);
     const raw = edits[key];
     const problem = raw === undefined ? null : parseEdits({ [key]: raw }).problems[0] ?? null;
     return <label className={`iso-detail${edited ? " edited" : ""}${problem ? " invalid" : ""}`} key={key}>
-      <span>{tr(DETAIL_LABELS[key])}{edited && <button type="button" className="iso-detail-reset" disabled={busy} title={tr(`Back to ${detailText(key, current)}`)} onClick={(event) => { event.preventDefault(); onEdit(key, undefined); }}>↺</button>}</span>
+      <span>{tr(DETAIL_LABELS[key])}{edited && <button type="button" className="iso-detail-reset" disabled={busy} title={tr(`Back to ${describe(key, detailText(key, current))}`)} onClick={(event) => { event.preventDefault(); onEdit(key, undefined); }}>↺</button>}</span>
       {input}
-      <small>{problem ? tr(problem.replace(/^[^:]+: /, "")) : edited ? tr(`was ${detailText(key, current)}`) : hint ? tr(hint) : "\u00a0"}</small>
+      <small>{problem ? tr(problem.replace(/^[^:]+: /, "")) : edited ? tr(`was ${describe(key, detailText(key, current))}`) : hint ? tr(hint) : "\u00a0"}</small>
     </label>;
   };
   const text = (key: keyof SlotDetails, max?: number) => <input className="perf-input" type="text" value={edits[key] ?? detailText(key, current)} maxLength={max} disabled={busy} spellCheck={false}
@@ -616,11 +626,17 @@ function SlotDetailsPanel({ slot, details, edits, busy, onEdit }: {
       {field("price", text("price"), "Dollars · charge not confirmed")}
       {field("letter", <select className="perf-input" value={edits.letter ?? current.letter} disabled={busy} onChange={(event) => onEdit("letter", event.target.value)}>
         {SHOWROOM_LETTERS.map((letter) => <option key={letter} value={letter}>{letter}</option>)}
-      </select>, "As shown; real class unchanged")}
+      </select>, art ? "Text and icon; real class unchanged" : "As shown; real class unchanged")}
       {field("showroomType", <select className="perf-input" value={edits.showroomType ?? String(current.showroomType)} disabled={busy} onChange={(event) => onEdit("showroomType", event.target.value)}>
         {SHOWROOM_TYPES.map((type) => <option key={type.value} value={String(type.value)}>{tr(type.label)}</option>)}
-      </select>, "As shown; real class unchanged")}
+      </select>, art ? "Text and icon; real class unchanged" : "As shown; real class unchanged")}
+      {art && logos.length > 0 && field("logo", <select className="perf-input" value={edits.logo ?? String(current.logo)} disabled={busy} onChange={(event) => onEdit("logo", event.target.value)}>
+        {logos.map((logo) => <option key={logo.character} value={String(logo.character)}>{logo.label}</option>)}
+      </select>, "Dealership, Manage Vehicles, garage")}
+      {art && field("remix", <span className="iso-detail-check"><input type="checkbox" checked={(edits.remix ?? String(current.remix)) === "true"} disabled={busy}
+        onChange={(event) => onEdit("remix", String(event.target.checked))} />{tr("Show the REMIX badge on the icon")}</span>)}
     </div>
+    {!art && <p className="iso-detail-note">{tr(`The icon of this slot can't be changed: ${current.artProblem}`)}</p>}
     <p className="iso-detail-note">{tr("These change what the game shows. The car's real class, group and unlock stay the slot's. A car already bought in a save may keep the name it was bought with.")}</p>
   </details>;
 }

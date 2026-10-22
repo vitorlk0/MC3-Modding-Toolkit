@@ -874,6 +874,8 @@ button { color:inherit; }
 .iso-detail.edited>small { color:#8a9a72; }
 .iso-detail.invalid .perf-input { border-color:#5c3230; }
 .iso-detail.invalid>small { color:#e0b3af; }
+.iso-detail-check { display:flex; align-items:center; gap:8px; height:28px; color:#aab2aa; font-size:11px; }
+.iso-detail-check input { margin:0; accent-color:var(--lime); }
 .iso-detail-reset { border:0; padding:0 2px; background:none; color:var(--lime-soft); font-size:11px; line-height:1; cursor:pointer; }
 .iso-detail-note { margin:4px 11px 10px; color:#646c64; font-size:10px; line-height:1.5; }
 @media (max-width:1100px) { .iso-detail-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } }

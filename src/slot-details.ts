@@ -1,8 +1,9 @@
-import { runFlashArrays, scalarText, type AvmScalar, type FlashArrays } from "./avm1-run";
+import { flashFileOffset, runFlashArrays, scalarText, type AvmScalar, type FlashArrays } from "./avm1-run";
 import { rewriteFlashArrays } from "./avm1-append";
 import { readEntry } from "./dave";
 import type { IsoSession, ModFile } from "./iso-install";
 import { readStrtbl, setStrtblText, strtblText, writeStrtbl } from "./strtbl";
+import { DealershipArt, LETTER_ART, LOGO_BRANDS, TYPE_ART, type IconArt } from "./dealership-art";
 
 /**
  * Slot details — what the game shows for a slot, edited at install time: its name and short name
@@ -11,13 +12,18 @@ import { readStrtbl, setStrtblText, strtblText, writeStrtbl } from "./strtbl";
  * car shares, so the edits of every car in an install are applied together, to the ISO's own copy,
  * in one rewrite of each file.
  *
- * The dealership fields change what the dealership SHOWS. Not changed here: the real class and
- * group (vehicle.lst), the unlock (unlockingrules.csv), the logo (the art frame tables). Whether the
- * price charged on purchase follows ShowRoomPrice is not known yet.
+ * The dealership fields change what the dealership SHOWS, text and icon: the class letter and type
+ * also redraw the car's icon, and the brand logo and REMIX badge are icon layers taken from other
+ * cars (src/dealership-art.ts; the logo also sets the garage's bottom band). Not changed here: the
+ * real class and group (vehicle.lst) and the unlock (unlockingrules.csv). The shown price was
+ * confirmed in game; whether the purchase charges it was not checked.
  */
 
 export const STRING_TABLES = ["01", "02", "04", "08"].flatMap((n) => [`fonts/mcstrings${n}.strtbl`, `fonts/mcstrings${n}_pal.strtbl`]);
 const TOPLEVEL = "flash/toplevel.pck";
+const GARAGE = "flash/garage.pck";
+/** garage.pck's frame script that builds _global.VehicleNames (modding KB §20.9). */
+const GARAGE_NAMES_SCRIPT = 0x181c;
 
 /** ShowroomClass values and the vehicle.lst class of the original cars that carry each one (1 and 6
  *  were confirmed in game as "Tuners" and "Exotics"; the rest follow the class). */
@@ -39,9 +45,15 @@ export type SlotDetails = {
   /** Class letter as shown: A–D. */
   letter: string;
   showroomType: number;
+  /** Brand logo of the icon (a sprite of toplevel.pck); -1 when the icon can't be changed. */
+  logo: number;
+  /** The icon's "REMIX" badge. */
+  remix: boolean;
 };
 export type SlotDetailsEdit = Partial<SlotDetails>;
-export const DETAIL_KEYS: (keyof SlotDetails)[] = ["name", "shortName", "price", "letter", "showroomType"];
+export const DETAIL_KEYS: (keyof SlotDetails)[] = ["name", "shortName", "price", "letter", "showroomType", "logo", "remix"];
+/** A brand logo to choose, named after the cars that show it. */
+export type LogoOption = { character: number; label: string };
 
 const SHOWROOM_ARRAYS: Record<"price" | "letter" | "showroomType", string> = {
   price: "ShowRoomPrice", letter: "ShowroomPerf", showroomType: "ShowroomClass",
@@ -51,7 +63,7 @@ const parsePrice = (text: string) => Number(text.replace(/[$,\s]/g, ""));
 const formatPrice = (value: number) => `$${value.toFixed(2)}`;
 
 /** Why a value can't be written, or null. */
-export function detailProblem(key: keyof SlotDetails, value: string | number): string | null {
+export function detailProblem(key: keyof SlotDetails, value: string | number | boolean): string | null {
   if (key === "name" || key === "shortName") {
     const text = String(value);
     const max = key === "name" ? NAME_MAX : SHORT_NAME_MAX;
@@ -63,12 +75,15 @@ export function detailProblem(key: keyof SlotDetails, value: string | number): s
   const number = Number(value);
   if (key === "price") return Number.isInteger(number) && number >= 0 && number <= 9_999_999 ? null : "A whole number of dollars, up to 9,999,999.";
   if (key === "letter") return SHOWROOM_LETTERS.includes(String(value)) ? null : "A, B, C or D.";
+  if (key === "logo") return Number.isInteger(number) && number > 0 ? null : "Not a brand logo.";
+  if (key === "remix") return typeof value === "boolean" || value === "true" || value === "false" ? null : "On or off.";
   return SHOWROOM_TYPES.some((type) => type.value === number) ? null : "Not a dealership type.";
 }
 
 /** The ISO's global files, read once and reused for every slot. */
 export type SlotDetailsSource = {
-  details(slot: string): Promise<SlotDetails>;
+  details(slot: string): Promise<SlotDetails & { artProblem: string | null }>;
+  logos(): Promise<LogoOption[]>;
   /** The shared files that carry `edits`, built from the ISO's own copies. Files no edit touches are
    *  left out; an edit that changes nothing writes nothing (the plan reads them as unchanged). */
   sharedFiles(edits: { slot: string; edit: SlotDetailsEdit }[]): ModFile[];
@@ -92,6 +107,39 @@ export function openSlotDetails(session: IsoSession): SlotDetailsSource {
   let names: Promise<ReturnType<typeof readStrtbl>> | null = null;
   const table = () => (names ??= asset("fonts/mcstrings08.strtbl").then((bytes) => readStrtbl(bytes, "mcstrings08.strtbl")));
 
+  let dealership: Promise<DealershipArt> | null = null;
+  const art = () => (dealership ??= (async () => {
+    const [top, garage, shown] = [await asset(TOPLEVEL), await asset(GARAGE), await arrays()];
+    const pointer = garage[GARAGE_NAMES_SCRIPT] | (garage[GARAGE_NAMES_SCRIPT + 1] << 8) | (garage[GARAGE_NAMES_SCRIPT + 2] << 16) | (garage[GARAGE_NAMES_SCRIPT + 3] << 24);
+    const garageNames = runFlashArrays(garage, "garage.pck", flashFileOffset(garage, pointer >>> 0)).get("VehicleNames");
+    if (!garageNames) throw new Error("garage.pck has no VehicleNames list.");
+    return new DealershipArt(top, garage, shown.get("ShowRoomNames")!.map(scalarText), garageNames.map(scalarText));
+  })());
+  let manufacturers: Promise<Map<string, string>> | null = null;
+  const makes = () => (manufacturers ??= asset("tune/vehicle/vehicle.lst").then((bytes) => {
+    let text = "";
+    for (const byte of bytes) text += String.fromCharCode(byte);
+    const out = new Map<string, string>();
+    for (const block of text.split(/\bVehicle\s*\{/).slice(1)) {
+      const name = /\bName\s+(\S+)/.exec(block)?.[1], make = /\bManufacturer\s+(\S+)/.exec(block)?.[1];
+      if (name && make) out.set(name.toLowerCase(), make);
+    }
+    return out;
+  }));
+  /** The icon a slot gets from an edit; null when the edit doesn't touch it or the slot can't change. */
+  const iconFor = async (slot: string, edit: SlotDetailsEdit): Promise<IconArt | null> => {
+    if (edit.letter === undefined && edit.showroomType === undefined && edit.logo === undefined && edit.remix === undefined) return null;
+    const now = (await art()).slot(slot);
+    if (now.problem) return null;
+    const next: IconArt = {
+      logo: edit.logo ?? now.logo,
+      letter: edit.letter !== undefined ? LETTER_ART[edit.letter] : now.letter,
+      silhouette: edit.showroomType !== undefined ? TYPE_ART[edit.showroomType] : now.silhouette,
+      remix: edit.remix ?? now.remix,
+    };
+    return next.logo === now.logo && next.letter === now.letter && next.silhouette === now.silhouette && next.remix === now.remix ? null : next;
+  };
+
   const showroomIndex = (top: FlashArrays, slot: string) => {
     const index = (top.get("ShowRoomNames") ?? []).findIndex((item) => item.kind === "string" && item.value.toLowerCase() === slot);
     if (index < 0) throw new Error(`${slot} isn't in the dealership list of toplevel.pck.`);
@@ -104,13 +152,26 @@ export function openSlotDetails(session: IsoSession): SlotDetailsSource {
       const [top, strings] = [await arrays(), await table()];
       const index = showroomIndex(top, slot);
       const at = (key: keyof typeof SHOWROOM_ARRAYS) => scalarText(top.get(SHOWROOM_ARRAYS[key])![index]);
+      let icon: { logo: number; remix: boolean; problem: string | null };
+      try { icon = (await art()).slot(slot); }
+      catch (caught) { icon = { logo: -1, remix: false, problem: caught instanceof Error ? caught.message : String(caught) }; }
       return {
+        logo: icon.problem ? -1 : icon.logo, remix: icon.remix, artProblem: icon.problem,
         name: strtblText(strings, slot)[0] ?? "",
         shortName: strtblText(strings, `${slot}_short`)[0] ?? "",
         price: parsePrice(at("price")),
         letter: at("letter").toUpperCase(),
         showroomType: Number(at("showroomType")),
       };
+    },
+
+    async logos() {
+      const [choices, made, strings] = [(await art()).logos(), await makes(), await table()];
+      return choices.map(({ character, cars }) => {
+        const make = LOGO_BRANDS[character] ?? made.get(cars[0]) ?? "?";
+        const examples = cars.slice(0, 2).map((car) => (strtblText(strings, `${car}_short`)[0] ?? car).trim()).join(", ");
+        return { character, label: `${make} — ${examples}${cars.length > 2 ? "…" : ""}` };
+      }).sort((a, b) => a.label.localeCompare(b.label));
     },
 
     sharedFiles(edits) {
@@ -142,7 +203,7 @@ export function openSlotDetails(session: IsoSession): SlotDetailsSource {
           })),
         });
       }
-      const dealer = edits.filter(({ edit }) => (Object.keys(SHOWROOM_ARRAYS) as (keyof typeof SHOWROOM_ARRAYS)[]).some((key) => edit[key] !== undefined));
+      const dealer = edits.filter(({ edit }) => (["price", "letter", "showroomType", "logo", "remix"] as const).some((key) => edit[key] !== undefined));
       if (dealer.length) {
         let built: Promise<Uint8Array> | null = null;
         files.push({
@@ -166,7 +227,23 @@ export function openSlotDetails(session: IsoSession): SlotDetailsSource {
             }
             // Arrays whose items all came out the same are not redefined.
             const arraysToWrite = [...changed].filter(([name, items]) => items.some((item, i) => scalarText(item) !== scalarText(top.get(name)![i]) || item.kind !== top.get(name)![i].kind));
-            return arraysToWrite.length ? rewriteFlashArrays(bytes, arraysToWrite, "toplevel.pck").bytes : bytes;
+            const withArrays = arraysToWrite.length ? rewriteFlashArrays(bytes, arraysToWrite, "toplevel.pck").bytes : bytes;
+            // Then the icons, rebuilt on that file (the array rewrite moves no frame record).
+            const icons = (await Promise.all(dealer.map(async ({ slot, edit }) => ({ car: slot, art: await iconFor(slot, edit) }))))
+              .filter((item): item is { car: string; art: IconArt } => item.art !== null);
+            return icons.length ? (await art()).apply(withArrays, icons) : withArrays;
+          })()),
+        });
+      }
+      const branded = edits.filter(({ edit }) => edit.logo !== undefined);
+      if (branded.length && session.byName.has(GARAGE)) {
+        let built: Promise<Uint8Array> | null = null;
+        files.push({
+          category: "shared", name: "garage.pck", sourcePath: GARAGE, target: GARAGE, size: 0,
+          read: () => (built ??= (async () => {
+            const dealership = await art();
+            const bands = branded.filter(({ slot }) => !dealership.slot(slot).problem).map(({ slot, edit }) => ({ car: slot, logo: edit.logo! }));
+            return dealership.applyBands(await asset(GARAGE), bands);
           })()),
         });
       }

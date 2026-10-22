@@ -61,10 +61,11 @@ export function checkFlashContainer(bytes: Uint8Array, label = "flash file") {
 
 const latin1 = (bytes: Uint8Array) => { let out = ""; for (const byte of bytes) out += String.fromCharCode(byte); return out; };
 
-/** Decodes the main script's action list, stopping at its End. */
-export function readMainScript(bytes: Uint8Array, label = "flash file"): MainScript {
+/** Decodes the main script's action list — or the one at `at`, the file offset of another list's
+ *  2-byte prefix (a frame script) — stopping at its End. */
+export function readMainScript(bytes: Uint8Array, label = "flash file", at?: number): MainScript {
   checkFlashContainer(bytes, label);
-  const listOffset = flashFileOffset(bytes, u32(bytes, MAIN_SCRIPT_POINTER));
+  const listOffset = at ?? flashFileOffset(bytes, u32(bytes, MAIN_SCRIPT_POINTER));
   if (listOffset < FLASH_HEADER_SIZE || listOffset + ACTION_LIST_PREFIX >= bytes.length) throw new Error(`${label}: the main script pointer (+0xDC) points outside the file.`);
   const actions: FlashAction[] = [];
   let pool: string[] = [];
@@ -158,10 +159,11 @@ function asCount(value: AvmValue) {
 
 export type FlashArrays = Map<string, AvmScalar[]>;
 
-/** Runs the main script and returns every `_global` array, items in menu order. Non-scalar items
- *  (an array inside an array) are refused — menu arrays hold strings and numbers only. */
-export function runFlashArrays(bytes: Uint8Array, label = "flash file"): FlashArrays {
-  const script = readMainScript(bytes, label);
+/** Runs the main script (or the linear script at `at`, see readMainScript) and returns every
+ *  `_global` array, items in menu order. Non-scalar items (an array inside an array) are refused —
+ *  menu arrays hold strings and numbers only. */
+export function runFlashArrays(bytes: Uint8Array, label = "flash file", at?: number): FlashArrays {
+  const script = readMainScript(bytes, label, at);
   const global: AvmObject = { kind: "object", members: new Map() };
   const stack: AvmValue[] = [];
   const pop = (at: number): AvmValue => {
