@@ -134,6 +134,21 @@ export class FlashMovie {
     }
     return [...new Set(out)].sort((a, b) => a - b);
   }
+
+  /** Where a record can end: the start of any other command, object, action list or the main
+   *  script, or the end of the file. Records this tool appended sit last in the file, or right
+   *  before the next appended chain, so they end cleanly too. */
+  recordBoundaries() {
+    const out = this.allCommandOffsets();
+    for (let id = 1; id < this.objectCount; id++) { const at = this.object(id); if (at !== null) out.push(at); }
+    for (const at of [...out]) {
+      if (u8(this.bytes, at) === 3) { const list = this.pointer(at + 12); if (list !== null) out.push(list); }
+    }
+    const main = this.pointer(0xdc);
+    if (main !== null) out.push(main);
+    out.push(this.bytes.length);
+    return [...new Set(out)].sort((a, b) => a - b);
+  }
 }
 
 /** One record to put in a rebuilt frame: an existing record cloned, with its depth and character
@@ -161,7 +176,7 @@ export function rebuildFrames(movie: FlashMovie, edits: { sprite: number; frame:
   const va = (offset: number) => flashVirtualAddress(original, offset);
   const setU32 = (block: Uint8Array, at: number, value: number) => { block[at] = value & 255; block[at + 1] = (value >>> 8) & 255; block[at + 2] = (value >>> 16) & 255; block[at + 3] = value >>> 24; };
   const setU16 = (block: Uint8Array, at: number, value: number) => { block[at] = value & 255; block[at + 1] = value >>> 8; };
-  const boundaries = movie.allCommandOffsets();
+  const boundaries = movie.recordBoundaries();
 
   /** clone_cmd: copy a record, rebase the pointers that lead inside it, clear its next pointer. */
   const clone = (record: number) => {

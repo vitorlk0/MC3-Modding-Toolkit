@@ -15,12 +15,22 @@ import { DealershipArt, LETTER_ART, LOGO_BRANDS, TYPE_ART, type IconArt } from "
  * The dealership fields change what the dealership SHOWS, text and icon: the class letter and type
  * also redraw the car's icon, and the brand logo and REMIX badge are icon layers taken from other
  * cars (src/dealership-art.ts; the logo also sets the garage's bottom band). Not changed here: the
- * real class and group (vehicle.lst) and the unlock (unlockingrules.csv). The shown price was
- * confirmed in game; whether the purchase charges it was not checked.
+ * group (vehicle.lst) and the unlock (unlockingrules.csv). The shown price was confirmed in game;
+ * whether the purchase charges it was not checked.
+ *
+ * The real class is the slot's `Class` in tune/vehicle/vehicle.lst. It picks the special ability —
+ * read from the Remix ELF (mc::CarDescription::CanUseInTheZone / CanUseAgro / CanUseRoar at
+ * 0x4B2080 / 0x4B20D0 / 0x4B2128, laid out as in the alpha's MC.MAP):
+ *   Zone  CULTURE, PERFORMANCE, SPORTBIKE — and any slot with ForceITZ (SC430, SL500, SL55)
+ *   Agro  SUV, LUXURY, COPCAR (unless ForceITZ)
+ *   Roar  MUSCLE, CHOPPER
+ * and also what else the game ties to the class (SUV, bike and police behaviour, which events
+ * take the car). A car never becomes a bike or the other way round.
  */
 
 export const STRING_TABLES = ["01", "02", "04", "08"].flatMap((n) => [`fonts/mcstrings${n}.strtbl`, `fonts/mcstrings${n}_pal.strtbl`]);
 const TOPLEVEL = "flash/toplevel.pck";
+const VEHICLE_LIST = "tune/vehicle/vehicle.lst";
 const GARAGE = "flash/garage.pck";
 /** garage.pck's frame script that builds _global.VehicleNames (modding KB §20.9). */
 const GARAGE_NAMES_SCRIPT = 0x181c;
@@ -33,6 +43,19 @@ export const SHOWROOM_TYPES: { value: number; label: string }[] = [
 ];
 /** The class letter the dealership shows is ShowroomPerf, the vehicle.lst Group inverted (A→d … D→a). */
 export const SHOWROOM_LETTERS = ["A", "B", "C", "D"];
+
+export type CarClass = { value: string; label: string; ability: "Zone" | "Agro" | "Roar"; bike: boolean };
+/** Real classes a slot can take; police classes are left out. */
+export const CAR_CLASSES: CarClass[] = [
+  { value: "CULTURE", label: "Tuner", ability: "Zone", bike: false },
+  { value: "PERFORMANCE", label: "Exotic", ability: "Zone", bike: false },
+  { value: "MUSCLE", label: "Muscle", ability: "Roar", bike: false },
+  { value: "SUV", label: "SUV", ability: "Agro", bike: false },
+  { value: "LUXURY", label: "Luxury", ability: "Agro", bike: false },
+  { value: "SPORTBIKE", label: "Sport bike", ability: "Zone", bike: true },
+  { value: "CHOPPER", label: "Chopper", ability: "Roar", bike: true },
+];
+const BIKE_CLASS = /^(CHOPPER|SPORTBIKE|COPBIKE)$/;
 
 export const NAME_MAX = 21;
 export const SHORT_NAME_MAX = 12;
@@ -49,9 +72,11 @@ export type SlotDetails = {
   logo: number;
   /** The icon's "REMIX" badge. */
   remix: boolean;
+  /** vehicle.lst Class: the special ability and the rest of the slot's class behaviour. */
+  carClass: string;
 };
 export type SlotDetailsEdit = Partial<SlotDetails>;
-export const DETAIL_KEYS: (keyof SlotDetails)[] = ["name", "shortName", "price", "letter", "showroomType", "logo", "remix"];
+export const DETAIL_KEYS: (keyof SlotDetails)[] = ["name", "shortName", "price", "letter", "showroomType", "logo", "remix", "carClass"];
 /** A brand logo to choose, named after the cars that show it. */
 export type LogoOption = { character: number; label: string };
 
@@ -75,6 +100,7 @@ export function detailProblem(key: keyof SlotDetails, value: string | number | b
   const number = Number(value);
   if (key === "price") return Number.isInteger(number) && number >= 0 && number <= 9_999_999 ? null : "A whole number of dollars, up to 9,999,999.";
   if (key === "letter") return SHOWROOM_LETTERS.includes(String(value)) ? null : "A, B, C or D.";
+  if (key === "carClass") return CAR_CLASSES.some((item) => item.value === value) ? null : "Not a class a slot can take.";
   if (key === "logo") return Number.isInteger(number) && number > 0 ? null : "Not a brand logo.";
   if (key === "remix") return typeof value === "boolean" || value === "true" || value === "false" ? null : "On or off.";
   return SHOWROOM_TYPES.some((type) => type.value === number) ? null : "Not a dealership type.";
@@ -82,7 +108,7 @@ export function detailProblem(key: keyof SlotDetails, value: string | number | b
 
 /** The ISO's global files, read once and reused for every slot. */
 export type SlotDetailsSource = {
-  details(slot: string): Promise<SlotDetails & { artProblem: string | null }>;
+  details(slot: string): Promise<SlotDetails & { artProblem: string | null; forceZone: boolean }>;
   logos(): Promise<LogoOption[]>;
   /** The shared files that carry `edits`, built from the ISO's own copies. Files no edit touches are
    *  left out; an edit that changes nothing writes nothing (the plan reads them as unchanged). */
@@ -115,6 +141,18 @@ export function openSlotDetails(session: IsoSession): SlotDetailsSource {
     if (!garageNames) throw new Error("garage.pck has no VehicleNames list.");
     return new DealershipArt(top, garage, shown.get("ShowRoomNames")!.map(scalarText), garageNames.map(scalarText));
   })());
+  /** The text of vehicle.lst and the extent of each car's Vehicle block in it. */
+  let vehicles: Promise<{ text: string; blocks: Map<string, { start: number; end: number }> }> | null = null;
+  const vehicleList = () => (vehicles ??= asset(VEHICLE_LIST).then((bytes) => {
+    let text = "";
+    for (const byte of bytes) text += String.fromCharCode(byte);
+    const blocks = new Map<string, { start: number; end: number }>();
+    for (const match of text.matchAll(/\bVehicle\s*\{[^{}]*?\bName\s+(\S+)[\s\S]*?\n\}/g)) {
+      blocks.set(match[1].toLowerCase(), { start: match.index!, end: match.index! + match[0].length });
+    }
+    return { text, blocks };
+  }));
+  const classOf = (text: string, block: { start: number; end: number }) => /\bClass\s+(\S+)/.exec(text.slice(block.start, block.end))?.[1] ?? "";
   let manufacturers: Promise<Map<string, string>> | null = null;
   const makes = () => (manufacturers ??= asset("tune/vehicle/vehicle.lst").then((bytes) => {
     let text = "";
@@ -155,7 +193,12 @@ export function openSlotDetails(session: IsoSession): SlotDetailsSource {
       let icon: { logo: number; remix: boolean; problem: string | null };
       try { icon = (await art()).slot(slot); }
       catch (caught) { icon = { logo: -1, remix: false, problem: caught instanceof Error ? caught.message : String(caught) }; }
+      const list = await vehicleList();
+      const block = list.blocks.get(slot);
+      const blockText = block ? list.text.slice(block.start, block.end) : "";
       return {
+        carClass: block ? classOf(list.text, block) : "",
+        forceZone: /\bForceITZ\b/.test(blockText),
         logo: icon.problem ? -1 : icon.logo, remix: icon.remix, artProblem: icon.problem,
         name: strtblText(strings, slot)[0] ?? "",
         shortName: strtblText(strings, `${slot}_short`)[0] ?? "",
@@ -232,6 +275,39 @@ export function openSlotDetails(session: IsoSession): SlotDetailsSource {
             const icons = (await Promise.all(dealer.map(async ({ slot, edit }) => ({ car: slot, art: await iconFor(slot, edit) }))))
               .filter((item): item is { car: string; art: IconArt } => item.art !== null);
             return icons.length ? (await art()).apply(withArrays, icons) : withArrays;
+          })()),
+        });
+      }
+      const classed = edits.filter(({ edit }) => edit.carClass !== undefined);
+      if (classed.length) {
+        let built: Promise<Uint8Array> | null = null;
+        files.push({
+          category: "shared", name: "vehicle.lst", sourcePath: VEHICLE_LIST, target: VEHICLE_LIST, size: 0,
+          read: () => (built ??= (async () => {
+            const { text, blocks } = await vehicleList();
+            // Rewrite block by block from the end, so earlier offsets stay valid.
+            const changes = classed.map(({ slot, edit }) => {
+              const block = blocks.get(slot);
+              if (!block) throw new Error(`${slot} has no Vehicle block in vehicle.lst.`);
+              const old = classOf(text, block);
+              if (BIKE_CLASS.test(old) !== BIKE_CLASS.test(edit.carClass!)) throw new Error(`${slot} is a ${old} — a car's class can't become a bike's, nor the other way round.`);
+              return { slot, block, value: edit.carClass! };
+            }).sort((a, b) => b.block.start - a.block.start);
+            let out = text;
+            for (const { block, value } of changes) {
+              const body = out.slice(block.start, block.end).replace(/(\bClass\s+)\S+/, `$1${value}`);
+              out = out.slice(0, block.start) + body + out.slice(block.end);
+            }
+            // Prove it: every Vehicle block reads back with the same name and class, except the edited ones.
+            const after = [...out.matchAll(/\bVehicle\s*\{[^{}]*?\bName\s+(\S+)[\s\S]*?\n\}/g)];
+            if (after.length !== blocks.size) throw new Error("vehicle.lst lost a Vehicle block.");
+            for (const match of after) {
+              const name = match[1].toLowerCase();
+              const want = changes.find((item) => item.slot === name)?.value ?? classOf(text, blocks.get(name)!);
+              if (/\bClass\s+(\S+)/.exec(match[0])?.[1] !== want) throw new Error(`vehicle.lst: ${name} didn't come out with class ${want}.`);
+            }
+            if (out.replace(/\bClass\s+\S+/g, "") !== text.replace(/\bClass\s+\S+/g, "")) throw new Error("vehicle.lst changed outside the Class lines.");
+            return Uint8Array.from(out, (char) => char.charCodeAt(0));
           })()),
         });
       }

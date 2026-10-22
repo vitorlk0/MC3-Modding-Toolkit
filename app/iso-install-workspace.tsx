@@ -10,7 +10,7 @@ import { readIsoCatalog } from "../src/slot-reference-iso";
 import { retargetPackage, type RetargetResult } from "../src/slot-retarget";
 import { RetargetNotes, SlotPicker } from "./mod-toolkit/slot-picker";
 import {
-  DETAIL_KEYS, NAME_MAX, SHORT_NAME_MAX, SHOWROOM_LETTERS, SHOWROOM_TYPES, detailProblem, openSlotDetails,
+  CAR_CLASSES, DETAIL_KEYS, NAME_MAX, SHORT_NAME_MAX, SHOWROOM_LETTERS, SHOWROOM_TYPES, detailProblem, openSlotDetails,
   type LogoOption, type SlotDetails, type SlotDetailsEdit, type SlotDetailsSource,
 } from "../src/slot-details";
 import { SECTOR } from "../src/iso9660";
@@ -67,7 +67,7 @@ type CarCard = {
 
 type DetailInputs = Partial<Record<keyof SlotDetails, string>>;
 /** A slot's current details, or why they couldn't be read. */
-type DetailsState = { details: (SlotDetails & { artProblem: string | null }) | null; error: string | null };
+type DetailsState = { details: (SlotDetails & { artProblem: string | null; forceZone: boolean }) | null; error: string | null };
 
 /** The typed fields as values to write, or the problems that stop them. */
 function parseEdits(inputs: DetailInputs): { edit: SlotDetailsEdit; problems: string[] } {
@@ -76,7 +76,7 @@ function parseEdits(inputs: DetailInputs): { edit: SlotDetailsEdit; problems: st
   for (const key of DETAIL_KEYS) {
     const raw = inputs[key];
     if (raw === undefined) continue;
-    const value = key === "name" || key === "shortName" || key === "letter" ? raw : key === "remix" ? raw === "true" : Number(raw.trim().replace(/^\$/, "").replace(/,/g, ""));
+    const value = key === "name" || key === "shortName" || key === "letter" || key === "carClass" ? raw : key === "remix" ? raw === "true" : Number(raw.trim().replace(/^\$/, "").replace(/,/g, ""));
     const problem = raw.trim() === "" && key !== "name" && key !== "shortName" ? "Can't be empty." : detailProblem(key, value);
     if (problem) problems.push(`${DETAIL_LABELS[key]}: ${problem}`);
     else (edit as Record<string, string | number | boolean>)[key] = value;
@@ -86,8 +86,10 @@ function parseEdits(inputs: DetailInputs): { edit: SlotDetailsEdit; problems: st
 
 const DETAIL_LABELS: Record<keyof SlotDetails, string> = {
   name: "Name", shortName: "Short name", price: "Price shown", letter: "Class letter", showroomType: "Type",
-  logo: "Brand logo", remix: "REMIX badge",
+  logo: "Brand logo", remix: "REMIX badge", carClass: "Real class",
 };
+/** The dealership type that matches each real class, so a class change can carry the shown type along. */
+const TYPE_FOR_CLASS: Record<string, string> = { CULTURE: "1", MUSCLE: "2", SUV: "3", CHOPPER: "4", SPORTBIKE: "5", PERFORMANCE: "6", LUXURY: "7" };
 /** How a current value fills its field. */
 const detailText = (key: keyof SlotDetails, details: SlotDetails) => String(details[key]);
 
@@ -601,7 +603,11 @@ function SlotDetailsPanel({ slot, details, logos, edits, busy, onEdit }: {
   const describe = (key: keyof SlotDetails, value: string) =>
     key === "showroomType" ? tr(SHOWROOM_TYPES.find((type) => String(type.value) === value)?.label ?? value)
       : key === "logo" ? logos.find((logo) => String(logo.character) === value)?.label ?? value
-      : key === "remix" ? tr(value === "true" ? "on" : "off") : value;
+      : key === "remix" ? tr(value === "true" ? "on" : "off")
+      : key === "carClass" ? (() => { const item = CAR_CLASSES.find((entry) => entry.value === value); return item ? `${tr(item.label)} · ${item.ability}` : value; })()
+      : value;
+  const bike = /^(CHOPPER|SPORTBIKE|COPBIKE)$/.test(current.carClass);
+  const classes = CAR_CLASSES.filter((item) => item.bike === bike);
   const changed = DETAIL_KEYS.filter((key) => edits[key] !== undefined && edits[key] !== detailText(key, current));
   const field = (key: keyof SlotDetails, input: ReactNode, hint?: string) => {
     const edited = edits[key] !== undefined && edits[key] !== detailText(key, current);
@@ -636,7 +642,18 @@ function SlotDetailsPanel({ slot, details, logos, edits, busy, onEdit }: {
       {art && field("remix", <span className="iso-detail-check"><input type="checkbox" checked={(edits.remix ?? String(current.remix)) === "true"} disabled={busy}
         onChange={(event) => onEdit("remix", String(event.target.checked))} />{tr("Show the REMIX badge on the icon")}</span>)}
     </div>
+    <div className="iso-detail-grid">
+      {current.carClass && field("carClass", <select className="perf-input" value={edits.carClass ?? current.carClass} disabled={busy}
+        onChange={(event) => {
+          onEdit("carClass", event.target.value);
+          // The shown type follows the real class unless it was set by hand.
+          if (edits.showroomType === undefined && TYPE_FOR_CLASS[event.target.value]) onEdit("showroomType", TYPE_FOR_CLASS[event.target.value]);
+        }}>
+        {!classes.some((item) => item.value === current.carClass) && <option value={current.carClass}>{current.carClass}</option>}
+        {classes.map((item) => <option key={item.value} value={item.value}>{`${tr(item.label)} · ${item.ability}`}</option>)}
+      </select>, current.forceZone ? "ForceITZ: this slot always has Zone" : "Special ability · class-only career events not tested")}
+    </div>
     {!art && <p className="iso-detail-note">{tr(`The icon of this slot can't be changed: ${current.artProblem}`)}</p>}
-    <p className="iso-detail-note">{tr("These change what the game shows. The car's real class, group and unlock stay the slot's. A car already bought in a save may keep the name it was bought with.")}</p>
+    <p className="iso-detail-note">{tr("Real class changes the special ability; the other fields change what the game shows. Group and unlock stay the slot's. A car already bought in a save may keep the name it was bought with.")}</p>
   </details>;
 }
