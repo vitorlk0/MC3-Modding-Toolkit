@@ -7,6 +7,7 @@ import { applyAnchorRotation } from "./anchor-rotation";
 import { anchorWorldPosition, matchLodEntries, resolveGroupShaderId, resolvePieceId, type MeshGeometry } from "../src/mesh";
 import { hexToRgb, rgbToHex, shaderColorRgb } from "./shader-color";
 import { PieceIdChip, ShaderIdChip } from "./piece-id-chip";
+import { registerDiagnosticViewer } from "./diagnostics";
 
 type ActiveCamera = THREE.PerspectiveCamera | THREE.OrthographicCamera;
 type ViewDirection = "front" | "back" | "left" | "right" | "top" | "bottom";
@@ -186,6 +187,7 @@ export function MeshEditorViewer({ meshes, visibleNames, document, selection, on
     uvChecker.anisotropy = renderer.capabilities.getMaxAnisotropy();
 
     runtimeRef.current = { renderer, scene, perspectiveCamera, orthographicCamera, camera: perspectiveCamera, controls, modelGroup, grid, raycaster: new THREE.Raycaster(), edgesMaterial, uvChecker };
+    const unregisterDiagnostics = registerDiagnosticViewer("Meshes", renderer, () => runtimeRef.current?.camera ?? perspectiveCamera, modelGroup);
     const resize = () => {
       const width = Math.max(host.clientWidth, 1); const height = Math.max(host.clientHeight, 1);
       renderer.setSize(width, height, false);
@@ -244,6 +246,7 @@ export function MeshEditorViewer({ meshes, visibleNames, document, selection, on
     };
     render();
     return () => {
+      unregisterDiagnostics();
       cancelAnimationFrame(frame); observer.disconnect(); controls.dispose();
       renderer.domElement.removeEventListener("click", handleClick);
       renderer.domElement.removeEventListener("dblclick", handleDoubleClick);
@@ -307,6 +310,7 @@ export function MeshEditorViewer({ meshes, visibleNames, document, selection, on
       geometry.computeBoundingSphere();
       const material = new THREE.MeshStandardMaterial({ vertexColors: !uvChecker, map: uvChecker ? runtime.uvChecker : null, transparent: true, wireframe: renderMode === "wireframe", roughness: 0.7, metalness: 0.05, side: THREE.DoubleSide });
       const object = new THREE.Mesh(geometry, material);
+      object.userData.source = parsed.name;
       const position = document ? anchorWorldPosition(document, parsed.anchorIndex ?? 0, "a2") : [0, 0, 0];
       object.position.set(position[0], position[1], position[2]);
       if (document) applyAnchorRotation(object, document, parsed.anchorIndex ?? 0);

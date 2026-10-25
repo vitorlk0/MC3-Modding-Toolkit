@@ -7,6 +7,7 @@ import type { PckDocument, Vec3 } from "../src/pck";
 import { anchorWorldPosition, nearestMeshAnchor, type MeshGeometry } from "../src/mesh";
 import { anchorWorldQuaternion, applyAnchorRotation, localRotationFor } from "./anchor-rotation";
 import type { PpfGeometry, PpfKind } from "../src/ppf";
+import { registerDiagnosticViewer } from "./diagnostics";
 
 type ActiveCamera = THREE.PerspectiveCamera | THREE.OrthographicCamera;
 type ViewDirection = "front" | "back" | "left" | "right" | "top" | "bottom";
@@ -377,6 +378,7 @@ export function MeshViewer({ document, selected, multiSelected, meshes, visibleA
     renderer.domElement.addEventListener("pointerup", onPointerUp);
 
     runtimeRef.current = { renderer, scene, perspectiveCamera, orthographicCamera, camera: perspectiveCamera, controls, transformControls, gizmoTarget, modelGroup, markerGroup, grid, material, selectedMaterial, edgesMaterial, referenceMaterials, markerA1, markerA2, cameraGroup, shopCamera, shopHelper, cameraMarker, targetMarker, cameraLine, targetPlane };
+    const unregisterDiagnostics = registerDiagnosticViewer("Anchors", renderer, () => lookThroughRef.current.active ? shopCamera : runtimeRef.current?.camera ?? perspectiveCamera, modelGroup);
     const resize = () => {
       const width = Math.max(host.clientWidth, 1); const height = Math.max(host.clientHeight, 1);
       renderer.setSize(width, height, false);
@@ -416,6 +418,7 @@ export function MeshViewer({ document, selected, multiSelected, meshes, visibleA
     const onSnapKey = (event: KeyboardEvent) => { if (event.key === "Shift") transformControls.setRotationSnap(event.type === "keydown" ? ROTATION_SNAP : null); };
     window.addEventListener("keydown", onSnapKey); window.addEventListener("keyup", onSnapKey);
     return () => {
+      unregisterDiagnostics();
       window.removeEventListener("keydown", onSnapKey); window.removeEventListener("keyup", onSnapKey);
       cancelAnimationFrame(frame); observer.disconnect(); controls.dispose(); transformControls.dispose();
       renderer.domElement.removeEventListener("pointerdown", onPointerDown); renderer.domElement.removeEventListener("pointerup", onPointerUp);

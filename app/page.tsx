@@ -2,12 +2,14 @@ import { tr, Tx, confirmDialog, messageDialog, setLanguage, useLanguage } from "
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { open, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { AboutDialog } from "./about-dialog";
+import { DiagnosticCompareDialog } from "./diagnostics-dialog";
+import { buildDiagnosticReport, recordVehicleLoad, registerDiagnosticSource, type VehicleLoadTrace } from "./diagnostics";
 import { readFile, writeFile, readDir, stat, exists } from "@tauri-apps/plugin-fs";
 import { join } from "@tauri-apps/api/path";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { formatClipboard, hex, parseClipboard, PckDocument, type LodMeshEntry, type MeshBlobSnapshot, type Vec3 } from "../src/pck";
-import { EmptyMeshError, MeshPckDocument, hasStockVariants, isLowLodOnly, isShadowPlane, isShellFamily, matchLodEntries, parseEmbeddedMesh, resolveGroupShaderId, resolvePieceId, type MeshGeometry } from "../src/mesh";
+import { EmptyMeshError, MeshPckDocument, defaultHiddenReason, hasStockVariants, isLowLodOnly, isShadowPlane, isShellFamily, matchLodEntries, parseEmbeddedMesh, resolveGroupShaderId, resolvePieceId, type MeshGeometry } from "../src/mesh";
 import { isShellPiece } from "../src/mesh-inject";
 import { exportMeshObj } from "../src/obj-export";
 import { convertObjToMeshPck } from "../src/obj";
@@ -389,7 +391,7 @@ export default function App() {
   // Subscribes the whole page to the interface language: switching re-renders every text through tr().
   const language = useLanguage();
   const [meshViewRole, setMeshViewRole] = useState<VehicleRole | null>(null);
-  const [dragging, setDragging] = useState(false); const [showAbout, setShowAbout] = useState(false);
+  const [dragging, setDragging] = useState(false); const [showAbout, setShowAbout] = useState(false); const [showCompare, setShowCompare] = useState(false);
   // Paths dropped while the Mod Toolkit is open, handed to its active tool and cleared once taken.
   const [toolkitDrop, setToolkitDrop] = useState<string[] | null>(null);
   const [texturesDrop, setTexturesDrop] = useState<string[] | null>(null);
@@ -897,6 +899,26 @@ export default function App() {
     }
   }, [refresh]);
   useEffect(() => onFileWritten((path) => { void reloadWrittenFile(path); }), [reloadWrittenFile]);
+  // The vehicle set as the diagnostic report reads it; the embedded pieces are only worked out when a
+  // report is made.
+  const diagnosticState = useRef({ slots, workingRole, meshRole, vehicleBase, workspace, meshDocs, visibleMeshAnchors });
+  diagnosticState.current = { slots, workingRole, meshRole, vehicleBase, workspace, meshDocs, visibleMeshAnchors };
+  useEffect(() => registerDiagnosticSource("vehicleSet", () => {
+    const state = diagnosticState.current;
+    const embeddedByRole = Object.fromEntries(roles.filter((role) => state.slots[role]).map((role) => [role, readEmbeddedOnly(state.slots[role]!.document, state.meshDocs)]));
+    return { ...state, anchorVisible: state.visibleMeshAnchors, embeddedByRole };
+  }), []);
+  const saveDiagnosticReport = useCallback(async () => {
+    setMenu(null);
+    try {
+      const text = await buildDiagnosticReport();
+      const stamp = new Date().toISOString().slice(0, 16).replace(/[-:]/g, "").replace("T", "-");
+      const path = await saveDialog({ defaultPath: `mc3-report-${vehicleBase || "no-vehicle"}-${stamp}.txt`, filters: [{ name: "Text", extensions: ["txt"] }] });
+      if (!path) return;
+      await writeFile(path, new TextEncoder().encode(text));
+      setStatus(`Diagnostic report saved · ${basename(path)}`);
+    } catch (error) { setStatus(`Could not save the diagnostic report · ${error instanceof Error ? error.message : String(error)}`); }
+  }, [vehicleBase]);
   /** Finds the car's shop camera file beside the vehicle folder. A car without one still opens. */
   const loadGarageFor = useCallback(async (vehiclePckPath: string, base: string) => {
     setGarage(null); setLookThrough(false);
@@ -906,35 +928,45 @@ export default function App() {
       setGarage(await readGarage(path)); setGarageNote("");
     } catch (error) { setGarageNote(error instanceof Error ? error.message : "The shop camera file could not be read."); }
   }, []);
-  const loadEntries = useCallback(async (entries: FileEntry[], preferredName?: string) => {
+  const loadEntries = useCallback(async (entries: FileEntry[], preferredName?: string, how: VehicleLoadTrace["how"] = "folder") => {
     if (anySlotDirty && !await confirmDiscard("Discard the unsaved changes and open another vehicle set?")) return;
+    const trace: VehicleLoadTrace = { at: Date.now(), how, given: entries.map((entry) => entry.name), preferred: preferredName ?? null, base: "", files: {}, workingRole: null, meshFailures: [], error: null };
     try {
       const group = selectVehicleGroup(entries, preferredName); const next = emptySlots();
+      trace.base = group.base;
+      for (const role of roles) if (group.entries[role]) trace.files[role] = group.entries[role]!.name;
       await Promise.all(roles.map(async (role) => { const entry = group.entries[role]; if (entry) next[role] = { role, path: entry.path, document: await readDocument(entry.path) }; }));
       const preferredRole = preferredName ? classifyVehicleFile(preferredName)?.role : undefined;
       const nextRole = preferredRole && next[preferredRole] ? preferredRole : roles.find((role) => next[role])!;
+      trace.workingRole = nextRole;
       const source = next[nextRole]!.document;
       for (const role of roles) if (next[role] && role !== nextRole) next[role]!.document.assertAnchorCompatibility(source);
       const meshEntries = entries.filter((entry) => isMeshPck(entry.name));
       const parsedMeshes = await Promise.allSettled(meshEntries.map(async (entry) => new MeshPckDocument(entry.path, entry.name, toArrayBuffer(await readFile(entry.path)), source)));
       const docs = parsedMeshes.filter((result): result is PromiseFulfilledResult<MeshPckDocument> => result.status === "fulfilled").map((result) => result.value);
       const failures = parsedMeshes.length - docs.length;
+      parsedMeshes.forEach((result, index) => { if (result.status === "rejected") trace.meshFailures.push({ name: meshEntries[index].name, error: result.reason instanceof Error ? result.reason.message : String(result.reason) }); });
+      recordVehicleLoad(trace);
       const nextMeshDocs = new Map(docs.map((doc) => [doc.name, doc]));
       const customizable = hasStockVariants(docs.map((doc) => doc.geometry));
-      const defaultVisible = new Set(docs.filter((doc) => doc.geometry.anchorIndex !== null && (doc.geometry.stock || doc.geometry.category === "lodgroup" || !customizable) && !isLowLodOnly(doc.geometry, source) && !isShadowPlane(doc.geometry.name)).map((doc) => doc.geometry.anchorIndex!));
-      for (const piece of readEmbeddedOnly(source, nextMeshDocs).pieces) if (piece.anchorIndex !== null && piece.lod === "hlod" && !isShadowPlane(piece.name)) defaultVisible.add(piece.anchorIndex);
+      const defaultVisible = new Set(docs.filter((doc) => doc.geometry.anchorIndex !== null && !defaultHiddenReason(doc.geometry, source, customizable)).map((doc) => doc.geometry.anchorIndex!));
+      for (const piece of readEmbeddedOnly(source, nextMeshDocs).pieces) if (piece.anchorIndex !== null && !defaultHiddenReason(piece, source, customizable)) defaultVisible.add(piece.anchorIndex);
       setMeshDocs(nextMeshDocs); setVisibleMeshAnchors(defaultVisible); setMeshErrors(failures);
       const count = roles.filter((role) => next[role]).length;
       installVehicle(next, nextRole, group.base, `${group.base} loaded · ${count}/3 vehicle PCKs · ${docs.length} mesh files${failures ? ` · ${failures} unsupported` : ""}`);
       void loadGarageFor(next[nextRole]!.path, group.base);
-    } catch (error) { setStatus(error instanceof Error ? error.message : "Could not open this vehicle set."); }
+    } catch (error) {
+      trace.error = error instanceof Error ? error.message : String(error);
+      recordVehicleLoad(trace);
+      setStatus(error instanceof Error ? error.message : "Could not open this vehicle set.");
+    }
   }, [anySlotDirty, installVehicle, loadGarageFor]);
   const openFiles = useCallback(async () => {
     setMenu(null);
     try {
       const selection = await open({ multiple: true, filters: vehicleFilters });
       const paths = selection ? (Array.isArray(selection) ? selection : [selection]) : [];
-      if (paths.length) await loadEntries(paths.map((path) => ({ path, name: basename(path) })), basename(paths[0]));
+      if (paths.length) await loadEntries(paths.map((path) => ({ path, name: basename(path) })), basename(paths[0]), "files");
     } catch (error) { setStatus(error instanceof Error ? error.message : "Could not open those files."); }
   }, [loadEntries]);
   const openVehicleFolderAtPath = useCallback(async (folderPath: string) => {
@@ -1522,7 +1554,7 @@ export default function App() {
         if (workspace === "toolkit") { setToolkitDrop(event.payload.paths); return; }
         if (workspace === "textures") { setTexturesDrop(event.payload.paths); return; }
         if (workspace === "iso") { setIsoDrop(event.payload.paths); return; }
-        void collectDroppedPaths(event.payload.paths).then((entries) => entries.length ? loadEntries(entries) : setStatus("No supported vehicle PCKs were found in that drop.")).catch((error) => setStatus(error instanceof Error ? error.message : "Could not read the dropped files."));
+        void collectDroppedPaths(event.payload.paths).then((entries) => entries.length ? loadEntries(entries, undefined, "drop") : setStatus("No supported vehicle PCKs were found in that drop.")).catch((error) => setStatus(error instanceof Error ? error.message : "Could not read the dropped files."));
       }
     }).then((fn) => { cancelled ? fn() : (unlisten = fn); });
     return () => { cancelled = true; unlisten?.(); };
@@ -1571,7 +1603,7 @@ export default function App() {
         : workspace === "performance" ? <div className="menu-wrap"><button className={menu === "edit" ? "active" : ""} onClick={() => setMenu(menu === "edit" ? null : "edit")}>{tr("Edit")}</button>{menu === "edit" && <div className="dropdown"><MenuItem shortcut="Ctrl+Z" disabled={!perfUndoRef.current.length} onClick={perfUndo}>{tr("Undo")}</MenuItem><MenuItem shortcut="Ctrl+Y" disabled={!perfRedoRef.current.length} onClick={perfRedo}>{tr("Redo")}</MenuItem></div>}</div>
         : workspace === "audio" ? <div className="menu-wrap"><button className={menu === "edit" ? "active" : ""} onClick={() => setMenu(menu === "edit" ? null : "edit")}>{tr("Edit")}</button>{menu === "edit" && <div className="dropdown"><MenuItem shortcut="Ctrl+Z" disabled={!audioUndoRef.current.length} onClick={audioUndo}>{tr("Undo")}</MenuItem><MenuItem shortcut="Ctrl+Y" disabled={!audioRedoRef.current.length} onClick={audioRedo}>{tr("Redo")}</MenuItem></div>}</div>
         : <div className="menu-wrap"><button className={menu === "edit" ? "active" : ""} onClick={() => setMenu(menu === "edit" ? null : "edit")}>{tr("Edit")}</button>{menu === "edit" && <div className="dropdown"><MenuItem shortcut="Ctrl+Z" disabled={!pieceIdUndoRef.current.length} onClick={meshUndo}>{tr("Undo")}</MenuItem><MenuItem shortcut="Ctrl+Y" disabled={!pieceIdRedoRef.current.length} onClick={meshRedo}>{tr("Redo")}</MenuItem></div>}</div>}
-      <div className="menu-wrap"><button className={menu === "help" ? "active" : ""} onClick={() => setMenu(menu === "help" ? null : "help")}>{tr("Help")}</button>{menu === "help" && <div className="dropdown compact"><MenuItem onClick={() => { setShowAbout(true); setMenu(null); }}>{tr("About")}</MenuItem></div>}</div>
+      <div className="menu-wrap"><button className={menu === "help" ? "active" : ""} onClick={() => setMenu(menu === "help" ? null : "help")}>{tr("Help")}</button>{menu === "help" && <div className="dropdown"><MenuItem onClick={() => void saveDiagnosticReport()}>{tr("Save diagnostic report…")}</MenuItem><MenuItem onClick={() => { setShowCompare(true); setMenu(null); }}>{tr("Compare diagnostic reports…")}</MenuItem><div className="separator" /><MenuItem onClick={() => { setShowAbout(true); setMenu(null); }}>{tr("About")}</MenuItem></div>}</div>
     </div>
 
     {workspace === "anchor" && (!document ? <main className="welcome"><div className={`drop-card ${dragging ? "dragging" : ""}`}><div className="file-glyph"><span>{tr("PCK×3")}</span></div><p className="eyebrow">{tr("VEHICLE ANCHOR WORKSPACE")}</p><h1><Tx t="Open the vehicle folder.{0}Edit the whole PCK set." v={[<br />]} /></h1><p className="welcome-copy">{tr("Player, Garage and Opponent are detected as one set. Standalone mesh.pck geometry from the folder is decoded locally for a live solid-color preview.")}</p><div className="welcome-actions"><button className="primary" onClick={() => void openFolder()}>{tr("Open vehicle folder")}</button><button className="secondary" onClick={() => void openFiles()}>{tr("Open PCK file(s)")}</button></div><p className="drop-hint">{tr("or drag and drop the complete vehicle folder")}</p>{recentVehicleFolders.length > 0 && <div className="recent-folders"><div className="recent-folders-heading"><span>{tr("Recent folders")}</span><button className="link-button" onClick={clearVehicleRecents}>{tr("Clear list")}</button></div><div className="recent-folders-list">{recentVehicleFolders.map((path) => <button key={path} className="recent-folder-item" title={path} onClick={() => void openVehicleFolderAtPath(path)}>{basename(path)}</button>)}</div></div>}<div className="capability-row"><span><Tx t="Set {0}" v={[<b>{tr("Player · Garage · Opponent")}</b>]} /></span><span><Tx t="Preview {0}" v={[<b>{tr("External mesh.pck geometry")}</b>]} /></span><span><Tx t="Save {0}" v={[<b>{tr("Deferred synchronization")}</b>]} /></span></div></div></main> : <main className="workspace" style={{ "--nav-width": `${panelWidths.nav}px`, "--editor-width": `${panelWidths.editor}px` } as React.CSSProperties}>
@@ -1674,5 +1706,6 @@ export default function App() {
     <footer className="statusbar"><div><span className="status-light" />{tr(status)}</div><div>{workspace === "toolkit" ? tr("Loose files · each tool saves over the file it opened") : workspace === "iso" ? tr("Writes into the opened ISO · make a backup first") : workspace === "textures" ? tr("Loose file · saves over the PCK it opened") : document ? tr(`${loadedCount}/3 PCKs · ${roleLabels[workingRole!]} working · ${anySlotDirty ? `${pendingCount} pending change${pendingCount === 1 ? "" : "s"}` : "Saved state"}`) : tr("Open a vehicle folder to begin")}</div></footer>
     {dragging && <div className="drop-overlay"><div>{workspace === "textures" ? <><strong>{tr("Drop a PCK")}</strong><span>{tr("Car or Flash/UI PCK — it opens here and is scanned for textures")}</span></> : workspace === "iso" ? <><strong>{tr("Drop an ISO or mod ZIPs")}</strong><span>{tr("An .iso opens as the target; ZIPs and folders are added as car mods")}</span></> : workspace === "toolkit" ? <><strong>{tr("Drop a file for this tool")}</strong><span>{tr("The active tool takes the file types it supports")}</span></> : <><strong>{tr("Drop vehicle folder")}</strong><span>{tr("The PCK set and external mesh geometry will be loaded together")}</span></>}</div></div>}
     {showAbout && <AboutDialog onClose={() => setShowAbout(false)} />}
+    {showCompare && <DiagnosticCompareDialog onClose={() => setShowCompare(false)} />}
   </div>;
 }

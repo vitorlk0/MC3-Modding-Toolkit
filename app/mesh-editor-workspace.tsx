@@ -1,7 +1,8 @@
 import { tr, Tx } from "./i18n";
 import { useCallback, useEffect, useState } from "react";
 import type { LodMeshEntry, PckDocument } from "../src/pck";
-import { hasStockVariants, isLowLodOnly, isShadowPlane, matchLodEntries, type MeshGeometry, type MeshPckDocument } from "../src/mesh";
+import { defaultHiddenReason, hasStockVariants, matchLodEntries, type MeshGeometry, type MeshPckDocument } from "../src/mesh";
+import { registerDiagnosticSource } from "./diagnostics";
 import { roleLabels, roles, sizeLabel, type VehicleRole, type VehicleSlots } from "./vehicle-types";
 import { MeshEditorViewer, type MeshSelection } from "./mesh-editor-viewer";
 import { MeshPieceList } from "./mesh-piece-list";
@@ -21,8 +22,7 @@ const plannedFeatures = [
 // (neonglow, Shadow_Neon) are flat sheets under the car and would just cover the grid.
 function defaultVisibleNames(meshes: MeshGeometry[], document: PckDocument | null) {
   const customizable = hasStockVariants(meshes);
-  return new Set(meshes.filter((mesh) => (mesh.origin === "embedded" || mesh.stock || mesh.category === "lodgroup" || !customizable)
-    && !isLowLodOnly(mesh, document) && !isShadowPlane(mesh.name)).map((mesh) => mesh.name));
+  return new Set(meshes.filter((mesh) => !defaultHiddenReason(mesh, document, customizable)).map((mesh) => mesh.name));
 }
 
 export function MeshEditorWorkspace({ document, activeRole, slots, onSelectRole, meshes, onEditPieceId, onEditGroupShader, onUpdateEmbedded, onRemoveEmbedded, onUpdateAllEmbedded, onConvertObjs, zeroShellId, onSetZeroShellId, compactStreams, onSetCompactStreams, onExportObj, embeddedUnreadable, embeddedEmpty, objFolder, describeEmbedTarget, describePieceSize, onUndo, onRedo, canUndo, canRedo, vehicleBase, loadedCount, onOpenFolder, recentVehicleFolders, onOpenRecentFolder, onClearRecentFolders, listWidth, onResizeList }: {
@@ -68,6 +68,8 @@ export function MeshEditorWorkspace({ document, activeRole, slots, onSelectRole,
   const [selection, setSelection] = useState<MeshSelection | null>(null);
   const [visibleNames, setVisibleNames] = useState<Set<string>>(() => defaultVisibleNames(meshes, document));
   useEffect(() => { setVisibleNames(defaultVisibleNames(meshes, document)); setSelection(null); }, [meshes, document]);
+  // What the Meshes tab is showing right now, for the diagnostic report.
+  useEffect(() => registerDiagnosticSource("meshEditor", () => ({ role: activeRole, visibleNames })), [activeRole, visibleNames]);
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
   // A fresh object per request so double-clicking the same piece twice still re-scrolls to it.
   const [revealRequest, setRevealRequest] = useState<{ meshName: string } | null>(null);

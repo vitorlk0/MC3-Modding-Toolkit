@@ -242,6 +242,16 @@ export const hasStockVariants = (meshes: MeshGeometry[]) => meshes.some((mesh) =
  *  viewer they are a big plane under the car rather than part of it. */
 export const isShadowPlane = (name: string) => /neonglow|shadow/i.test(name);
 
+/** Why a piece starts hidden in the 3D views, or null when it starts shown: the close-up car only,
+ *  so no shadow planes, no MLOD/LLOD copies and, on a car with `stk` variants, no non-stock variant.
+ *  `customizable` is hasStockVariants() of the set. The diagnostic report prints the reason. */
+export function defaultHiddenReason(mesh: MeshGeometry, document: PckDocument | null, customizable: boolean) {
+  if (isShadowPlane(mesh.name)) return "shadow plane";
+  if (isLowLodOnly(mesh, document)) return "MLOD/LLOD only";
+  if (mesh.origin === "loose" && customizable && !mesh.stock && mesh.category !== "lodgroup") return "customization variant (not stk, not lodgroup) on a car with stk variants";
+  return null;
+}
+
 export type PieceIdInfo = {
   /** The ID to show/edit — the HLOD/MLOD/LLOD table's value when there's a clean match, since
    *  that's what the engine actually reads. Falls back to the standalone file's own byte only
