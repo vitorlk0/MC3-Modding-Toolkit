@@ -35,6 +35,15 @@ dropped onto the window. Keep a backup of your files anyway.
 | **Audio** | Engine audio curves and values, with an audible preview from the game's sound banks; RPM ranges rescale to a new top RPM, and curves copy across levels |
 | **ISO Install** | Installs the finished cars straight into the game's ISO, into the slot each was made for or any other; can rename the slot and change its dealership card, icon and special ability |
 
+## Reporting a problem
+
+If the tool shows something it shouldn't (a car opening without its shell, say), open the car the
+way you usually do and use **Help ▸ Save diagnostic report…**. It saves a text file listing what the
+tool read, decided and drew, your graphics card and the errors since it opened: file names, sizes
+and hashes, never file contents, with your user folder masked. Send that file along with the report.
+**Help ▸ Compare diagnostic reports…** lists the rows that differ between two of them, such as one
+from the computer with the problem and one made elsewhere with the same files.
+
 ## Credits
 
 Built on the community's investigation of the game's files: Bruno (@offlbruno) and ZNX (@znxee)
