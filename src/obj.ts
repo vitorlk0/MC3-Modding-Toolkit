@@ -676,7 +676,9 @@ function makePckFile(streams: MeshStream[], virtualOffset: number) {
     padTo(pointerChunk, 16, 0xcd);
 
     mainPointers.push(virtualOffset + offset - pointerBlockSize + 16);
-    tail.push(...amountChunk, ...pointerChunk, ...blockBytes);
+    // Not spread: a dense group's blocks run past V8's argument limit ("Maximum call stack size exceeded").
+    tail.push(...amountChunk, ...pointerChunk);
+    for (const byte of blockBytes) tail.push(byte);
     fileSize += blockSize + pointerBlockSize;
   }
 
