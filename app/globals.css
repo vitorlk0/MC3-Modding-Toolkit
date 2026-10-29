@@ -59,6 +59,13 @@ button { color:inherit; }
 .mesh-piece-lod.embedded { color:var(--lime); }
 .mesh-piece-lod.warn { color:#e0a25a; }
 .viewer-pane.mesh-editor-3d { grid-column:auto; grid-row:auto; flex:1; min-height:0; border-left:0; }
+.mesh-editor-3d .view-controls { flex-wrap:wrap; }
+.selection-tools { display:flex; flex-wrap:wrap; align-items:center; gap:5px; }
+.selection-tools>i { width:1px; height:16px; margin:0 3px; background:#343b34; }
+.viewer-stage.box-tool .viewer-canvas { cursor:crosshair; }
+.selection-marquee { position:absolute; z-index:3; border:1px dashed #ffb35c; background:rgba(255,154,31,.08); pointer-events:none; }
+.selection-marquee[hidden] { display:none; }
+.viewer-stats .stat-selected { border-color:#6b4a22; color:#ffb35c; }
 .shader-legend { position:absolute; left:10px; bottom:10px; max-width:calc(100% - 20px); display:flex; flex-wrap:wrap; gap:7px; pointer-events:auto; }
 .shader-legend-chip { position:relative; display:flex; align-items:center; gap:7px; padding:6px 11px; border:1px solid #2b322b; border-radius:7px; background:rgba(13,16,14,.85); color:#9aa19a; font:14px var(--mono); backdrop-filter:blur(5px); }
 .shader-legend-chip:hover { border-color:#4c5749; color:#d7dcd6; }
@@ -136,6 +143,9 @@ button { color:inherit; }
 .piece-size.none { color:#4c534c; }
 .piece-size.shrank { color:#6cb6e8; }
 .piece-size.grew { color:#e8776c; }
+.mesh-piece-tris { flex:0 0 auto; display:flex; gap:5px; font:10px var(--mono); white-space:nowrap; }
+.mesh-piece-tris .sel { color:#ffb35c; }
+.mesh-piece-tris .hid { color:#7d867d; }
 .mesh-shader-chips { display:flex; flex-wrap:wrap; gap:4px; padding:0 0 2px 42px; }
 .mesh-shader-chips:empty { display:none; }
 .shader-id-chip { border-color:#2a3238; background:#111417; color:#8fb4d8; }

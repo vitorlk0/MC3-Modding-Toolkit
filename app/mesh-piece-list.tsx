@@ -43,7 +43,7 @@ function lodTag(document: PckDocument | null, mesh: MeshGeometry) {
   return { text, className: embedded ? "embedded" : (info.standaloneMismatch ? "warn" : ""), ...info };
 }
 
-export function MeshPieceList({ meshes, document, visibleNames, onSetVisible, selection, onSelect, onEditPieceId, onEditGroupShader, onUpdateEmbedded, describeEmbedTarget, describePieceSize, onPieceContextMenu, revealRequest, width }: {
+export function MeshPieceList({ meshes, document, visibleNames, onSetVisible, selection, onSelect, onEditPieceId, onEditGroupShader, onUpdateEmbedded, describeEmbedTarget, describePieceSize, describeTriangles, onPieceContextMenu, revealRequest, width }: {
   meshes: MeshGeometry[];
   document: PckDocument | null;
   visibleNames: Set<string>;
@@ -55,6 +55,8 @@ export function MeshPieceList({ meshes, document, visibleNames, onSetVisible, se
   onUpdateEmbedded(meshName: string): void;
   describeEmbedTarget(meshName: string): { targets: string[]; inserting: boolean; hasRow: boolean };
   describePieceSize(meshName: string): { embedded: number | null; embeddedSaved: number | null; loose: number | null; looseSaved: number | null; embeddedHere: boolean };
+  /** Triangles of the piece picked / hidden in the viewer. */
+  describeTriangles(mesh: MeshGeometry): { selected: number; hidden: number };
   onPieceContextMenu(mesh: MeshGeometry, x: number, y: number): void;
   revealRequest: { meshName: string } | null;
   width: number;
@@ -143,6 +145,7 @@ export function MeshPieceList({ meshes, document, visibleNames, onSetVisible, se
             const visible = visibleNames.has(mesh.name);
             const tag = lodTag(document, mesh);
             const firstGroup = mesh.groupShaderIds.length ? 0 : null;
+            const tris = describeTriangles(mesh);
             return <div key={mesh.name} data-mesh-name={mesh.name} className={`flat-anchor-row mesh-piece-row ${active ? "selected" : ""}`} onContextMenu={(event) => { event.preventDefault(); onSelect({ meshName: mesh.name, meshId: tag.displayId, shaderId: mesh.groupShaderIds[0] ?? null, group: firstGroup, triangleIndex: null }); onPieceContextMenu(mesh, event.clientX, event.clientY); }}>
               <div className="mesh-piece-row-top">
                 <PieceIdChip meshId={tag.displayId} editable={tag.editable} onCommit={(newId) => onEditPieceId(mesh.name, tag.entries, newId)} />
@@ -151,6 +154,10 @@ export function MeshPieceList({ meshes, document, visibleNames, onSetVisible, se
                   <span className="mesh-piece-meta">
                     <small className={`mesh-piece-lod ${tag.className}`} title={mesh.origin === "embedded" ? tr("Baked into the car PCK with no loose mesh.pck beside it — read straight from the PCK. Nothing to sync; right-click to export it.") : undefined}>{tag.text}</small>
                     <PieceSize size={describePieceSize(mesh.name)} />
+                    {(tris.selected > 0 || tris.hidden > 0) && <small className="mesh-piece-tris" title={tr("Triangles of this piece selected / hidden in the viewer · Alt+H shows every hidden triangle again")}>
+                      {tris.selected > 0 && <span className="sel">{tr(`${tris.selected} sel`)}</span>}
+                      {tris.hidden > 0 && <span className="hid">{tr(`${tris.hidden} hidden`)}</span>}
+                    </small>}
                   </span>
                 </button>
                 {(() => {

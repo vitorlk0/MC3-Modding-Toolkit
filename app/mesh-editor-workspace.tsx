@@ -1,5 +1,5 @@
 import { tr, Tx } from "./i18n";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { LodMeshEntry, PckDocument } from "../src/pck";
 import { defaultHiddenReason, hasStockVariants, matchLodEntries, type MeshGeometry, type MeshPckDocument } from "../src/mesh";
 import { registerDiagnosticSource } from "./diagnostics";
@@ -8,6 +8,7 @@ import { MeshEditorViewer, type MeshSelection } from "./mesh-editor-viewer";
 import { MeshPieceList } from "./mesh-piece-list";
 import { ResizeHandle } from "./resize-handle";
 import { ContextMenu, type ContextMenuState } from "./context-menu";
+import { applyTriangleCommand, countOf, NO_TRIANGLES, type TriangleCommand, type TriangleState } from "./mesh-selection";
 
 const plannedFeatures = [
   { title: "Piece ID + shader editing", detail: "Edit a piece's ID and per-group shader IDs, kept in sync across the Player, Garage and Opponent PCKs." },
@@ -67,9 +68,32 @@ export function MeshEditorWorkspace({ document, activeRole, slots, onSelectRole,
 }) {
   const [selection, setSelection] = useState<MeshSelection | null>(null);
   const [visibleNames, setVisibleNames] = useState<Set<string>>(() => defaultVisibleNames(meshes, document));
-  useEffect(() => { setVisibleNames(defaultVisibleNames(meshes, document)); setSelection(null); }, [meshes, document]);
+  // `meshes` is a new array after every edit (each piece is re-parsed), so visibility only goes back
+  // to the defaults for another PCK; a piece that shows up later (embedded-only pieces, Convert OBJs)
+  // gets its own default without touching what was shown or hidden by hand.
+  const knownPiecesRef = useRef<{ document: PckDocument | null; names: Set<string> }>({ document: null, names: new Set() });
+  useEffect(() => {
+    const known = knownPiecesRef.current;
+    if (known.document !== document) setVisibleNames(defaultVisibleNames(meshes, document));
+    else {
+      const added = meshes.filter((mesh) => !known.names.has(mesh.name));
+      if (added.length) {
+        const defaults = defaultVisibleNames(meshes, document);
+        setVisibleNames((current) => { const next = new Set(current); for (const mesh of added) if (defaults.has(mesh.name)) next.add(mesh.name); return next; });
+      }
+    }
+    knownPiecesRef.current = { document, names: new Set(meshes.map((mesh) => mesh.name)) };
+    setSelection(null);
+  }, [meshes, document]);
   // What the Meshes tab is showing right now, for the diagnostic report.
   useEffect(() => registerDiagnosticSource("meshEditor", () => ({ role: activeRole, visibleNames })), [activeRole, visibleNames]);
+  // Picked and hidden triangles: view state that outlives shader/ID edits (mesh-selection.ts drops a
+  // piece's flags on its own once that piece's geometry changes), cleared with the vehicle set.
+  const [triangles, setTriangles] = useState<TriangleState>({ selected: NO_TRIANGLES, hidden: NO_TRIANGLES });
+  useEffect(() => { setTriangles({ selected: NO_TRIANGLES, hidden: NO_TRIANGLES }); }, [vehicleBase]);
+  const visibleMeshes = useMemo(() => meshes.filter((mesh) => visibleNames.has(mesh.name)), [meshes, visibleNames]);
+  const runTriangleCommand = (command: TriangleCommand) => setTriangles((current) => applyTriangleCommand(current, command, visibleMeshes));
+  const describeTriangles = (mesh: MeshGeometry) => ({ selected: countOf(triangles.selected, mesh), hidden: countOf(triangles.hidden, mesh) });
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
   // A fresh object per request so double-clicking the same piece twice still re-scrolls to it.
   const [revealRequest, setRevealRequest] = useState<{ meshName: string } | null>(null);
@@ -151,9 +175,9 @@ export function MeshEditorWorkspace({ document, activeRole, slots, onSelectRole,
         <button className="folder-button" onClick={onOpenFolder}>{tr("Open folder…")}</button>
       </section>
       <div className="mesh-editor-body">
-        <MeshPieceList key={vehicleBase} meshes={meshes} document={document} visibleNames={visibleNames} onSetVisible={setVisible} selection={selection} onSelect={setSelection} onEditPieceId={onEditPieceId} onEditGroupShader={onEditGroupShader} onUpdateEmbedded={onUpdateEmbedded} describeEmbedTarget={describeEmbedTarget} describePieceSize={describePieceSize} onPieceContextMenu={openPieceMenu} revealRequest={revealRequest} width={listWidth} />
+        <MeshPieceList key={vehicleBase} meshes={meshes} document={document} visibleNames={visibleNames} onSetVisible={setVisible} selection={selection} onSelect={setSelection} onEditPieceId={onEditPieceId} onEditGroupShader={onEditGroupShader} onUpdateEmbedded={onUpdateEmbedded} describeEmbedTarget={describeEmbedTarget} describePieceSize={describePieceSize} onPieceContextMenu={openPieceMenu} revealRequest={revealRequest} width={listWidth} describeTriangles={describeTriangles} />
         <ResizeHandle variant="resize-mesh-list" onDrag={onResizeList} />
-        <MeshEditorViewer meshes={meshes} visibleNames={visibleNames} document={document} selection={selection} onSelect={setSelection} onPieceContextMenu={openPieceMenu} onRevealPiece={(meshName) => setRevealRequest({ meshName })} onEditPieceId={editSelectedPieceId} onEditGroupShader={editSelectedGroupShader} onUndo={onUndo} onRedo={onRedo} canUndo={canUndo} canRedo={canRedo} />
+        <MeshEditorViewer meshes={meshes} visibleNames={visibleNames} document={document} selection={selection} onSelect={setSelection} onPieceContextMenu={openPieceMenu} onRevealPiece={(meshName) => setRevealRequest({ meshName })} onEditPieceId={editSelectedPieceId} onEditGroupShader={editSelectedGroupShader} onUndo={onUndo} onRedo={onRedo} canUndo={canUndo} canRedo={canRedo} selectedTriangles={triangles.selected} hiddenTriangles={triangles.hidden} onTriangleCommand={runTriangleCommand} />
       </div>
       {contextMenu && <ContextMenu menu={contextMenu} onClose={closeContextMenu} />}
     </main>
