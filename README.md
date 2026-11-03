@@ -27,9 +27,9 @@ dropped onto the window. Keep a backup of your files anyway.
 
 | Tab | What it does |
 | --- | --- |
-| **Tools** | Loose-file tools: Visual Shop menu editor, Carcfg Randomizer, Flash Parts Mapper, Car PCK Mesh Injector, Mesh ID Sync, Car PCK Cleaner, Vehicle DAT Builder, Compact ISO, Exhaust Tips, Neon & Shadow and Slot Retarget |
+| **Tools** | Loose-file tools: Visual Shop menu editor, Carcfg Randomizer, Flash Parts Mapper, Car PCK Mesh Injector, Mesh ID Sync, Car PCK Cleaner, Vehicle DAT (build / extract), Compact ISO, Exhaust Tips, Neon & Shadow and Slot Retarget |
 | **Anchors** | Anchor positions and rotations with a 3D preview and move/rotate gizmo, multi-select, mirroring and wheel/exhaust sync, plus the garage shop cameras |
-| **Meshes** | Piece IDs, shader IDs, OBJ conversion (compact by default), re-embedding loose `mesh.pck` files, removing an embedded copy, and OBJ export |
+| **Meshes** | Triangle selection and moving triangles to another shader, piece IDs, shader IDs, OBJ conversion (compact by default), re-embedding loose `mesh.pck` files, removing an embedded copy, and OBJ export |
 | **Performance** | Vehicle physics and performance values across all three PCKs at once |
 | **Textures** | Finds, previews and replaces PS2 textures in a PCK |
 | **Audio** | Engine audio curves and values, with an audible preview from the game's sound banks; RPM ranges rescale to a new top RPM, and curves copy across levels |
@@ -95,6 +95,16 @@ before the document is marked as saved.
 
 - Colors the model by shader ID and identifies the piece, material group and shader behind any
   triangle you click.
+- **Selects triangles** Blender-style: click / Shift-click, linked (L, Ctrl+L, stopping at the
+  shader by default), same shader (Shift+G) in this part or all parts, box (B) and brush (C, Shift+wheel
+  sizes it), with X-ray, select all / none / invert, and hide / isolate / reveal. Selection steps are
+  part of Undo.
+- **Assign shader** moves the selected triangles to another shader, picked by name from the car's own
+  shader list (carpaint, chrome, carbon_fiber…): into the piece's slot with that shader, or a new slot.
+  The piece isn't re-encoded: its packets stay byte for byte, the moved triangles are switched off in
+  place and written again in the target slot (~34 bytes each), keeping each vertex's crash-deformation
+  data. Moving them back costs nothing. Every copy of the piece is updated: the loose file and the
+  embedded copies.
 - Edits a piece's **ID**, mirrored across the HLOD/MLOD/LLOD tables, every embedded copy and the
   loose `mesh.pck`.
 - Edits a piece's **shader IDs** per material group, written to every loaded PCK that embeds the
