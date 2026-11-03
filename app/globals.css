@@ -61,8 +61,15 @@ button { color:inherit; }
 .viewer-pane.mesh-editor-3d { grid-column:auto; grid-row:auto; flex:1; min-height:0; border-left:0; }
 .mesh-editor-3d .view-controls { flex-wrap:wrap; }
 .selection-tools { display:flex; flex-wrap:wrap; align-items:center; gap:5px; }
-.selection-tools>i { width:1px; height:16px; margin:0 3px; background:#343b34; }
-.viewer-stage.box-tool .viewer-canvas { cursor:crosshair; }
+.view-controls.mesh-toolbar { flex-direction:column; align-items:stretch; gap:6px; }
+.mesh-toolbar-row { display:flex; flex-wrap:wrap; align-items:center; gap:5px; }
+.mesh-toolbar-row>i { width:1px; height:16px; margin:0 3px; background:#343b34; }
+.mesh-toolbar-label { width:54px; flex:none; color:var(--lime); font:600 9px var(--mono); letter-spacing:.12em; }
+.assign-shader>button:not(:disabled) { border-color:#6b4a22; color:#ffb35c; }
+.assign-shader>button:not(:disabled):hover { border-color:#ffb35c; color:#fff; }
+.selection-brush { position:absolute; z-index:3; border:1px solid #ffb35c; border-radius:50%; background:rgba(255,154,31,.06); pointer-events:none; }
+.selection-brush[hidden] { display:none; }
+.viewer-stage.select-tool .viewer-canvas { cursor:crosshair; }
 .selection-marquee { position:absolute; z-index:3; border:1px dashed #ffb35c; background:rgba(255,154,31,.08); pointer-events:none; }
 .selection-marquee[hidden] { display:none; }
 .viewer-stats .stat-selected { border-color:#6b4a22; color:#ffb35c; }
@@ -989,6 +996,7 @@ button { color:inherit; }
 .segmented { display:flex; border:1px solid #343b34; border-radius:6px; overflow:hidden; }
 .segmented button { border:0; border-left:1px solid #343b34; padding:5px 12px; background:#181c18; color:#9ba39b; font-size:10px; cursor:pointer; }
 .segmented button:first-child { border-left:0; }
+.dat-mode-switch { align-self:flex-start; width:max-content; margin-bottom:14px; }
 .segmented button:hover { color:#fff; }
 .segmented button.active { background:#1c2415; color:var(--lime-soft); }
 .mirror-button.active { border-color:var(--lime); background:#1c2415; color:var(--lime-soft); }

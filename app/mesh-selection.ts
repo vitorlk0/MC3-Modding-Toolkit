@@ -29,7 +29,8 @@ export type TriangleCommand =
   | { kind: "grow"; delimitShader: boolean }
   | { kind: "shader"; shaderId: number; deselect: boolean }
   | { kind: "similar"; scope: SimilarScope }
-  | { kind: "box"; hits: Map<string, number[]>; mode: SelectMode }
+  /** `stroke` numbers a brush stroke: its dabs are one step in the undo history. */
+  | { kind: "box"; hits: Map<string, number[]>; mode: SelectMode; stroke?: number }
   | { kind: "hide" }
   | { kind: "isolate" }
   | { kind: "reveal" };

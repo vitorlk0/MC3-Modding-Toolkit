@@ -34,6 +34,12 @@ type ViewerRuntime = {
 };
 type TriangleHit = { parsed: MeshGeometry; triangle: number };
 type BoxRect = { left: number; top: number; right: number; bottom: number };
+type SelectTool = "none" | "box" | "brush";
+type PickBuffer = { pixels: Uint8Array; width: number; height: number; ratio: number; ranges: { name: string; faceMap: Uint32Array; start: number }[] };
+/** The circle's radius in CSS pixels, kept between sessions (a per-viewer convenience). */
+const BRUSH_RADIUS_KEY = "mc3pae.brushRadius";
+const BRUSH_MIN = 4, BRUSH_MAX = 300;
+function loadBrushRadius() { try { const value = Number(localStorage.getItem(BRUSH_RADIUS_KEY)); return value >= BRUSH_MIN && value <= BRUSH_MAX ? value : 30; } catch { return 30; } }
 
 const VIEW_OFFSETS: Record<ViewDirection, THREE.Vector3> = {
   front: new THREE.Vector3(0, 0, -1), back: new THREE.Vector3(0, 0, 1),
@@ -125,7 +131,8 @@ function ShaderChip({ id, name, rgba, active, onRgbChange, onAlphaChange, onSele
   const rgbaCss = `rgba(${r255}, ${g255}, ${b255}, ${a})`;
   const alphaTrack = { "--alpha-track": `linear-gradient(to right, transparent, ${solidCss}), ${CHECKERBOARD}` } as React.CSSProperties;
   return <div className={`shader-legend-chip ${active ? "active" : ""}`} ref={ref}>
-    <button type="button" className="shader-swatch" style={{ backgroundImage: `linear-gradient(${rgbaCss}, ${rgbaCss}), ${CHECKERBOARD}` }} onClick={(event) => { if (event.shiftKey) onSelectTriangles(event.ctrlKey || event.metaKey); else setOpen((value) => !value); }} title={tr(`Shader ${hex(id, 2)}${name ? ` ${name}` : ""} — click to recolor, Shift-click to select its triangles (Ctrl+Shift to deselect)`)} />
+    {/* `background`, not backgroundImage: the checkerboard carries its position/size, which only the shorthand accepts. */}
+    <button type="button" className="shader-swatch" style={{ background: `linear-gradient(${rgbaCss}, ${rgbaCss}), ${CHECKERBOARD}` }} onClick={(event) => { if (event.shiftKey) onSelectTriangles(event.ctrlKey || event.metaKey); else setOpen((value) => !value); }} title={tr(`Shader ${hex(id, 2)}${name ? ` ${name}` : ""} — click to recolor, Shift-click to select its triangles (Ctrl+Shift to deselect)`)} />
     <span>{hex(id, 2)}</span>
     {open && <div className="shader-picker-popover">
       <input type="color" className="shader-picker-color" value={rgbToHex([r, g, b])} onChange={(event) => onRgbChange(event.target.value)} />
@@ -157,6 +164,7 @@ export function MeshEditorViewer({ meshes, visibleNames, document, selection, on
 }) {
   const hostRef = useRef<HTMLDivElement>(null);
   const marqueeRef = useRef<HTMLDivElement>(null);
+  const brushRef = useRef<HTMLDivElement>(null);
   const runtimeRef = useRef<ViewerRuntime | null>(null);
   const objectsRef = useRef(new Map<THREE.Object3D, MeshGeometry>());
   const edgesRef = useRef(new Map<THREE.Object3D, THREE.LineSegments>());
@@ -176,16 +184,17 @@ export function MeshEditorViewer({ meshes, visibleNames, document, selection, on
   const [renderMode, setRenderMode] = useState<RenderMode>("solid");
   const renderModeRef = useRef(renderMode);
   const [uvChecker, setUvChecker] = useState(false);
-  const [boxTool, setBoxTool] = useState(false);
+  // Selection tool on the left button: none (orbit), box or brush.
+  const [tool, setTool] = useState<SelectTool>("none");
   const [xray, setXray] = useState(false);
   // On by default: the tab is about shaders, so Linked normally means "this patch of this shader".
   const [delimitShader, setDelimitShader] = useState(true);
   const [similarScope, setSimilarScope] = useState<SimilarScope>("part");
-  const toolsRef = useRef({ boxTool, xray, delimitShader, similarScope });
+  const toolsRef = useRef({ tool, xray, delimitShader, similarScope });
   useEffect(() => {
     documentRef.current = document; contextMenuRef.current = onPieceContextMenu; revealRef.current = onRevealPiece;
     commandRef.current = onTriangleCommand; selectedRef.current = selectedTriangles; hiddenRef.current = hiddenTriangles;
-    renderModeRef.current = renderMode; toolsRef.current = { boxTool, xray, delimitShader, similarScope };
+    renderModeRef.current = renderMode; toolsRef.current = { tool, xray, delimitShader, similarScope };
   });
   const [colorOverrides, setColorOverrides] = useState<Map<number, Rgba>>(new Map());
   const getColor = useCallback((shaderId: number): Rgba => {
@@ -259,12 +268,15 @@ export function MeshEditorViewer({ meshes, visibleNames, document, selection, on
     appliedHiddenRef.current.set(object, hidden);
     const previous = edgesRef.current.get(object);
     if (previous) { object.remove(previous); previous.geometry.dispose(); }
-    // EdgesGeometry reads the whole index, not the draw range, so it gets a trimmed copy. That copy
-    // is never drawn (and never disposed: it shares the position buffer with the piece).
+    // Every triangle edge, like Blender's wireframe — not EdgesGeometry, which leaves out the edges
+    // between faces in the same plane (a flat quad's diagonal). WireframeGeometry reads the whole
+    // index, not the draw range, so it gets a trimmed copy. That copy is never drawn (and never
+    // disposed: it shares the position buffer with the piece).
     const visibleOnly = new THREE.BufferGeometry();
     visibleOnly.setAttribute("position", object.geometry.getAttribute("position"));
     visibleOnly.setIndex(new THREE.BufferAttribute((object.geometry.getIndex()!.array as Uint32Array).slice(0, faceMap.length * 3), 1));
-    const edges = new THREE.LineSegments(new THREE.EdgesGeometry(visibleOnly, 1), runtime.edgesMaterial);
+    const edges = new THREE.LineSegments(new THREE.WireframeGeometry(visibleOnly), runtime.edgesMaterial);
+    edges.renderOrder = 3;
     edges.visible = renderModeRef.current === "solid-wire";
     object.add(edges);
     edgesRef.current.set(object, edges);
@@ -311,7 +323,8 @@ export function MeshEditorViewer({ meshes, visibleNames, document, selection, on
     const axes = new THREE.AxesHelper(0.65); axes.position.set(-0.01, 0.01, -0.01); scene.add(axes);
     scene.add(new THREE.HemisphereLight(0xdce8d8, 0x151915, 2.3));
     const key = new THREE.DirectionalLight(0xffffff, 1.4); key.position.set(4, 7, 5); scene.add(key);
-    const edgesMaterial = new THREE.LineBasicMaterial({ color: 0x000000 });
+    // Transparent only to be drawn in the late pass, after the selection tint, so it never covers the lines.
+    const edgesMaterial = new THREE.LineBasicMaterial({ color: 0x000000, transparent: true });
     // MC3 stores V pointing down (the OBJ export writes 1 - v), so the image is sampled from its top
     // row at v = 0 — the same placement Blender shows for an exported OBJ.
     const uvChecker = new THREE.TextureLoader().load(UV_CHECKER_URL);
@@ -371,6 +384,8 @@ export function MeshEditorViewer({ meshes, visibleNames, document, selection, on
     const handleClick = (event: MouseEvent) => {
       const start = leftDown; leftDown = null;
       if (moved(start, event)) return;
+      // With the brush a press already painted its circle; the click that follows must not replace it.
+      if (toolsRef.current.tool === "brush") return;
       const hit = pickAt(event, !event.shiftKey);
       if (hit) commandRef.current({ kind: "pick", meshName: hit.parsed.name, triangle: hit.triangle, toggle: event.shiftKey });
       else if (!event.shiftKey) commandRef.current({ kind: "clear" });
@@ -385,10 +400,14 @@ export function MeshEditorViewer({ meshes, visibleNames, document, selection, on
       if (hit) contextMenuRef.current(hit.parsed, event.clientX, event.clientY);
     };
 
-    // Box selection: with the Box tool on, a left drag draws the box (OrbitControls has its left
-    // button switched off then, see the boxTool effect) and releasing it selects what it covers.
+    // Box and brush selection: with either tool on, the left button selects (OrbitControls has its
+    // left button switched off then, see the tool effect). The box selects what it covers when it
+    // is released; the brush adds (Ctrl: removes) what passes under its circle while dragging.
     let box: { startX: number; startY: number; endX: number; endY: number } | null = null;
+    let stroke: { id: number; buffer: PickBuffer | null; mode: SelectMode; done: Map<string, Set<number>> } | null = null;
+    let strokes = 0;
     let hover: { x: number; y: number } | null = null;
+    let brushRadius = loadBrushRadius();
     const drawMarquee = () => {
       const marquee = marqueeRef.current; if (!marquee) return;
       if (!box) { marquee.hidden = true; return; }
@@ -397,40 +416,86 @@ export function MeshEditorViewer({ meshes, visibleNames, document, selection, on
       marquee.style.width = `${Math.abs(box.endX - box.startX)}px`; marquee.style.height = `${Math.abs(box.endY - box.startY)}px`;
     };
     const localPoint = (event: MouseEvent) => { const rect = renderer.domElement.getBoundingClientRect(); return { x: event.clientX - rect.left, y: event.clientY - rect.top }; };
+    const drawBrush = (point: { x: number; y: number } | null) => {
+      const circle = brushRef.current; if (!circle) return;
+      if (!point || toolsRef.current.tool !== "brush") { circle.hidden = true; return; }
+      circle.hidden = false;
+      circle.style.left = `${point.x - brushRadius}px`; circle.style.top = `${point.y - brushRadius}px`;
+      circle.style.width = circle.style.height = `${brushRadius * 2}px`;
+    };
+    /** One dab of the brush: what lies under the circle and wasn't taken earlier in this stroke. */
+    const paint = (point: { x: number; y: number }) => {
+      if (!stroke) return;
+      const inside = (x: number, y: number) => (x - point.x) ** 2 + (y - point.y) ** 2 <= brushRadius ** 2;
+      const hits = stroke.buffer
+        ? pickBufferHits(stroke.buffer, { left: point.x - brushRadius, right: point.x + brushRadius, top: point.y - brushRadius, bottom: point.y + brushRadius }, inside)
+        : trianglesThrough(inside);
+      const fresh = new Map<string, number[]>();
+      for (const [name, list] of hits) {
+        const done = stroke.done.get(name) ?? new Set<number>();
+        const added = list.filter((triangle) => !done.has(triangle));
+        added.forEach((triangle) => done.add(triangle));
+        stroke.done.set(name, done);
+        if (added.length) fresh.set(name, added);
+      }
+      if (fresh.size) commandRef.current({ kind: "box", hits: fresh, mode: stroke.mode, stroke: stroke.id });
+    };
     const handlePointerDown = (event: PointerEvent) => {
       if (event.button === 0) leftDown = { x: event.clientX, y: event.clientY };
       if (event.button === 2) rightDown = { x: event.clientX, y: event.clientY };
-      if (event.button === 0 && toolsRef.current.boxTool) {
-        const point = localPoint(event);
+      if (event.button !== 0) return;
+      const point = localPoint(event);
+      if (toolsRef.current.tool === "box") {
         box = { startX: point.x, startY: point.y, endX: point.x, endY: point.y };
         renderer.domElement.setPointerCapture(event.pointerId);
         drawMarquee();
+      } else if (toolsRef.current.tool === "brush") {
+        // The camera can't move during a stroke, so the visible-triangle buffer is rendered once.
+        strokes += 1;
+        stroke = { id: strokes, buffer: toolsRef.current.xray ? null : renderPickBuffer(), mode: event.ctrlKey || event.metaKey ? "remove" : "add", done: new Map() };
+        renderer.domElement.setPointerCapture(event.pointerId);
+        paint(point);
       }
     };
     const handlePointerMove = (event: PointerEvent) => {
       hover = { x: event.clientX, y: event.clientY };
-      if (!box) return;
       const point = localPoint(event);
+      drawBrush(point);
+      if (stroke) paint(point);
+      if (!box) return;
       box.endX = point.x; box.endY = point.y;
       drawMarquee();
     };
     const handlePointerUp = (event: PointerEvent) => {
-      if (event.button !== 0 || !box) return;
+      if (event.button !== 0) return;
+      if (stroke) { stroke = null; return; }
+      if (!box) return;
       const finished = box; box = null; drawMarquee();
       // A box this small was a click; the click handler picks the triangle.
       if (Math.abs(finished.endX - finished.startX) <= DRAG_THRESHOLD && Math.abs(finished.endY - finished.startY) <= DRAG_THRESHOLD) return;
       const rect = { left: Math.min(finished.startX, finished.endX), right: Math.max(finished.startX, finished.endX), top: Math.min(finished.startY, finished.endY), bottom: Math.max(finished.startY, finished.endY) };
       const mode: SelectMode = event.shiftKey ? "add" : event.ctrlKey || event.metaKey ? "remove" : "replace";
-      commandRef.current({ kind: "box", hits: toolsRef.current.xray ? boxHitsThrough(rect) : boxHitsVisible(rect), mode });
+      const inside = (x: number, y: number) => x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
+      if (toolsRef.current.xray) { commandRef.current({ kind: "box", hits: trianglesThrough(inside), mode }); return; }
+      const buffer = renderPickBuffer();
+      commandRef.current({ kind: "box", hits: buffer ? pickBufferHits(buffer, rect, () => true) : new Map(), mode });
     };
-    const handlePointerLeave = () => { hover = null; };
+    const handlePointerLeave = () => { hover = null; drawBrush(null); };
+    // Shift+wheel sizes the brush. Caught on the way down, before OrbitControls zooms with it.
+    const handleWheel = (event: WheelEvent) => {
+      if (event.target !== renderer.domElement || toolsRef.current.tool !== "brush" || !event.shiftKey) return;
+      event.preventDefault(); event.stopPropagation();
+      // With Shift held, some browsers report the wheel as horizontal scrolling.
+      const delta = event.deltaY || event.deltaX;
+      brushRadius = Math.round(Math.min(BRUSH_MAX, Math.max(BRUSH_MIN, brushRadius * (delta > 0 ? 0.9 : 1.1))));
+      try { localStorage.setItem(BRUSH_RADIUS_KEY, String(brushRadius)); } catch { /* storage unavailable */ }
+      drawBrush(localPoint(event));
+    };
 
-    /** X-ray box: every visible triangle whose center projects inside the box, in front of or behind others. */
-    const boxHitsThrough = (rect: BoxRect) => {
+    /** X-ray: every visible triangle whose center lands inside the area on screen, in front of or behind others. */
+    const trianglesThrough = (inside: (x: number, y: number) => boolean) => {
       const runtime = runtimeRef.current!;
       const width = Math.max(renderer.domElement.clientWidth, 1); const height = Math.max(renderer.domElement.clientHeight, 1);
-      const [x0, x1] = [rect.left / width * 2 - 1, rect.right / width * 2 - 1];
-      const [y0, y1] = [-(rect.bottom / height) * 2 + 1, -(rect.top / height) * 2 + 1];
       const hits = new Map<string, number[]>();
       const point = new THREE.Vector3();
       for (const [object, parsed] of objectsRef.current) {
@@ -441,19 +506,19 @@ export function MeshEditorViewer({ meshes, visibleNames, document, selection, on
           const a = parsed.indices[triangle * 3] * 3, b = parsed.indices[triangle * 3 + 1] * 3, c = parsed.indices[triangle * 3 + 2] * 3;
           const p = parsed.positions;
           point.set((p[a] + p[b] + p[c]) / 3, (p[a + 1] + p[b + 1] + p[c + 1]) / 3, (p[a + 2] + p[b + 2] + p[c + 2]) / 3).applyMatrix4(object.matrixWorld).project(runtime.camera);
-          if (point.z >= -1 && point.z <= 1 && point.x >= x0 && point.x <= x1 && point.y >= y0 && point.y <= y1) found.push(triangle);
+          if (point.z >= -1 && point.z <= 1 && inside((point.x + 1) / 2 * width, (1 - point.y) / 2 * height)) found.push(triangle);
         }
         if (found.length) hits.set(parsed.name, found);
       }
       return hits;
     };
-    /** Regular box: the triangles that cover at least one pixel inside the box (see PICK_VERTEX_SHADER). */
-    const boxHitsVisible = (rect: BoxRect) => {
+    /** Renders every visible triangle in a flat color that encodes its number (see PICK_VERTEX_SHADER)
+     *  and reads the whole frame back, so only what the camera actually sees gets picked. */
+    const renderPickBuffer = (): PickBuffer | null => {
       const runtime = runtimeRef.current!;
       const canvas = renderer.domElement;
-      const ratio = canvas.width / Math.max(canvas.clientWidth, 1);
       const pickScene = new THREE.Scene();
-      const ranges: { name: string; faceMap: Uint32Array; start: number }[] = [];
+      const ranges: PickBuffer["ranges"] = [];
       let nextId = 1;
       for (const [object, parsed] of objectsRef.current) {
         const faceMap = faceMapsRef.current.get(object); if (!faceMap?.length) continue;
@@ -478,27 +543,36 @@ export function MeshEditorViewer({ meshes, visibleNames, document, selection, on
         ranges.push({ name: parsed.name, faceMap, start: nextId });
         nextId += faceMap.length;
       }
-      const hits = new Map<string, number[]>();
-      if (!ranges.length) return hits;
+      if (!ranges.length) return null;
       const target = new THREE.WebGLRenderTarget(canvas.width, canvas.height);
       const clearColor = renderer.getClearColor(new THREE.Color()); const clearAlpha = renderer.getClearAlpha();
       renderer.setRenderTarget(target); renderer.setClearColor(0x000000, 1);
       renderer.render(pickScene, runtime.camera);
       renderer.setRenderTarget(null); renderer.setClearColor(clearColor, clearAlpha);
-      const x = Math.max(0, Math.floor(rect.left * ratio)); const right = Math.min(canvas.width, Math.ceil(rect.right * ratio));
-      const top = Math.max(0, Math.floor(rect.top * ratio)); const bottom = Math.min(canvas.height, Math.ceil(rect.bottom * ratio));
-      const width = right - x; const height = bottom - top;
-      const ids = new Set<number>();
-      if (width > 0 && height > 0) {
-        const pixels = new Uint8Array(width * height * 4);
-        // Render-target rows count from the bottom.
-        renderer.readRenderTargetPixels(target, x, canvas.height - bottom, width, height, pixels);
-        for (let i = 0; i < pixels.length; i += 4) { const id = pixels[i] | (pixels[i + 1] << 8) | (pixels[i + 2] << 16); if (id) ids.add(id); }
-      }
+      const pixels = new Uint8Array(canvas.width * canvas.height * 4);
+      renderer.readRenderTargetPixels(target, 0, 0, canvas.width, canvas.height, pixels);
       target.dispose();
       for (const child of pickScene.children) (child as THREE.Mesh).geometry.dispose();
+      return { pixels, width: canvas.width, height: canvas.height, ratio: canvas.width / Math.max(canvas.clientWidth, 1), ranges };
+    };
+    /** The triangles the buffer shows inside a CSS-pixel rectangle, among the pixels `inside` keeps. */
+    const pickBufferHits = (buffer: PickBuffer, rect: BoxRect, inside: (x: number, y: number) => boolean) => {
+      const ids = new Set<number>();
+      const x0 = Math.max(0, Math.floor(rect.left * buffer.ratio)), x1 = Math.min(buffer.width, Math.ceil(rect.right * buffer.ratio));
+      const y0 = Math.max(0, Math.floor(rect.top * buffer.ratio)), y1 = Math.min(buffer.height, Math.ceil(rect.bottom * buffer.ratio));
+      for (let y = y0; y < y1; y += 1) {
+        // Render-target rows count from the bottom.
+        const row = (buffer.height - 1 - y) * buffer.width;
+        for (let x = x0; x < x1; x += 1) {
+          if (!inside((x + 0.5) / buffer.ratio, (y + 0.5) / buffer.ratio)) continue;
+          const at = (row + x) * 4;
+          const id = buffer.pixels[at] | (buffer.pixels[at + 1] << 8) | (buffer.pixels[at + 2] << 16);
+          if (id) ids.add(id);
+        }
+      }
+      const hits = new Map<string, number[]>();
       for (const id of ids) {
-        const range = ranges.find((item) => id >= item.start && id < item.start + item.faceMap.length);
+        const range = buffer.ranges.find((item) => id >= item.start && id < item.start + item.faceMap.length);
         if (!range) continue;
         const list = hits.get(range.name) ?? []; list.push(range.faceMap[id - range.start]); hits.set(range.name, list);
       }
@@ -512,7 +586,7 @@ export function MeshEditorViewer({ meshes, visibleNames, document, selection, on
       const ctrl = event.ctrlKey || event.metaKey;
       const { delimitShader: delimit, similarScope: scope } = toolsRef.current;
       if (event.key === "Escape") {
-        if (box) { box = null; drawMarquee(); } else setBoxTool(false);
+        if (box) { box = null; drawMarquee(); } else if (stroke) stroke = null; else setTool("none");
         return;
       }
       // event.code, not event.key: Alt and Shift change the character the key types.
@@ -524,7 +598,8 @@ export function MeshEditorViewer({ meshes, visibleNames, document, selection, on
       if (event.code === "KeyA") run(event.altKey ? { kind: "clear" } : { kind: "all" });
       else if (event.code === "KeyH") run(event.altKey ? { kind: "reveal" } : event.shiftKey ? { kind: "isolate" } : { kind: "hide" });
       else if (event.code === "KeyG" && event.shiftKey && !event.altKey) run({ kind: "similar", scope });
-      else if (event.code === "KeyB" && !event.altKey && !event.shiftKey && !event.repeat) { event.preventDefault(); setBoxTool((current) => !current); }
+      else if (event.code === "KeyB" && !event.altKey && !event.shiftKey && !event.repeat) { event.preventDefault(); setTool((current) => current === "box" ? "none" : "box"); }
+      else if (event.code === "KeyC" && !event.altKey && !event.shiftKey && !event.repeat) { event.preventDefault(); setTool((current) => current === "brush" ? "none" : "brush"); }
       else if (event.code === "KeyL" && !event.altKey && hover) {
         const hit = hitAt(hover.x, hover.y);
         if (hit) run({ kind: "linked", meshName: hit.parsed.name, triangle: hit.triangle, deselect: event.shiftKey, delimitShader: delimit });
@@ -536,6 +611,7 @@ export function MeshEditorViewer({ meshes, visibleNames, document, selection, on
     renderer.domElement.addEventListener("pointermove", handlePointerMove);
     renderer.domElement.addEventListener("pointerup", handlePointerUp);
     renderer.domElement.addEventListener("pointerleave", handlePointerLeave);
+    window.addEventListener("wheel", handleWheel, { capture: true, passive: false });
     renderer.domElement.addEventListener("contextmenu", handleContextMenu);
     window.addEventListener("keydown", handleKeyDown);
 
@@ -556,6 +632,7 @@ export function MeshEditorViewer({ meshes, visibleNames, document, selection, on
       renderer.domElement.removeEventListener("pointermove", handlePointerMove);
       renderer.domElement.removeEventListener("pointerup", handlePointerUp);
       renderer.domElement.removeEventListener("pointerleave", handlePointerLeave);
+      window.removeEventListener("wheel", handleWheel, { capture: true });
       renderer.domElement.removeEventListener("contextmenu", handleContextMenu);
       window.removeEventListener("keydown", handleKeyDown);
       for (const child of modelGroup.children) disposePieceObject(child as THREE.Mesh);
@@ -643,11 +720,13 @@ export function MeshEditorViewer({ meshes, visibleNames, document, selection, on
 
   useEffect(() => {
     const runtime = runtimeRef.current; if (!runtime) return;
-    // With the Box tool the left button draws the box, so orbiting moves to the middle button
+    // With the Box or Brush tool the left button selects, so orbiting moves to the middle button
     // (Blender's own); right-drag still pans and the wheel still zooms.
-    runtime.controls.mouseButtons.LEFT = boxTool ? null : THREE.MOUSE.ROTATE;
-    runtime.controls.mouseButtons.MIDDLE = boxTool ? THREE.MOUSE.ROTATE : THREE.MOUSE.DOLLY;
-  }, [boxTool]);
+    const selecting = tool !== "none";
+    runtime.controls.mouseButtons.LEFT = selecting ? null : THREE.MOUSE.ROTATE;
+    runtime.controls.mouseButtons.MIDDLE = selecting ? THREE.MOUSE.ROTATE : THREE.MOUSE.DOLLY;
+    if (tool !== "brush" && brushRef.current) brushRef.current.hidden = true;
+  }, [tool]);
 
   useEffect(() => {
     for (const [object, parsed] of objectsRef.current) {
@@ -676,19 +755,30 @@ export function MeshEditorViewer({ meshes, visibleNames, document, selection, on
   }, [uvChecker]);
 
   return <section className="viewer-pane mesh-editor-3d">
-    <header className="viewer-header"><div><p className="eyebrow">{tr("SHADER MAP")}</p><strong>{tr("Triangle picking · shader colors")}</strong></div><div className="viewer-tools"><button disabled={!canUndo} onClick={onUndo} title={tr("Undo")}>{tr("↶ Undo")}</button><button disabled={!canRedo} onClick={onRedo} title={tr("Redo")}>{tr("↷ Redo")}</button><button className={renderMode !== "solid" ? "active" : ""} onClick={cycleRenderMode} title={tr("Cycle shading mode")}>{renderMode === "solid" ? tr("Solid") : renderMode === "wireframe" ? tr("Wireframe") : tr("Solid+Wire")}</button><button className={uvChecker ? "active" : ""} onClick={() => setUvChecker((current) => !current)} title={tr("Show a numbered test texture on the UVs instead of the shader colors")}>{tr("UV Checker")}</button><button onClick={fitCamera}>{tr("Frame model")}</button></div></header>
-    <div className="view-controls">
-      <div className="view-buttons">
+    <header className="viewer-header"><div><p className="eyebrow">{tr("SHADER MAP")}</p><strong>{tr("Triangle picking · shader colors")}</strong></div><div className="viewer-tools"><button disabled={!canUndo} onClick={onUndo} title={tr("Undo")}>{tr("↶ Undo")}</button><button disabled={!canRedo} onClick={onRedo} title={tr("Redo")}>{tr("↷ Redo")}</button></div></header>
+    {/* Two rows so what moves the camera or changes the look is never mixed with what selects. */}
+    <div className="view-controls mesh-toolbar">
+      <div className="mesh-toolbar-row">
+        <span className="mesh-toolbar-label">{tr("VIEW")}</span>
         <button onClick={() => applyView("front")}>{tr("Front")}</button>
         <button onClick={() => applyView("back")}>{tr("Back")}</button>
         <button onClick={() => applyView("left")}>{tr("Left")}</button>
         <button onClick={() => applyView("right")}>{tr("Right")}</button>
         <button onClick={() => applyView("top")}>{tr("Top")}</button>
         <button onClick={() => applyView("bottom")}>{tr("Bottom")}</button>
+        <i />
+        <button className={projection === "orthographic" ? "active" : ""} onClick={toggleProjection}>{projection === "orthographic" ? tr("Ortho") : tr("Persp")}</button>
+        <i />
+        <button className={renderMode !== "solid" ? "active" : ""} onClick={cycleRenderMode} title={tr("Cycle shading mode")}>{renderMode === "solid" ? tr("Solid") : renderMode === "wireframe" ? tr("Wireframe") : tr("Solid+Wire")}</button>
+        <button className={uvChecker ? "active" : ""} onClick={() => setUvChecker((current) => !current)} title={tr("Show a numbered test texture on the UVs instead of the shader colors")}>{tr("UV Checker")}</button>
+        <i />
+        <button onClick={fitCamera}>{tr("Frame model")}</button>
       </div>
-      <div className="selection-tools">
-        <button className={boxTool ? "active" : ""} onClick={() => setBoxTool((current) => !current)} title={tr("Box select (B): left-drag draws a box, Shift adds, Ctrl removes. Orbit with the middle button meanwhile; Esc leaves the tool.")}>{tr("Box")}</button>
-        <button className={xray ? "active" : ""} onClick={() => setXray((current) => !current)} title={tr("X-ray: the box also takes the triangles behind others, not only what you see")}>{tr("X-ray")}</button>
+      <div className="mesh-toolbar-row selection-tools">
+        <span className="mesh-toolbar-label">{tr("SELECT")}</span>
+        <button className={tool === "box" ? "active" : ""} onClick={() => setTool((current) => current === "box" ? "none" : "box")} title={tr("Box select (B): left-drag draws a box, Shift adds, Ctrl removes. Orbit with the middle button meanwhile; Esc leaves the tool.")}>{tr("Box")}</button>
+        <button className={tool === "brush" ? "active" : ""} onClick={() => setTool((current) => current === "brush" ? "none" : "brush")} title={tr("Brush select (C): left-drag paints the selection, Ctrl-drag removes. Shift+wheel resizes the circle; orbit with the middle button meanwhile; Esc leaves the tool.")}>{tr("Brush")}</button>
+        <button className={xray ? "active" : ""} onClick={() => setXray((current) => !current)} title={tr("X-ray: the box and the brush also take the triangles behind others, not only what you see")}>{tr("X-ray")}</button>
         <i />
         <button onClick={() => onTriangleCommand({ kind: "all" })} title={tr("Select every visible triangle (A)")}>{tr("All")}</button>
         <button onClick={() => onTriangleCommand({ kind: "clear" })} title={tr("Clear the selection (Alt+A)")}>{tr("None")}</button>
@@ -703,16 +793,17 @@ export function MeshEditorViewer({ meshes, visibleNames, document, selection, on
           <button className={similarScope === "all" ? "active" : ""} onClick={() => setSimilarScope("all")} title={tr("Same shader looks in every visible part")}>{tr("All parts")}</button>
         </span>
         <i />
-        <AssignShaderMenu bank={shaderBank} used={selectedPartShaders} selectedCount={selectedCount} getColor={getColor} onPick={onAssignShader} />
-        <i />
         <button onClick={() => onTriangleCommand({ kind: "hide" })} title={tr("Hide the selected triangles (H). View only — the file doesn't change.")}>{tr("Hide")}</button>
         <button onClick={() => onTriangleCommand({ kind: "isolate" })} title={tr("Hide everything except the selection (Shift+H)")}>{tr("Isolate")}</button>
         <button onClick={() => onTriangleCommand({ kind: "reveal" })} title={tr("Show every hidden triangle again (Alt+H)")}>{tr("Reveal")}</button>
+        <i />
+        {/* The one control here that changes the file, set apart at the end. */}
+        <AssignShaderMenu bank={shaderBank} used={selectedPartShaders} selectedCount={selectedCount} getColor={getColor} onPick={onAssignShader} />
       </div>
-      <div className="view-toggles"><button className={projection === "orthographic" ? "active" : ""} onClick={toggleProjection}>{projection === "orthographic" ? tr("Ortho") : tr("Persp")}</button></div>
     </div>
-    <div className={`viewer-stage ${boxTool ? "box-tool" : ""}`} ref={hostRef}>
+    <div className={`viewer-stage ${tool !== "none" ? "select-tool" : ""}`} ref={hostRef}>
       <div className="selection-marquee" ref={marqueeRef} hidden />
+      <div className="selection-brush" ref={brushRef} hidden />
       {!visible.length && <div className="viewer-empty"><span>3D</span><strong>{tr("No visible geometry")}</strong><p>{tr("Show some parts in the pieces list to see them colored by shader here.")}</p></div>}
       <div className="viewer-stats"><span><Tx t="{0} parts" v={[visible.length]} /></span><span><Tx t="{0} tris" v={[visibleTriangleCount.toLocaleString()]} /></span><span><Tx t="{0} shaders" v={[shaderLegend.length]} /></span>{selectedCount > 0 && <span className="stat-selected"><Tx t="{0} selected in {1} parts" v={[selectedCount.toLocaleString(), selectedPieces]} /></span>}{hiddenCount > 0 && <span className="stat-hidden"><Tx t="{0} hidden" v={[hiddenCount.toLocaleString()]} /></span>}</div>
       <div className="shader-legend">{shaderLegend.map((id) => <ShaderChip key={id} id={id} name={shaderBank?.[id]?.name ?? ""} rgba={getColor(id)} active={selection?.shaderId === id} onRgbChange={(value) => setShaderRgb(id, value)} onAlphaChange={(value) => setShaderAlpha(id, value)} onSelectTriangles={(deselect) => onTriangleCommand({ kind: "shader", shaderId: id, deselect })} />)}</div>
@@ -744,6 +835,6 @@ export function MeshEditorViewer({ meshes, visibleNames, document, selection, on
         </div>;
       })()}
     </div>
-    <footer className="viewer-footer"><span>{tr("Click a triangle to identify its piece + shader")}</span><span>{tr("Shift-click adds · L linked · Shift+G same shader · B box · H hide")}</span><span>{tr("Right-click for piece actions")}</span><span>{boxTool ? tr("Middle-drag to orbit") : tr("Drag to orbit")}</span><span>{tr("Wheel to zoom")}</span></footer>
+    <footer className="viewer-footer"><span>{tr("Click a triangle to identify its piece + shader")}</span><span>{tr("Shift-click adds · L linked · Shift+G same shader · B box · C brush · H hide")}</span><span>{tr("Right-click for piece actions")}</span><span>{tool !== "none" ? tr("Middle-drag to orbit") : tr("Drag to orbit")}</span><span>{tr("Wheel to zoom")}</span></footer>
   </section>;
 }

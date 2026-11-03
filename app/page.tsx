@@ -11,6 +11,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { formatClipboard, hex, parseClipboard, PckDocument, type LodMeshEntry, type MeshBlobSnapshot, type Vec3 } from "../src/pck";
 import { EmptyMeshError, MeshPckDocument, defaultHiddenReason, hasStockVariants, isLowLodOnly, isShadowPlane, isShellFamily, matchLodEntries, parseEmbeddedMesh, resolveGroupShaderId, resolvePieceId, sameMeshGeometry, type MeshGeometry } from "../src/mesh";
 import { moveTrianglesToShader } from "../src/mesh-slots";
+import type { TriangleState } from "./mesh-selection";
 import { isShellPiece } from "../src/mesh-inject";
 import { exportMeshObj } from "../src/obj-export";
 import { convertObjToMeshPck } from "../src/obj";
@@ -102,7 +103,13 @@ type MeshBlobAction = {
   /** Loose mesh.pck files the same action rewrote (a slot move), restored along with the PCKs. */
   loose?: { meshName: string; before: Uint8Array; after: Uint8Array }[];
 };
-type MeshEditAction = PieceIdAction | ShaderIdAction | MeshBlobAction;
+// A change of the Meshes tab's triangle selection or hidden triangles. View state, not a file edit,
+// but on the same timeline so Ctrl+Z walks back through both in the order they happened.
+type SelectionAction = { kind: "selection"; meshName: string; before: TriangleState; after: TriangleState };
+type MeshEditAction = PieceIdAction | ShaderIdAction | MeshBlobAction | SelectionAction;
+// Selection steps are cheap and frequent; file edits can hold whole-PCK snapshots, so fewer are kept.
+const MESH_HISTORY_STEPS = 200;
+const MESH_HISTORY_FILE_EDITS = 20;
 type FileEntry = { path: string; name: string };
 type PpfSlot = { path: string; name: string; geometry: PpfGeometry };
 type PpfSlots = Record<PpfKind, PpfSlot | null>;
@@ -429,6 +436,28 @@ export default function App() {
   const refresh = useCallback(() => setRevision((value) => value + 1), []);
   const pieceIdUndoRef = useRef<MeshEditAction[]>([]);
   const pieceIdRedoRef = useRef<MeshEditAction[]>([]);
+  /** Adds a step to the Meshes history and drops the redo branch. Past the limits the oldest steps go,
+   *  always from the front so what is left still replays in order. */
+  const pushMeshHistory = useCallback((entry: MeshEditAction) => {
+    const history = pieceIdUndoRef.current;
+    history.push(entry);
+    pieceIdRedoRef.current = [];
+    const fileEdits = () => history.filter((item) => item.kind !== "selection").length;
+    while (history.length > MESH_HISTORY_STEPS || fileEdits() > MESH_HISTORY_FILE_EDITS) history.shift();
+  }, []);
+  // Set by the Meshes tab while it is open: puts a recorded selection back.
+  const selectionApplierRef = useRef<((state: TriangleState) => void) | null>(null);
+  // Re-renders the page for Undo/Redo's enabled state only. `refresh` would also bump the revision the
+  // piece geometry is memoized on, and rebuild the whole 3D view on every click.
+  const [, setHistoryTick] = useState(0);
+  /** The Meshes tab reports each selection change; `merge` folds a brush stroke's later dabs into its first step. */
+  const recordSelection = useCallback((before: TriangleState, after: TriangleState, merge: boolean) => {
+    const last = pieceIdUndoRef.current[pieceIdUndoRef.current.length - 1];
+    if (merge && last?.kind === "selection") { last.after = after; pieceIdRedoRef.current = []; }
+    else pushMeshHistory({ kind: "selection", meshName: "selection", before, after });
+    setHistoryTick((value) => value + 1);
+  }, [pushMeshHistory]);
+  const registerSelectionApplier = useCallback((apply: ((state: TriangleState) => void) | null) => { selectionApplierRef.current = apply; }, []);
   const editPieceId = useCallback((meshName: string, entries: LodMeshEntry[], newId: number) => {
     if (!meshDocument || !entries.length) return;
     const standaloneDoc = meshDocs.get(meshName) ?? null;
@@ -437,9 +466,7 @@ export default function App() {
     const carChanged = meshDocument.setLodMeshId(entries, newId, false);
     const standaloneChanged = standaloneDoc ? standaloneDoc.setMeshId(newId, false) : false;
     if ((carChanged || standaloneChanged) && meshRole) {
-      pieceIdUndoRef.current.push({ kind: "pieceId", meshName, role: meshRole, carEntries: entries.map(({ lod, index }) => ({ lod, index })), carBefore, standaloneBefore, after: newId });
-      if (pieceIdUndoRef.current.length > 20) pieceIdUndoRef.current.shift();
-      pieceIdRedoRef.current = [];
+      pushMeshHistory({ kind: "pieceId", meshName, role: meshRole, carEntries: entries.map(({ lod, index }) => ({ lod, index })), carBefore, standaloneBefore, after: newId });
     }
     refresh();
   }, [meshDocument, meshDocs, meshRole, refresh]);
@@ -466,9 +493,7 @@ export default function App() {
     }
     if (standaloneDoc && standaloneDoc.setGroupShaderId(group, newId, false)) anyChanged = true;
     if (anyChanged) {
-      pieceIdUndoRef.current.push({ kind: "shaderId", meshName, targets: targets.map(({ role, before }) => ({ role, before })), group, standaloneBefore, after: newId });
-      if (pieceIdUndoRef.current.length > 20) pieceIdUndoRef.current.shift();
-      pieceIdRedoRef.current = [];
+      pushMeshHistory({ kind: "shaderId", meshName, targets: targets.map(({ role, before }) => ({ role, before })), group, standaloneBefore, after: newId });
     }
     refresh();
   }, [meshDocs, refresh, slots]);
@@ -576,9 +601,7 @@ export default function App() {
 
     const targets: MeshBlobAction["targets"] = documents.filter(({ document }) => touched.has(document)).map(({ role, document }) => ({ role, before: before.get(document)!, after: document.captureState() }));
     if (targets.length) {
-      pieceIdUndoRef.current.push({ kind: "meshBlob", meshName: actionLabel, targets });
-      if (pieceIdUndoRef.current.length > 20) pieceIdUndoRef.current.shift();
-      pieceIdRedoRef.current = [];
+      pushMeshHistory({ kind: "meshBlob", meshName: actionLabel, targets });
     }
     refresh();
     if (warnings.length) console.warn("Embedded mesh update warnings:", warnings);
@@ -644,9 +667,7 @@ export default function App() {
     }
     const targets: MeshBlobAction["targets"] = documents.filter(({ document }) => touched.has(document)).map(({ role, document }) => ({ role, before: before.get(document)!, after: document.captureState() }));
     if (targets.length || loose.length) {
-      pieceIdUndoRef.current.push({ kind: "meshBlob", meshName: `Shader ${hex(shaderId, 2)}`, targets, loose });
-      if (pieceIdUndoRef.current.length > 20) pieceIdUndoRef.current.shift();
-      pieceIdRedoRef.current = [];
+      pushMeshHistory({ kind: "meshBlob", meshName: `Shader ${hex(shaderId, 2)}`, targets, loose });
     }
     refresh();
     if (warnings.length) console.warn("Assign shader warnings:", warnings);
@@ -691,9 +712,7 @@ export default function App() {
       targets.push({ role, before, after: document.captureState() });
     }
     if (!targets.length) { setStatus(`${label} is not embedded in any loaded PCK — nothing to remove.`); return; }
-    pieceIdUndoRef.current.push({ kind: "meshBlob", meshName: label, targets });
-    if (pieceIdUndoRef.current.length > 20) pieceIdUndoRef.current.shift();
-    pieceIdRedoRef.current = [];
+    pushMeshHistory({ kind: "meshBlob", meshName: label, targets });
     refresh();
     const where = targets.map(({ role }) => roleLabels[role]).join(", ");
     const freed = targets.reduce((sum, { role }) => sum + ((sizeBefore.get(role) ?? 0) - slots[role]!.document.projectedSize), 0);
@@ -856,6 +875,11 @@ export default function App() {
       if (!roleDocument) throw new Error(`the ${roleLabels[role]} PCK is no longer loaded`);
       return roleDocument;
     };
+    if (entry.kind === "selection") {
+      if (!selectionApplierRef.current) throw new Error("the Meshes tab isn't open");
+      selectionApplierRef.current(entry[direction]);
+      return;
+    }
     if (entry.kind === "meshBlob") {
       const documents = entry.targets.map((target) => documentFor(target.role));
       const looseDocs = (entry.loose ?? []).map((item) => {
@@ -896,7 +920,8 @@ export default function App() {
     } catch (error) {
       setStatus(`${verb} skipped and dropped from the history: ${error instanceof Error ? error.message : "it no longer applies"}`);
     }
-    refresh();
+    // A selection step changes no file: no need to re-read every piece.
+    if (entry.kind === "selection") setHistoryTick((value) => value + 1); else refresh();
   }, [refresh, replayMeshAction]);
   const meshUndo = useCallback(() => stepMeshHistory(pieceIdUndoRef, pieceIdRedoRef, "before"), [stepMeshHistory]);
   const meshRedo = useCallback(() => stepMeshHistory(pieceIdRedoRef, pieceIdUndoRef, "after"), [stepMeshHistory]);
@@ -1774,7 +1799,7 @@ export default function App() {
       <ResizeHandle variant="resize-editor" onDrag={resizeEditor} />
       <MeshViewer document={document} selected={selected} multiSelected={selectedIndices} meshes={anchorMeshes} visibleAnchors={visibleMeshAnchors} referenceGeometry={referenceGeometry} rimSizeInches={rimSizeInches} revision={revision} onMoveSelection={moveSelection} onRotateSelection={rotateSelection} canRotate={document.rotationEditable && !positionLocked} cameraEdit={cameraMode && garage && cameraPoints ? { camera: garageToPck(cameraPoints.camera), target: garageToPck(cameraPoints.target), handle: cameraHandle, lookThrough, targetPlane, safeAreas, fov: garage.fov, aspect: cameraAspects[cameraAspect], onSelectHandle: setCameraHandle, onToggleLookThrough: () => setLookThrough((value) => !value), onMove: moveShopCamera } : null} />
     </main>)}
-    {workspace === "mesh" && <div className="mesh-editor-shell"><MeshEditorWorkspace document={meshDocument} activeRole={meshRole} slots={slots} onSelectRole={setMeshViewRole} meshes={meshEditorMeshes} onEditPieceId={editPieceId} onEditGroupShader={editGroupShader} onAssignShader={assignShader} shaderBank={shaderBank} onUpdateEmbedded={updateEmbeddedMesh} onRemoveEmbedded={removeEmbeddedPiece} onUpdateAllEmbedded={updateAllEmbeddedMeshes} onConvertObjs={() => void chooseObjFolder()} zeroShellId={zeroShellId} onSetZeroShellId={setZeroShellId} compactStreams={compactStreams} onSetCompactStreams={setCompactStreams} onExportObj={(mesh) => void exportPieceObj(mesh)} embeddedUnreadable={embeddedOnly.unreadable} embeddedEmpty={embeddedOnly.empty} objFolder={objFolder} describeEmbedTarget={describeEmbedTarget} describePieceSize={describePieceSize} onUndo={meshUndo} onRedo={meshRedo} canUndo={pieceIdUndoRef.current.length > 0} canRedo={pieceIdRedoRef.current.length > 0} vehicleBase={vehicleBase} loadedCount={loadedCount} onOpenFolder={() => void openFolder()} recentVehicleFolders={recentVehicleFolders} onOpenRecentFolder={(path) => void openVehicleFolderAtPath(path)} onClearRecentFolders={clearVehicleRecents} listWidth={panelWidths.meshList} onResizeList={resizeMeshList} /></div>}
+    {workspace === "mesh" && <div className="mesh-editor-shell"><MeshEditorWorkspace document={meshDocument} activeRole={meshRole} slots={slots} onSelectRole={setMeshViewRole} meshes={meshEditorMeshes} onEditPieceId={editPieceId} onEditGroupShader={editGroupShader} onAssignShader={assignShader} shaderBank={shaderBank} onRecordSelection={recordSelection} onRegisterSelectionApplier={registerSelectionApplier} onUpdateEmbedded={updateEmbeddedMesh} onRemoveEmbedded={removeEmbeddedPiece} onUpdateAllEmbedded={updateAllEmbeddedMeshes} onConvertObjs={() => void chooseObjFolder()} zeroShellId={zeroShellId} onSetZeroShellId={setZeroShellId} compactStreams={compactStreams} onSetCompactStreams={setCompactStreams} onExportObj={(mesh) => void exportPieceObj(mesh)} embeddedUnreadable={embeddedOnly.unreadable} embeddedEmpty={embeddedOnly.empty} objFolder={objFolder} describeEmbedTarget={describeEmbedTarget} describePieceSize={describePieceSize} onUndo={meshUndo} onRedo={meshRedo} canUndo={pieceIdUndoRef.current.length > 0} canRedo={pieceIdRedoRef.current.length > 0} vehicleBase={vehicleBase} loadedCount={loadedCount} onOpenFolder={() => void openFolder()} recentVehicleFolders={recentVehicleFolders} onOpenRecentFolder={(path) => void openVehicleFolderAtPath(path)} onClearRecentFolders={clearVehicleRecents} listWidth={panelWidths.meshList} onResizeList={resizeMeshList} /></div>}
     {workspace === "performance" && <PerformanceWorkspace slots={slots} workingRole={workingRole} vehicleBase={vehicleBase} loadedCount={loadedCount} revision={revision} onApply={applyPerformance} onStatus={setStatus} onOpenFolder={() => void openFolder()} recentVehicleFolders={recentVehicleFolders} onOpenRecentFolder={(path) => void openVehicleFolderAtPath(path)} onClearRecentFolders={clearVehicleRecents} />}
     {workspace === "audio" && <AudioWorkspace slots={slots} workingRole={workingRole} vehicleBase={vehicleBase} loadedCount={loadedCount} revision={revision} onApply={applyAudio} onStatus={setStatus} onOpenFolder={() => void openFolder()} recentVehicleFolders={recentVehicleFolders} onOpenRecentFolder={(path) => void openVehicleFolderAtPath(path)} onClearRecentFolders={clearVehicleRecents} />}
     <div className="workspace-host" style={{ display: workspace === "textures" ? "contents" : "none" }}><TextureWorkspace active={workspace === "textures"} dropped={texturesDrop} onConsumeDrop={() => setTexturesDrop(null)} onStatus={setStatus} isPathBlocked={isVehiclePathBlocked} onPendingChange={setTexturesPending} menuRef={textureMenu} /></div>

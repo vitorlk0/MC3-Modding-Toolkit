@@ -26,7 +26,7 @@ function defaultVisibleNames(meshes: MeshGeometry[], document: PckDocument | nul
   return new Set(meshes.filter((mesh) => !defaultHiddenReason(mesh, document, customizable)).map((mesh) => mesh.name));
 }
 
-export function MeshEditorWorkspace({ document, activeRole, slots, onSelectRole, meshes, onEditPieceId, onEditGroupShader, onAssignShader, shaderBank, onUpdateEmbedded, onRemoveEmbedded, onUpdateAllEmbedded, onConvertObjs, zeroShellId, onSetZeroShellId, compactStreams, onSetCompactStreams, onExportObj, embeddedUnreadable, embeddedEmpty, objFolder, describeEmbedTarget, describePieceSize, onUndo, onRedo, canUndo, canRedo, vehicleBase, loadedCount, onOpenFolder, recentVehicleFolders, onOpenRecentFolder, onClearRecentFolders, listWidth, onResizeList }: {
+export function MeshEditorWorkspace({ document, activeRole, slots, onSelectRole, meshes, onEditPieceId, onEditGroupShader, onAssignShader, shaderBank, onRecordSelection, onRegisterSelectionApplier, onUpdateEmbedded, onRemoveEmbedded, onUpdateAllEmbedded, onConvertObjs, zeroShellId, onSetZeroShellId, compactStreams, onSetCompactStreams, onExportObj, embeddedUnreadable, embeddedEmpty, objFolder, describeEmbedTarget, describePieceSize, onUndo, onRedo, canUndo, canRedo, vehicleBase, loadedCount, onOpenFolder, recentVehicleFolders, onOpenRecentFolder, onClearRecentFolders, listWidth, onResizeList }: {
   document: PckDocument | null;
   activeRole: VehicleRole | null;
   slots: VehicleSlots;
@@ -38,6 +38,10 @@ export function MeshEditorWorkspace({ document, activeRole, slots, onSelectRole,
   onAssignShader(pieces: { meshName: string; triangles: number[] }[], shaderId: number): void;
   /** The car's shader bank (index = shader ID), limited to what every loaded PCK defines; null when not found. */
   shaderBank: { id: number; name: string }[] | null;
+  /** Puts a selection change on the shared Meshes undo history (`merge`: same brush stroke as the last step). */
+  onRecordSelection(before: TriangleState, after: TriangleState, merge: boolean): void;
+  /** Hands the page the function that restores a recorded selection (null when the tab closes). */
+  onRegisterSelectionApplier(apply: ((state: TriangleState) => void) | null): void;
   onUpdateEmbedded(meshName: string): void;
   /** Takes the piece's embedded copy out of every loaded PCK; its table row stays. */
   onRemoveEmbedded(meshName: string): void;
@@ -94,9 +98,26 @@ export function MeshEditorWorkspace({ document, activeRole, slots, onSelectRole,
   // Picked and hidden triangles: view state that outlives shader/ID edits (mesh-selection.ts drops a
   // piece's flags on its own once that piece's geometry changes), cleared with the vehicle set.
   const [triangles, setTriangles] = useState<TriangleState>({ selected: NO_TRIANGLES, hidden: NO_TRIANGLES });
-  useEffect(() => { setTriangles({ selected: NO_TRIANGLES, hidden: NO_TRIANGLES }); }, [vehicleBase]);
+  useEffect(() => { const empty = { selected: NO_TRIANGLES, hidden: NO_TRIANGLES }; trianglesRef.current = empty; setTriangles(empty); }, [vehicleBase]);
   const visibleMeshes = useMemo(() => meshes.filter((mesh) => visibleNames.has(mesh.name)), [meshes, visibleNames]);
-  const runTriangleCommand = (command: TriangleCommand) => setTriangles((current) => applyTriangleCommand(current, command, visibleMeshes));
+  // Every change is recorded for Undo; the ref keeps the state the next command starts from in step
+  // with what was recorded, even when several commands land before a re-render (brush dabs).
+  const trianglesRef = useRef(triangles);
+  const lastStrokeRef = useRef<number | null>(null);
+  const runTriangleCommand = (command: TriangleCommand) => {
+    const before = trianglesRef.current;
+    const after = applyTriangleCommand(before, command, visibleMeshes);
+    if (after.selected === before.selected && after.hidden === before.hidden) return;
+    const stroke = command.kind === "box" ? command.stroke ?? null : null;
+    onRecordSelection(before, after, stroke !== null && stroke === lastStrokeRef.current);
+    lastStrokeRef.current = stroke;
+    trianglesRef.current = after;
+    setTriangles(after);
+  };
+  useEffect(() => {
+    onRegisterSelectionApplier((state) => { trianglesRef.current = state; lastStrokeRef.current = null; setTriangles(state); });
+    return () => onRegisterSelectionApplier(null);
+  }, [onRegisterSelectionApplier]);
   const describeTriangles = (mesh: MeshGeometry) => ({ selected: countOf(triangles.selected, mesh), hidden: countOf(triangles.hidden, mesh) });
   // Selected triangles of the visible pieces, piece by piece: what "Assign shader" acts on.
   const assignSelectionShader = (shaderId: number) => {
