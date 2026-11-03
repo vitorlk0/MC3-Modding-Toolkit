@@ -22,6 +22,7 @@
     "fs:allow-fstat",
     "fs:allow-rename",
     "fs:allow-remove",
+    "fs:allow-mkdir",
     { "identifier": "fs:scope", "allow": [{ "path": "**" }, { "path": "**/*" }] }
   ]
 }

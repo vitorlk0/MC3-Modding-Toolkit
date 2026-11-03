@@ -10,9 +10,10 @@ import type { PackageFile } from "../../src/iso-install";
 import { basename, parentPath, sizeLabel, writeVerified } from "./toolkit-io";
 import { loadRecent, pushRecent, saveRecent } from "../recent-paths";
 import { RecentList } from "./toolkit-ui";
+import { DatExtractPanel } from "./dat-extract-panel";
 
 /**
- * Vehicle DAT Builder — compiles a car's loose folder (HostFS layout) into its `vp_*.dat`.
+ * Vehicle DAT · Build — compiles a car's loose folder (HostFS layout) into its `vp_*.dat`.
  *
  * The folder can be dropped at any level: the car folder itself, or the HostFS root / `resources` /
  * `vehicle` above it — the car folder is the one holding `vp_x.pck`. Inside the DAT every file sits
@@ -25,7 +26,30 @@ const RECENTS_KEY = "mc3pae.recentDatBuilderFolders";
 
 type Scan = { root: string; vehicle: VehicleFolder<PackageFile> };
 
+/**
+ * Tool 07 has two halves: Build (folder → DAT, below) and Extract (DAT → folder, dat-extract-panel).
+ * A dropped .dat opens the extract half; anything else goes to the build half as before.
+ */
 export function DatBuilderTool({ dropped, onConsumeDrop, onStatus }: {
+  dropped: string[] | null;
+  onConsumeDrop: () => void;
+  onStatus: (message: string) => void;
+}) {
+  const [mode, setMode] = useState<"build" | "extract">("build");
+  const droppedDat = dropped?.find((path) => /\.dat$/i.test(path)) ?? null;
+  useEffect(() => { if (droppedDat) setMode("extract"); else if (dropped?.length) setMode("build"); }, [dropped, droppedDat]);
+  return <>
+    <div className="segmented dat-mode-switch" role="group">
+      <button className={mode === "build" ? "active" : ""} onClick={() => setMode("build")}>{tr("Build DAT")}</button>
+      <button className={mode === "extract" ? "active" : ""} onClick={() => setMode("extract")}>{tr("Extract DAT")}</button>
+    </div>
+    {mode === "build"
+      ? <DatBuildPanel dropped={droppedDat ? null : dropped} onConsumeDrop={onConsumeDrop} onStatus={onStatus} />
+      : <DatExtractPanel droppedDat={droppedDat} onConsumeDrop={onConsumeDrop} onStatus={onStatus} />}
+  </>;
+}
+
+function DatBuildPanel({ dropped, onConsumeDrop, onStatus }: {
   dropped: string[] | null;
   onConsumeDrop: () => void;
   onStatus: (message: string) => void;

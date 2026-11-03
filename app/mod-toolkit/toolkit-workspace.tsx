@@ -34,7 +34,7 @@ const tools: Tool[] = [
   { id: "flash-menu", number: "04", name: "Flash Menu Editor", blurb: "Limit the Visual Shop menu entries", status: "active" },
   { id: "injector", number: "05", name: "Car PCK Mesh Injector", blurb: "Embed loose mesh.pck files into a car PCK in bulk", status: "active" },
   { id: "id-sync", number: "06", name: "Mesh ID Sync", blurb: "Stamp a car PCK's LOD table IDs onto loose meshes", status: "active" },
-  { id: "dat-builder", number: "07", name: "Vehicle DAT Builder", blurb: "Pack a car folder into its vp_*.dat", status: "active" },
+  { id: "dat-builder", number: "07", name: "Vehicle DAT · Build / Extract", blurb: "Pack a car folder into its vp_*.dat, or unpack one", status: "active" },
   { id: "compact-iso", number: "08", name: "Compact ISO", blurb: "Pack the original dual-layer ISO into one layer", status: "active" },
   { id: "exhausts", number: "09", name: "Exhaust Tips", blurb: "Turn rear-bumper exhaust tips on or off", status: "active" },
   { id: "neon", number: "10", name: "Neon & Shadow", blurb: "Resize the colored neon and the ground shadow", status: "active" },
