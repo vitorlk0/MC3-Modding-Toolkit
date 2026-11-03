@@ -46,7 +46,21 @@ export type MeshGeometry = {
   /** Every geometry packet, in stream order, with offsets into the bytes the piece was read from
    *  (the car PCK for an embedded piece) — what an in-place vertex rewrite needs. */
   packets: MeshPacket[];
+  /** Each material group's data blocks, as its block list gives them: offset into the bytes the piece
+   *  was read from, size in bytes, and the emitted vertex count the list stores. */
+  groupBlocks: MeshBlock[][];
+  /** Per triangle (parallel to `indices`): packet index × 256 + the strip vertex that closes it. The
+   *  closing vertex's face flag is what switches that one triangle off (KB §10.6). */
+  triangleSources: Uint32Array;
+  /** Per vertex: offset of its 3 normal bytes in the bytes the piece was read from (bit 0 of the
+   *  first one is the face flag). */
+  vertexNormalOffsets: Uint32Array;
+  /** Per vertex: the 4 damage bytes (VU stream 3), as the unpack delivers them. Native pieces carry
+   *  per-vertex crash deformation here; the converter writes 80 80 80 00. */
+  vertexDamage: Uint8Array;
 };
+
+export type MeshBlock = { offset: number; size: number; vertexCount: number };
 
 export type MeshPacket = {
   /** Packet header (`98 00 02 6C` / `C5 01 02 6C`): +0x04 packet_scale, +0x08..+0x13 culling bounds. */
@@ -59,9 +73,14 @@ export type MeshPacket = {
   /** True when positions aren't one plain V3-16 run (V3-8 deltas or several chunks): they can't be
    *  rewritten in place through `vertexOffset`. */
   packedPositions: boolean;
+  /** Material group and data block (index into `groupBlocks[group]`) the packet belongs to. */
+  group: number;
+  block: number;
+  /** Index of the packet's first vertex in the piece's vertex arrays. */
+  firstVertex: number;
 };
 
-type PacketVertex = { xyz: Vec3; normal: Vec3; uv: [number, number]; faceEnabled: boolean };
+type PacketVertex = { xyz: Vec3; normal: Vec3; uv: [number, number]; faceEnabled: boolean; normalOffset: number; damage: number[] };
 
 const PAYLOAD_OFFSET = 0x80;
 const MAGIC = [0x98, 0x0f, 0x7a, 0x00];
@@ -367,6 +386,14 @@ export function nearestMeshAnchor(document: PckDocument, selected: number, meshe
  *  origin) to switch a LOD row off. Not a read failure. */
 export class EmptyMeshError extends Error {}
 
+/** True when two reads of a piece draw the same triangles from the same vertices — how a slot move
+ *  tells that a copy in another PCK is the piece it was planned on, so the same triangle numbers mean
+ *  the same triangles there. */
+export function sameMeshGeometry(a: MeshGeometry, b: MeshGeometry) {
+  const equal = (x: ArrayLike<number>, y: ArrayLike<number>) => x.length === y.length && Array.prototype.every.call(x, (value: number, i: number) => value === y[i]);
+  return equal(a.positions, b.positions) && equal(a.indices, b.indices) && equal(a.vertexGroupIndices, b.vertexGroupIndices) && equal(a.triangleSources, b.triangleSources);
+}
+
 export function parseMeshPck(name: string, source: ArrayBuffer, document: PckDocument): MeshGeometry {
   const bytes = new Uint8Array(source.slice(0));
   const view = new DataView(bytes.buffer);
@@ -411,9 +438,13 @@ function parseMeshAt(name: string, bytes: Uint8Array, meshOffset: number, vaToOf
   const uvs: number[] = [];
   const vertexShaderIds: number[] = [];
   const vertexGroupIndices: number[] = [];
+  const vertexNormalOffsets: number[] = [];
+  const vertexDamage: number[] = [];
   const indices: number[] = [];
+  const triangleSources: number[] = [];
   let packetVertices = 0;
   const packets: MeshPacket[] = [];
+  const groupBlocks: MeshBlock[][] = [];
   let uvZeroedPackets = 0;
   const hex = (offset: number) => `0x${offset.toString(16).toUpperCase()}`;
   // Reads one packet's command stream, from just after the header to the ITOP + MSCAL footer.
@@ -428,6 +459,7 @@ function parseMeshAt(name: string, bytes: Uint8Array, meshOffset: number, vaToOf
     const position: (Vec3 | undefined)[] = new Array(count).fill(undefined);
     const uv: ([number, number] | undefined)[] = new Array(count).fill(undefined);
     const normalBytes = new Int32Array(count).fill(-1);
+    const damage: (number[] | undefined)[] = new Array(count).fill(undefined);
     const row = [0, 0, 0, 0];
     let mode = 0, mask = 0;
     let vertexOffset = -1, plainPositions = true;
@@ -464,6 +496,7 @@ function parseMeshAt(name: string, bytes: Uint8Array, meshOffset: number, vaToOf
       if (masked) {
         // Only the damage stream is masked, with every field taken from the row: no payload at all.
         if (stream !== STREAM_DAMAGE || mask !== MASK_ALL_ROW) throw new Error(`${name}: unsupported masked unpack at ${hex(offset - 4)}.`);
+        for (let vertex = 0; vertex < num; vertex += 1) damage[first + vertex] = row.map((value) => value & 0xff);
         continue;
       }
       if (!size) throw new Error(`${name}: unsupported V4-5 unpack at ${hex(offset - 4)}.`);
@@ -500,6 +533,9 @@ function parseMeshAt(name: string, bytes: Uint8Array, meshOffset: number, vaToOf
         for (let vertex = 0; vertex < num; vertex += 1) normalBytes[first + vertex] = payload + vertex * 3;
       } else if (kind !== DAMAGE_KIND) {
         throw new Error(`${name}: unsupported damage format 0x${kind.toString(16)} at ${hex(offset - 4)}.`);
+      } else {
+        // Raw bytes: every damage unpack in both corpora is unsigned with STMOD 0 (KB §10.5.2).
+        for (let vertex = 0; vertex < num; vertex += 1) damage[first + vertex] = Array.from(bytes.subarray(payload + vertex * 4, payload + vertex * 4 + 4));
       }
     }
 
@@ -516,15 +552,16 @@ function parseMeshAt(name: string, bytes: Uint8Array, meshOffset: number, vaToOf
         normal: normalize([signed8(first & 0xfe) / 127, signed8(bytes[normalOffset + 1]) / 127, signed8(bytes[normalOffset + 2]) / 127]),
         uv: uvComplete ? uv[index]! : [0, 0],
         faceEnabled: (first & 1) === 0,
+        normalOffset,
+        damage: damage[index] ?? [0, 0, 0, 0],
       });
     }
-    packets.push({ offset: cursor, vertexOffset, count, scale: storedScale, packedPositions: !plainPositions });
-    return { decoded, next: offset };
+    return { decoded, next: offset, packet: { offset: cursor, vertexOffset, count, scale: storedScale, packedPositions: !plainPositions } };
   };
   const parseDataBlock = (blockOffset: number, blockSize: number) => {
     const end = blockOffset + blockSize;
     let cursor = blockOffset;
-    const output: PacketVertex[][] = [];
+    const output: { decoded: PacketVertex[]; packet: Omit<MeshPacket, "group" | "block" | "firstVertex"> }[] = [];
     while (cursor < end) {
       // Packets can sit on any 4-byte boundary with VIF NOPs (zero words) between them (VIP
       // pieces pack them 8 bytes apart), and a block can end in 00/CD padding.
@@ -533,11 +570,11 @@ function parseMeshAt(name: string, bytes: Uint8Array, meshOffset: number, vaToOf
       for (let offset = cursor; offset < end; offset += 1) if (bytes[offset] !== 0 && bytes[offset] !== 0xcd) { paddingOnly = false; break; }
       if (paddingOnly) break;
       if (!inside(cursor, PACKET_COMMANDS_START + 4, end) || !BLOCK_HEADERS.has(bytesKey(bytes, cursor, 4))) throw new Error(`${name}: unsupported packet header at ${hex(cursor)}.`);
-      const { decoded, next } = parsePacket(cursor, end);
+      const { decoded, next, packet } = parsePacket(cursor, end);
       // Every packet is an independent triangle-strip stream. Its first two
       // vertices are seeds marked as skip; removing them would connect the
       // first real face to the previous packet and create stretched bridges.
-      output.push(decoded);
+      output.push({ decoded, packet });
       cursor = next;
     }
     return output;
@@ -546,6 +583,8 @@ function parseMeshAt(name: string, bytes: Uint8Array, meshOffset: number, vaToOf
   for (let group = 0; group < groupCount; group += 1) {
     const pointerEntry = pointerTable + group * 8;
     const infoCount = u16(view, pointerEntry + 4);
+    const blocks: MeshBlock[] = [];
+    groupBlocks.push(blocks);
     if (!infoCount) continue;
     if (infoCount > 1024) throw new Error(`${name}: suspicious block count in group ${group}.`);
     const infoList = vaToOffset(u32(view, pointerEntry));
@@ -555,11 +594,14 @@ function parseMeshAt(name: string, bytes: Uint8Array, meshOffset: number, vaToOf
       const blockOffset = vaToOffset(u32(view, info));
       const blockSize = u16(view, info + 4) * 16;
       if (!inside(blockOffset, blockSize, bytes.length) || blockSize <= 0) throw new Error(`${name}: geometry block is out of bounds.`);
-      const packets = parseDataBlock(blockOffset, blockSize);
+      blocks.push({ offset: blockOffset, size: blockSize, vertexCount: u16(view, info + 6) });
+      const blockPackets = parseDataBlock(blockOffset, blockSize);
       const shaderId = groupShaderIds[group];
-      for (const vertices of packets) {
+      for (const { decoded: vertices, packet } of blockPackets) {
         const base = positions.length / 3;
-        for (const vertex of vertices) { positions.push(...vertex.xyz); normals.push(...vertex.normal); uvs.push(...vertex.uv); vertexShaderIds.push(shaderId); vertexGroupIndices.push(group); }
+        const packetIndex = packets.length;
+        packets.push({ ...packet, group, block, firstVertex: base });
+        for (const vertex of vertices) { positions.push(...vertex.xyz); normals.push(...vertex.normal); uvs.push(...vertex.uv); vertexShaderIds.push(shaderId); vertexGroupIndices.push(group); vertexNormalOffsets.push(vertex.normalOffset); vertexDamage.push(...vertex.damage); }
         for (let index = 2; index < vertices.length; index += 1) {
           if (!vertices[index].faceEnabled) continue;
           let triangle: [number, number, number] = index % 2 === 0 ? [index - 2, index - 1, index] : [index - 1, index - 2, index];
@@ -568,6 +610,7 @@ function parseMeshAt(name: string, bytes: Uint8Array, meshOffset: number, vaToOf
           if (lengthSquared(face) <= 1e-18) continue;
           if (dot(normalize(face), vertices[index].normal) < 0) triangle = [triangle[1], triangle[0], triangle[2]];
           indices.push(base + triangle[0], base + triangle[1], base + triangle[2]);
+          triangleSources.push(packetIndex * 256 + index);
         }
         packetVertices += vertices.length;
       }
@@ -597,6 +640,10 @@ function parseMeshAt(name: string, bytes: Uint8Array, meshOffset: number, vaToOf
     stock: /(?:^|_)stk(?:_|\.)/i.test(name) || meshCategory(name) === "lodgroup",
     anchorIndex: hostAnchor(name, document, lod === null ? null : meshId),
     packets,
+    groupBlocks,
+    triangleSources: new Uint32Array(triangleSources),
+    vertexNormalOffsets: new Uint32Array(vertexNormalOffsets),
+    vertexDamage: new Uint8Array(vertexDamage),
   };
 }
 
@@ -654,6 +701,15 @@ export class MeshPckDocument {
     this.replacedSinceSave = true;
     this.undoStack = [];
     this.redoStack = [];
+  }
+
+  /** Sets the piece's bytes as one edit (a slot move) or its undo: unlike replaceBytes, the file
+   *  counts as changed only while it differs from what is on disk. */
+  setContents(source: Uint8Array) {
+    this.bytes = source.slice();
+    this.geometry = parseMeshPck(this.name, this.bytes.buffer as ArrayBuffer, this.carDocument);
+    this.replacedSinceSave = this.bytes.length !== this.savedBytes.length || this.bytes.some((value, i) => value !== this.savedBytes[i]);
+    this.refreshGroupShaderDirty();
   }
 
   /** Marks a document as not yet existing on disk, so Save writes it out even though nothing in

@@ -738,6 +738,108 @@ export function compactConvertedMeshPck(source: Uint8Array): Uint8Array {
   return rebuild(true);
 }
 
+// --- stored-vertex encoding (Meshes tab: triangles moved to another slot) -----
+
+/** A vertex exactly as a packet stores it: s16 position on the piece's grid, s16 UV, the 3 normal
+ *  bytes (face flag left to the encoder) and the 4 damage bytes. */
+export type StoredVertex = { xyz: [number, number, number]; uv: [number, number]; normal: [number, number, number]; damage: [number, number, number, number] };
+export type MeshDataBlock = { bytes: Uint8Array; vertexCount: number };
+
+// A block's emitted-vertex count is a u16; at ~2 vertices per triangle this stays far below it.
+const STORED_TRIANGLES_PER_BLOCK = 8000;
+
+function encodeStoredBlock(records: BlockRecord[], vertices: StoredVertex[], packetVertexScale: number, blockParity: number, compact: boolean) {
+  const count = records.length;
+  const vertexBytes: number[] = [], uvBytes: number[] = [], normalBytes: number[] = [], damageBytes: number[] = [];
+  for (const { ref, skip } of records) {
+    const vertex = vertices[ref.v];
+    for (const value of vertex.xyz) {
+      if (!Number.isInteger(value) || value < -32768 || value > 32767) throw new Error("A vertex is off the piece's s16 grid.");
+      pushU16(vertexBytes, value & 0xffff);
+    }
+    for (const value of vertex.uv) pushU16(uvBytes, value & 0xffff);
+    normalBytes.push(skip ? vertex.normal[0] | 0x01 : vertex.normal[0] & 0xfe, vertex.normal[1], vertex.normal[2]);
+    damageBytes.push(...vertex.damage);
+  }
+  const packetScale = 1 / packetVertexScale;
+  const header: number[] = [];
+  pushF32(header, packetScale);
+  for (const value of packetCullingBounds(vertexBytes, packetScale)) pushF32(header, value);
+  pushU32(header, count);
+  pushF32(header, 0); pushF32(header, 0);
+  pushU32(header, count);
+  return encodePacket({ count, header, vertexBytes, uvBytes, damageBytes, normalBytes }, blockParity, compact);
+}
+
+/**
+ * Writes triangles of stored vertices as fresh packets, through the same stripifier and packet
+ * writer as the OBJ path. `triangles` index `vertices` and keep the winding the game draws them
+ * with; vertices that repeat every stored value should be shared so strips can join them. Damage
+ * goes through per vertex, so a native piece keeps its crash deformation.
+ */
+export function encodeStoredTriangles(vertices: StoredVertex[], triangles: [number, number, number][], packetVertexScale: number, compact: boolean): MeshDataBlock[] {
+  const blocks: MeshDataBlock[] = [];
+  for (let start = 0; start < triangles.length; start += STORED_TRIANGLES_PER_BLOCK) {
+    const faces: Face[] = triangles.slice(start, start + STORED_TRIANGLES_PER_BLOCK).map(([a, b, c]) => ({ refs: [{ v: a, vt: a, vn: a }, { v: b, vt: b, vn: b }, { v: c, vt: c, vn: c }], material: "" }));
+    const packed = packStripsIntoBlocks(buildStrips(faces, false));
+    const bytes: number[] = [];
+    packed.forEach((records, index) => { for (const byte of encodeStoredBlock(records, vertices, packetVertexScale, index, compact)) bytes.push(byte); });
+    blocks.push({ bytes: new Uint8Array(bytes), vertexCount: packed.reduce((sum, records) => sum + records.length, 0) });
+  }
+  return blocks;
+}
+
+/**
+ * Lays out a standalone mesh.pck whose groups can hold several data blocks — the converter's own
+ * layout (makePckFile) generalized: per group a block count, its block list (VA, size / 16, emitted
+ * vertices) and the blocks, each 16-byte aligned. With one block per group it is the same layout.
+ */
+export function buildMeshPck(groups: { shaderId: number; blocks: MeshDataBlock[] }[], meshId: number, virtualOffset = VIRTUAL_OFFSET): Uint8Array {
+  const groupCount = groups.length;
+  const sizes = mainPointerSizes(groupCount);
+  let cursor = 32 + sizes.materials + sizes.count + sizes.pointers;
+  const listAt: number[] = [];
+  const dataAt: number[][] = [];
+  for (const group of groups) {
+    if (group.blocks.length > 0xffff) throw new Error("Too many data blocks in one material group.");
+    cursor += 16;                                             // block count chunk
+    listAt.push(cursor);
+    cursor += padSize(Math.max(group.blocks.length, 1) * 8, 16);
+    dataAt.push(group.blocks.map((block) => {
+      if (block.bytes.length % 16 || block.bytes.length / 16 > MAX_MESH_ENTRY_QWORDS) throw new Error("A data block doesn't fit its block list entry.");
+      if (block.vertexCount > 0xffff) throw new Error("A data block has too many vertices.");
+      const at = cursor; cursor += block.bytes.length; return at;
+    }));
+  }
+  const payload = new Uint8Array(cursor).fill(0xcd);
+  const view = new DataView(payload.buffer);
+  const materialPointer = 32, countPointer = 32 + sizes.materials, tablePointer = countPointer + sizes.count;
+  payload.set([0x98, 0x0f, 0x7a, 0x00]);
+  view.setUint32(4, 0, true);
+  view.setUint32(8, groupCount, true);
+  view.setUint32(12, virtualOffset + materialPointer, true);
+  view.setUint32(16, virtualOffset + tablePointer, true);
+  view.setUint32(20, 0, true);
+  view.setUint32(countPointer, groupCount, true);
+  groups.forEach((group, g) => {
+    view.setUint16(materialPointer + g * 2, group.shaderId & 0xffff, true);
+    view.setUint32(tablePointer + g * 8, virtualOffset + listAt[g], true);
+    view.setUint16(tablePointer + g * 8 + 4, group.blocks.length, true);
+    view.setUint32(listAt[g] - 16, group.blocks.length, true);
+    group.blocks.forEach((block, b) => {
+      view.setUint32(listAt[g] + b * 8, virtualOffset + dataAt[g][b], true);
+      view.setUint16(listAt[g] + b * 8 + 4, block.bytes.length / 16, true);
+      view.setUint16(listAt[g] + b * 8 + 6, block.vertexCount, true);
+      payload.set(block.bytes, dataAt[g][b]);
+    });
+  });
+  payload[MESH_ID_OFFSET - PAYLOAD_OFFSET] = meshId & 0xff;
+  const file = new Uint8Array(PAYLOAD_OFFSET + payload.length);
+  file.set(fileHeader(payload.length, virtualOffset));
+  file.set(payload, PAYLOAD_OFFSET);
+  return file;
+}
+
 // --- names and IDs -----------------------------------------------------------
 
 /** `5D - name.mesh.obj` → piece ID 0x5D plus the clean stem. A missing or invalid prefix means

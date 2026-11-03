@@ -88,7 +88,34 @@ function disposePieceObject(object: THREE.Mesh) {
   (object.material as THREE.Material)?.dispose?.();
 }
 
-function ShaderChip({ id, rgba, active, onRgbChange, onAlphaChange, onSelectTriangles }: { id: number; rgba: Rgba; active: boolean; onRgbChange(hex: string): void; onAlphaChange(alpha: number): void; onSelectTriangles(deselect: boolean): void }) {
+/**
+ * "Assign shader ▾": moves the selected triangles to the slot of the chosen shader in each piece.
+ * Lists the car's shader bank by name, the shaders the selected pieces already use first.
+ */
+function AssignShaderMenu({ bank, used, selectedCount, getColor, onPick }: { bank: { id: number; name: string }[] | null; used: number[]; selectedCount: number; getColor(id: number): Rgba; onPick(shaderId: number): void }) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => { const close = (event: MouseEvent) => { if (!ref.current?.contains(event.target as Node)) setOpen(false); }; window.addEventListener("mousedown", close); return () => window.removeEventListener("mousedown", close); }, []);
+  const disabled = !bank || !selectedCount;
+  const row = (entry: { id: number; name: string }) => {
+    const [r, g, b] = getColor(entry.id);
+    return <button key={entry.id} type="button" className="assign-shader-row" onClick={() => { setOpen(false); onPick(entry.id); }}>
+      <i style={{ background: `rgb(${Math.round(r * 255)} ${Math.round(g * 255)} ${Math.round(b * 255)})` }} /><span>{hex(entry.id, 2)}</span><em>{entry.name || tr("(unnamed)")}</em>
+    </button>;
+  };
+  const inUse = bank ? used.map((id) => bank[id]).filter(Boolean) : [];
+  return <div className="assign-shader" ref={ref}>
+    <button className={open ? "active" : ""} disabled={disabled} onClick={() => setOpen((value) => !value)} title={!bank ? tr("This car's shader list wasn't found, so there is nothing to assign") : !selectedCount ? tr("Select triangles first") : tr("Move the selected triangles to another shader. Each piece moves them into its slot with that shader, or a new slot when it has none. The file changes; Undo reverts it.")}>{tr("Assign shader ▾")}</button>
+    {open && bank && <div className="assign-shader-menu">
+      <p><Tx t="Move {0} selected triangles to:" v={[selectedCount.toLocaleString()]} /></p>
+      {inUse.length > 0 && <><strong>{tr("In the selected parts")}</strong>{inUse.map(row)}</>}
+      <strong>{tr("All shaders of this car")}</strong>
+      {bank.map(row)}
+    </div>}
+  </div>;
+}
+
+function ShaderChip({ id, name, rgba, active, onRgbChange, onAlphaChange, onSelectTriangles }: { id: number; name: string; rgba: Rgba; active: boolean; onRgbChange(hex: string): void; onAlphaChange(alpha: number): void; onSelectTriangles(deselect: boolean): void }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => { const close = (event: MouseEvent) => { if (!ref.current?.contains(event.target as Node)) setOpen(false); }; window.addEventListener("mousedown", close); return () => window.removeEventListener("mousedown", close); }, []);
@@ -98,7 +125,7 @@ function ShaderChip({ id, rgba, active, onRgbChange, onAlphaChange, onSelectTria
   const rgbaCss = `rgba(${r255}, ${g255}, ${b255}, ${a})`;
   const alphaTrack = { "--alpha-track": `linear-gradient(to right, transparent, ${solidCss}), ${CHECKERBOARD}` } as React.CSSProperties;
   return <div className={`shader-legend-chip ${active ? "active" : ""}`} ref={ref}>
-    <button type="button" className="shader-swatch" style={{ backgroundImage: `linear-gradient(${rgbaCss}, ${rgbaCss}), ${CHECKERBOARD}` }} onClick={(event) => { if (event.shiftKey) onSelectTriangles(event.ctrlKey || event.metaKey); else setOpen((value) => !value); }} title={tr(`Shader ${hex(id, 2)} — click to recolor, Shift-click to select its triangles (Ctrl+Shift to deselect)`)} />
+    <button type="button" className="shader-swatch" style={{ backgroundImage: `linear-gradient(${rgbaCss}, ${rgbaCss}), ${CHECKERBOARD}` }} onClick={(event) => { if (event.shiftKey) onSelectTriangles(event.ctrlKey || event.metaKey); else setOpen((value) => !value); }} title={tr(`Shader ${hex(id, 2)}${name ? ` ${name}` : ""} — click to recolor, Shift-click to select its triangles (Ctrl+Shift to deselect)`)} />
     <span>{hex(id, 2)}</span>
     {open && <div className="shader-picker-popover">
       <input type="color" className="shader-picker-color" value={rgbToHex([r, g, b])} onChange={(event) => onRgbChange(event.target.value)} />
@@ -108,7 +135,7 @@ function ShaderChip({ id, rgba, active, onRgbChange, onAlphaChange, onSelectTria
   </div>;
 }
 
-export function MeshEditorViewer({ meshes, visibleNames, document, selection, onSelect, onPieceContextMenu, onRevealPiece, onEditPieceId, onEditGroupShader, onUndo, onRedo, canUndo, canRedo, selectedTriangles, hiddenTriangles, onTriangleCommand }: {
+export function MeshEditorViewer({ meshes, visibleNames, document, selection, onSelect, onPieceContextMenu, onRevealPiece, onEditPieceId, onEditGroupShader, onUndo, onRedo, canUndo, canRedo, selectedTriangles, hiddenTriangles, onTriangleCommand, shaderBank, onAssignShader }: {
   meshes: MeshGeometry[];
   visibleNames: Set<string>;
   document: PckDocument | null;
@@ -125,6 +152,8 @@ export function MeshEditorViewer({ meshes, visibleNames, document, selection, on
   selectedTriangles: TriangleFlags;
   hiddenTriangles: TriangleFlags;
   onTriangleCommand(command: TriangleCommand): void;
+  shaderBank: { id: number; name: string }[] | null;
+  onAssignShader(shaderId: number): void;
 }) {
   const hostRef = useRef<HTMLDivElement>(null);
   const marqueeRef = useRef<HTMLDivElement>(null);
@@ -182,6 +211,7 @@ export function MeshEditorViewer({ meshes, visibleNames, document, selection, on
   const selectedCount = useMemo(() => visible.reduce((sum, mesh) => sum + countOf(selectedTriangles, mesh), 0), [visible, selectedTriangles]);
   const selectedPieces = useMemo(() => visible.filter((mesh) => countOf(selectedTriangles, mesh) > 0).length, [visible, selectedTriangles]);
   const hiddenCount = useMemo(() => visible.reduce((sum, mesh) => sum + countOf(hiddenTriangles, mesh), 0), [visible, hiddenTriangles]);
+  const selectedPartShaders = useMemo(() => [...new Set(visible.filter((mesh) => countOf(selectedTriangles, mesh) > 0).flatMap((mesh) => mesh.groupShaderIds))].sort((a, b) => a - b), [visible, selectedTriangles]);
   const selectionLodMatches = useMemo(() => (selection && document ? matchLodEntries(selection.meshName, document) : []), [selection, document]);
   // Multiple matches are only a real problem (blocking edits) when they disagree on the current ID —
   // a piece intentionally listed at HLOD *and* MLOD *and* LLOD with the same ID is normal, not ambiguous.
@@ -673,6 +703,8 @@ export function MeshEditorViewer({ meshes, visibleNames, document, selection, on
           <button className={similarScope === "all" ? "active" : ""} onClick={() => setSimilarScope("all")} title={tr("Same shader looks in every visible part")}>{tr("All parts")}</button>
         </span>
         <i />
+        <AssignShaderMenu bank={shaderBank} used={selectedPartShaders} selectedCount={selectedCount} getColor={getColor} onPick={onAssignShader} />
+        <i />
         <button onClick={() => onTriangleCommand({ kind: "hide" })} title={tr("Hide the selected triangles (H). View only — the file doesn't change.")}>{tr("Hide")}</button>
         <button onClick={() => onTriangleCommand({ kind: "isolate" })} title={tr("Hide everything except the selection (Shift+H)")}>{tr("Isolate")}</button>
         <button onClick={() => onTriangleCommand({ kind: "reveal" })} title={tr("Show every hidden triangle again (Alt+H)")}>{tr("Reveal")}</button>
@@ -683,7 +715,7 @@ export function MeshEditorViewer({ meshes, visibleNames, document, selection, on
       <div className="selection-marquee" ref={marqueeRef} hidden />
       {!visible.length && <div className="viewer-empty"><span>3D</span><strong>{tr("No visible geometry")}</strong><p>{tr("Show some parts in the pieces list to see them colored by shader here.")}</p></div>}
       <div className="viewer-stats"><span><Tx t="{0} parts" v={[visible.length]} /></span><span><Tx t="{0} tris" v={[visibleTriangleCount.toLocaleString()]} /></span><span><Tx t="{0} shaders" v={[shaderLegend.length]} /></span>{selectedCount > 0 && <span className="stat-selected"><Tx t="{0} selected in {1} parts" v={[selectedCount.toLocaleString(), selectedPieces]} /></span>}{hiddenCount > 0 && <span className="stat-hidden"><Tx t="{0} hidden" v={[hiddenCount.toLocaleString()]} /></span>}</div>
-      <div className="shader-legend">{shaderLegend.map((id) => <ShaderChip key={id} id={id} rgba={getColor(id)} active={selection?.shaderId === id} onRgbChange={(value) => setShaderRgb(id, value)} onAlphaChange={(value) => setShaderAlpha(id, value)} onSelectTriangles={(deselect) => onTriangleCommand({ kind: "shader", shaderId: id, deselect })} />)}</div>
+      <div className="shader-legend">{shaderLegend.map((id) => <ShaderChip key={id} id={id} name={shaderBank?.[id]?.name ?? ""} rgba={getColor(id)} active={selection?.shaderId === id} onRgbChange={(value) => setShaderRgb(id, value)} onAlphaChange={(value) => setShaderAlpha(id, value)} onSelectTriangles={(deselect) => onTriangleCommand({ kind: "shader", shaderId: id, deselect })} />)}</div>
       {selection && (() => {
         const shaderRgba = selection.shaderId !== null ? getColor(selection.shaderId) : null;
         const standaloneRaw = meshes.find((mesh) => mesh.name === selection.meshName)?.meshId;

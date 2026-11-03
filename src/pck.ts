@@ -840,6 +840,56 @@ export class PckDocument {
     return output;
   }
 
+  /**
+   * The car's shader bank: a piece's shader ID is an index into it. Found the way the community
+   * porting tools find it — a counted array of shader objects whose header points 0x20 ahead to the
+   * array, repeats the count in two u16s, has 1 sixteen bytes before it, and the count again sixteen
+   * bytes before the array. Every car PCK in the HostFS and VIP installs (655) has exactly one, and
+   * every shader ID of their 21,200 embedded pieces is below its size. Names are the `*.shadert`
+   * of each entry, or of its children for a composite (carpaint + carbon_fiber); "" when unresolved.
+   * Null when no single bank is found (PSP files, or anything unexpected).
+   */
+  shaderBank(): { id: number; name: string }[] | null {
+    if (this.shaderBankCache && this.shaderBankCache.bytes === this.bytes) return this.shaderBankCache.bank;
+    const bank = this.format === "pck" ? this.findShaderBank() : null;
+    this.shaderBankCache = { bytes: this.bytes, bank };
+    return bank;
+  }
+  private shaderBankCache: { bytes: Uint8Array; bank: { id: number; name: string }[] | null } | null = null;
+  private findShaderBank() {
+    const base = this.pointerBase;
+    const length = this.bytes.length;
+    const objectOk = (offset: number) => offset >= 0x80 && offset < length - 64;
+    const name = (offset: number, depth: number): string => {
+      if (depth > 6 || !objectOk(offset)) return "";
+      const text = offset + 40 < length - 4 ? (u32(this.view, offset + 40) - base) | 0 : -1;
+      if (text >= 0x80 && text < length) {
+        let end = text;
+        while (end < length && end - text < 128 && this.bytes[end] !== 0) end += 1;
+        const value = String.fromCharCode(...this.bytes.subarray(text, end));
+        if (/^[A-Za-z0-9_]+\.shadert$/.test(value)) return value.replace(/\.shadert$/, "");
+      }
+      const children = (u32(this.view, offset + 48) - base) | 0;
+      const count = u32(this.view, offset + 56);
+      if (count >= 1 && count <= 16 && children >= 0x80 && children + count * 4 <= length) {
+        const parts = Array.from({ length: count }, (_, i) => name((u32(this.view, children + i * 4) - base) | 0, depth + 1));
+        if (parts.every(Boolean)) return parts.join(" + ");
+      }
+      return "";
+    };
+    const found: { id: number; name: string }[][] = [];
+    for (let at = 0x90; at + 32 < length; at += 16) {
+      const array = (u32(this.view, at + 4) - base) | 0;
+      const count = u16(this.view, at + 8);
+      if (array !== at + 32 || count !== u16(this.view, at + 10) || count < 1 || count > 128 || array + count * 4 > length) continue;
+      if (u32(this.view, at - 16) !== 1 || u32(this.view, array - 16) !== count) continue;
+      const objects = Array.from({ length: count }, (_, i) => (u32(this.view, array + i * 4) - base) | 0);
+      if (!objects.every(objectOk)) continue;
+      found.push(objects.map((offset, id) => ({ id, name: name(offset, 0) })));
+    }
+    return found.length === 1 ? found[0] : null;
+  }
+
   /** True when this embedded copy's group slot has a pending (unsaved) shader-ID edit — used to
    *  drive the "pending save" UI indicator without exposing the internal dirtyShaderKeys format. */
   isGroupShaderDirty(meshBlockOffset: number, group: number): boolean {

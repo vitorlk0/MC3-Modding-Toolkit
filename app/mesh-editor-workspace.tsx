@@ -8,7 +8,7 @@ import { MeshEditorViewer, type MeshSelection } from "./mesh-editor-viewer";
 import { MeshPieceList } from "./mesh-piece-list";
 import { ResizeHandle } from "./resize-handle";
 import { ContextMenu, type ContextMenuState } from "./context-menu";
-import { applyTriangleCommand, countOf, NO_TRIANGLES, type TriangleCommand, type TriangleState } from "./mesh-selection";
+import { applyTriangleCommand, countOf, flagsOf, NO_TRIANGLES, type TriangleCommand, type TriangleState } from "./mesh-selection";
 
 const plannedFeatures = [
   { title: "Piece ID + shader editing", detail: "Edit a piece's ID and per-group shader IDs, kept in sync across the Player, Garage and Opponent PCKs." },
@@ -26,7 +26,7 @@ function defaultVisibleNames(meshes: MeshGeometry[], document: PckDocument | nul
   return new Set(meshes.filter((mesh) => !defaultHiddenReason(mesh, document, customizable)).map((mesh) => mesh.name));
 }
 
-export function MeshEditorWorkspace({ document, activeRole, slots, onSelectRole, meshes, onEditPieceId, onEditGroupShader, onUpdateEmbedded, onRemoveEmbedded, onUpdateAllEmbedded, onConvertObjs, zeroShellId, onSetZeroShellId, compactStreams, onSetCompactStreams, onExportObj, embeddedUnreadable, embeddedEmpty, objFolder, describeEmbedTarget, describePieceSize, onUndo, onRedo, canUndo, canRedo, vehicleBase, loadedCount, onOpenFolder, recentVehicleFolders, onOpenRecentFolder, onClearRecentFolders, listWidth, onResizeList }: {
+export function MeshEditorWorkspace({ document, activeRole, slots, onSelectRole, meshes, onEditPieceId, onEditGroupShader, onAssignShader, shaderBank, onUpdateEmbedded, onRemoveEmbedded, onUpdateAllEmbedded, onConvertObjs, zeroShellId, onSetZeroShellId, compactStreams, onSetCompactStreams, onExportObj, embeddedUnreadable, embeddedEmpty, objFolder, describeEmbedTarget, describePieceSize, onUndo, onRedo, canUndo, canRedo, vehicleBase, loadedCount, onOpenFolder, recentVehicleFolders, onOpenRecentFolder, onClearRecentFolders, listWidth, onResizeList }: {
   document: PckDocument | null;
   activeRole: VehicleRole | null;
   slots: VehicleSlots;
@@ -34,6 +34,10 @@ export function MeshEditorWorkspace({ document, activeRole, slots, onSelectRole,
   meshes: MeshGeometry[];
   onEditPieceId(meshName: string, entries: LodMeshEntry[], newId: number): void;
   onEditGroupShader(meshName: string, group: number, newId: number): void;
+  /** Moves each piece's listed triangles to the slot using `shaderId` (a new slot if it has none). */
+  onAssignShader(pieces: { meshName: string; triangles: number[] }[], shaderId: number): void;
+  /** The car's shader bank (index = shader ID), limited to what every loaded PCK defines; null when not found. */
+  shaderBank: { id: number; name: string }[] | null;
   onUpdateEmbedded(meshName: string): void;
   /** Takes the piece's embedded copy out of every loaded PCK; its table row stays. */
   onRemoveEmbedded(meshName: string): void;
@@ -94,6 +98,15 @@ export function MeshEditorWorkspace({ document, activeRole, slots, onSelectRole,
   const visibleMeshes = useMemo(() => meshes.filter((mesh) => visibleNames.has(mesh.name)), [meshes, visibleNames]);
   const runTriangleCommand = (command: TriangleCommand) => setTriangles((current) => applyTriangleCommand(current, command, visibleMeshes));
   const describeTriangles = (mesh: MeshGeometry) => ({ selected: countOf(triangles.selected, mesh), hidden: countOf(triangles.hidden, mesh) });
+  // Selected triangles of the visible pieces, piece by piece: what "Assign shader" acts on.
+  const assignSelectionShader = (shaderId: number) => {
+    const pieces = visibleMeshes.flatMap((mesh) => {
+      const flags = flagsOf(triangles.selected, mesh); if (!flags) return [];
+      const list: number[] = []; flags.forEach((flag, triangle) => { if (flag) list.push(triangle); });
+      return list.length ? [{ meshName: mesh.name, triangles: list }] : [];
+    });
+    if (pieces.length) onAssignShader(pieces, shaderId);
+  };
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
   // A fresh object per request so double-clicking the same piece twice still re-scrolls to it.
   const [revealRequest, setRevealRequest] = useState<{ meshName: string } | null>(null);
@@ -177,7 +190,7 @@ export function MeshEditorWorkspace({ document, activeRole, slots, onSelectRole,
       <div className="mesh-editor-body">
         <MeshPieceList key={vehicleBase} meshes={meshes} document={document} visibleNames={visibleNames} onSetVisible={setVisible} selection={selection} onSelect={setSelection} onEditPieceId={onEditPieceId} onEditGroupShader={onEditGroupShader} onUpdateEmbedded={onUpdateEmbedded} describeEmbedTarget={describeEmbedTarget} describePieceSize={describePieceSize} onPieceContextMenu={openPieceMenu} revealRequest={revealRequest} width={listWidth} describeTriangles={describeTriangles} />
         <ResizeHandle variant="resize-mesh-list" onDrag={onResizeList} />
-        <MeshEditorViewer meshes={meshes} visibleNames={visibleNames} document={document} selection={selection} onSelect={setSelection} onPieceContextMenu={openPieceMenu} onRevealPiece={(meshName) => setRevealRequest({ meshName })} onEditPieceId={editSelectedPieceId} onEditGroupShader={editSelectedGroupShader} onUndo={onUndo} onRedo={onRedo} canUndo={canUndo} canRedo={canRedo} selectedTriangles={triangles.selected} hiddenTriangles={triangles.hidden} onTriangleCommand={runTriangleCommand} />
+        <MeshEditorViewer meshes={meshes} visibleNames={visibleNames} document={document} selection={selection} onSelect={setSelection} onPieceContextMenu={openPieceMenu} onRevealPiece={(meshName) => setRevealRequest({ meshName })} onEditPieceId={editSelectedPieceId} onEditGroupShader={editSelectedGroupShader} onUndo={onUndo} onRedo={onRedo} canUndo={canUndo} canRedo={canRedo} selectedTriangles={triangles.selected} hiddenTriangles={triangles.hidden} onTriangleCommand={runTriangleCommand} shaderBank={shaderBank} onAssignShader={assignSelectionShader} />
       </div>
       {contextMenu && <ContextMenu menu={contextMenu} onClose={closeContextMenu} />}
     </main>

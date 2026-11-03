@@ -66,6 +66,15 @@ button { color:inherit; }
 .selection-marquee { position:absolute; z-index:3; border:1px dashed #ffb35c; background:rgba(255,154,31,.08); pointer-events:none; }
 .selection-marquee[hidden] { display:none; }
 .viewer-stats .stat-selected { border-color:#6b4a22; color:#ffb35c; }
+.selection-tools button:disabled { opacity:.35; cursor:default; }
+.assign-shader { position:relative; }
+.assign-shader-menu { position:absolute; top:calc(100% + 6px); left:0; z-index:20; width:270px; max-height:min(420px,60vh); overflow:auto; display:flex; flex-direction:column; gap:2px; padding:8px; border:1px solid #343b34; border-radius:8px; background:#14170f; box-shadow:0 16px 35px rgba(0,0,0,.5); scrollbar-color:#343a34 transparent; }
+.assign-shader-menu p { margin:0 0 6px; color:#9aa19a; font-size:10px; }
+.assign-shader-menu strong { margin:6px 0 3px; color:#6f776f; font:9px var(--mono); text-transform:uppercase; }
+.assign-shader-menu .assign-shader-row { display:grid; grid-template-columns:10px 34px minmax(0,1fr); align-items:center; gap:8px; width:100%; padding:5px 7px; border:1px solid transparent; border-radius:5px; background:transparent; color:#cdd2cd; font:10px var(--mono); text-align:left; cursor:pointer; }
+.assign-shader-menu .assign-shader-row:hover { border-color:#4c5749; background:#1b2018; color:#fff; }
+.assign-shader-row i { width:10px; height:10px; border-radius:3px; }
+.assign-shader-row em { overflow:hidden; color:#9aa39a; font-style:normal; text-overflow:ellipsis; white-space:nowrap; }
 .shader-legend { position:absolute; left:10px; bottom:10px; max-width:calc(100% - 20px); display:flex; flex-wrap:wrap; gap:7px; pointer-events:auto; }
 .shader-legend-chip { position:relative; display:flex; align-items:center; gap:7px; padding:6px 11px; border:1px solid #2b322b; border-radius:7px; background:rgba(13,16,14,.85); color:#9aa19a; font:14px var(--mono); backdrop-filter:blur(5px); }
 .shader-legend-chip:hover { border-color:#4c5749; color:#d7dcd6; }

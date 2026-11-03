@@ -9,7 +9,8 @@ import { join } from "@tauri-apps/api/path";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { formatClipboard, hex, parseClipboard, PckDocument, type LodMeshEntry, type MeshBlobSnapshot, type Vec3 } from "../src/pck";
-import { EmptyMeshError, MeshPckDocument, defaultHiddenReason, hasStockVariants, isLowLodOnly, isShadowPlane, isShellFamily, matchLodEntries, parseEmbeddedMesh, resolveGroupShaderId, resolvePieceId, type MeshGeometry } from "../src/mesh";
+import { EmptyMeshError, MeshPckDocument, defaultHiddenReason, hasStockVariants, isLowLodOnly, isShadowPlane, isShellFamily, matchLodEntries, parseEmbeddedMesh, resolveGroupShaderId, resolvePieceId, sameMeshGeometry, type MeshGeometry } from "../src/mesh";
+import { moveTrianglesToShader } from "../src/mesh-slots";
 import { isShellPiece } from "../src/mesh-inject";
 import { exportMeshObj } from "../src/obj-export";
 import { convertObjToMeshPck } from "../src/obj";
@@ -98,6 +99,8 @@ type MeshBlobAction = {
   kind: "meshBlob";
   meshName: string;
   targets: { role: VehicleRole; before: MeshBlobSnapshot; after: MeshBlobSnapshot }[];
+  /** Loose mesh.pck files the same action rewrote (a slot move), restored along with the PCKs. */
+  loose?: { meshName: string; before: Uint8Array; after: Uint8Array }[];
 };
 type MeshEditAction = PieceIdAction | ShaderIdAction | MeshBlobAction;
 type FileEntry = { path: string; name: string };
@@ -597,6 +600,71 @@ export default function App() {
     setStatus(`${actionLabel} · ${parts} into ${targets.length} PCK${targets.length === 1 ? "" : "s"} · ${replacedEntries} LOD slot${replacedEntries === 1 ? "" : "s"} repointed${zeroNote} · ${sizeNote}${warnNote}`);
   }, [describeEmbedTarget, meshDocs, refresh, slots, zeroShellId]);
 
+  /**
+   * Moves selected triangles to the slot that uses `shaderId` in each piece (a new slot when the
+   * piece has none), as one Undo step. The move is planned on the copy the Meshes tab shows — the
+   * loose mesh.pck, or the viewed PCK's copy for a piece that only exists embedded — and the same
+   * resulting piece is written to every copy that draws the same geometry: the loose file and the
+   * embedded copies in each loaded PCK. A copy that differs (not synced) is left alone and reported.
+   */
+  const assignShader = useCallback((pieces: { meshName: string; triangles: number[] }[], shaderId: number) => {
+    const documents = roles.map((role) => ({ role, document: slots[role]?.document })).filter((item): item is { role: VehicleRole; document: PckDocument } => Boolean(item.document));
+    const before = new Map(documents.map(({ document }) => [document, document.captureState()]));
+    const sizeBefore = new Map(documents.map(({ document }) => [document, document.projectedSize]));
+    const touched = new Set<PckDocument>();
+    const loose: NonNullable<MeshBlobAction["loose"]> = [];
+    const warnings: string[] = [];
+    let movedTriangles = 0, changedPieces = 0, newSlots = 0;
+    for (const { meshName, triangles } of pieces) {
+      try {
+        const looseDoc = meshDocs.get(meshName) ?? null;
+        let source: { bytes: Uint8Array; geometry: MeshGeometry };
+        if (looseDoc) source = { bytes: looseDoc.bytes, geometry: looseDoc.geometry };
+        else {
+          const entry = meshDocument ? matchLodEntries(meshName, meshDocument).find((item) => item.meshBlockOffset !== null) : undefined;
+          if (!meshDocument || !entry) throw new Error("no copy of this piece is loaded");
+          source = { bytes: meshDocument.bytes, geometry: parseEmbeddedMesh(entry, meshDocument) };
+        }
+        const result = moveTrianglesToShader(source.bytes, source.geometry, triangles, shaderId, compactStreams);
+        if (!result.moved) continue;
+        // Decide every embedded copy before writing any, against the geometry the move was planned on.
+        const copies: { document: PckDocument; entries: LodMeshEntry[] }[] = [];
+        for (const { role, document } of documents) {
+          const entries = matchLodEntries(meshName, document).filter((item) => item.meshBlockOffset !== null);
+          const matching = entries.filter((item) => { try { return sameMeshGeometry(parseEmbeddedMesh(item, document), source.geometry); } catch { return false; } });
+          if (matching.length < entries.length) warnings.push(`${meshName} on ${roleLabels[role]}: its embedded copy differs from the one shown, so it was left as is (sync it first)`);
+          if (matching.length) copies.push({ document, entries: matching });
+        }
+        if (looseDoc) { const previous = looseDoc.bytes.slice(); looseDoc.setContents(result.bytes); loose.push({ meshName, before: previous, after: looseDoc.bytes.slice() }); }
+        for (const { document, entries } of copies) { for (const entry of entries) document.replaceEmbeddedMesh(entry, result.bytes, false); touched.add(document); }
+        movedTriangles += result.moved; changedPieces += 1; if (result.newSlot) newSlots += 1;
+      } catch (error) {
+        warnings.push(`${meshName}: ${error instanceof Error ? error.message : "unknown error"}`);
+      }
+    }
+    const targets: MeshBlobAction["targets"] = documents.filter(({ document }) => touched.has(document)).map(({ role, document }) => ({ role, before: before.get(document)!, after: document.captureState() }));
+    if (targets.length || loose.length) {
+      pieceIdUndoRef.current.push({ kind: "meshBlob", meshName: `Shader ${hex(shaderId, 2)}`, targets, loose });
+      if (pieceIdUndoRef.current.length > 20) pieceIdUndoRef.current.shift();
+      pieceIdRedoRef.current = [];
+    }
+    refresh();
+    if (warnings.length) console.warn("Assign shader warnings:", warnings);
+    if (!changedPieces) { setStatus(warnings.length ? `Nothing moved · ${warnings[0]}` : "Nothing moved: the selected triangles already use that shader."); return; }
+    // Car PCKs only: the loose files are separate and the projected size is what the car costs.
+    const added = [...touched].reduce((sum, document) => sum + (document.projectedSize - (sizeBefore.get(document) ?? document.projectedSize)), 0);
+    const sizeNote = added ? `${added > 0 ? "+" : "−"}${sizeLabel(Math.abs(added))} once saved` : "same size";
+    const warnNote = warnings.length ? ` · ${warnings.length} skipped (see console)` : "";
+    setStatus(`Moved ${movedTriangles} triangle${movedTriangles === 1 ? "" : "s"} in ${changedPieces} piece${changedPieces === 1 ? "" : "s"} to shader ${hex(shaderId, 2)} · ${newSlots} new slot${newSlots === 1 ? "" : "s"} · ${sizeNote}${warnNote}`);
+  }, [compactStreams, meshDocs, meshDocument, refresh, slots]);
+  /** The viewed car's shader bank, cut to the IDs every loaded PCK has (213 of 217 cars agree). */
+  const shaderBank = useMemo(() => {
+    const bank = meshDocument?.shaderBank();
+    if (!bank) return null;
+    const sizes = roles.map((role) => slots[role]?.document.shaderBank()?.length).filter((size): size is number => size !== undefined);
+    const limit = Math.min(bank.length, ...sizes);
+    return bank.slice(0, limit);
+  }, [meshDocument, slots, revision]);
   const updateEmbeddedMesh = useCallback((meshName: string) => {
     updateEmbeddedMeshes([meshName], meshName.replace(/\.mesh\.pck$/i, ""));
   }, [updateEmbeddedMeshes]);
@@ -790,7 +858,13 @@ export default function App() {
     };
     if (entry.kind === "meshBlob") {
       const documents = entry.targets.map((target) => documentFor(target.role));
+      const looseDocs = (entry.loose ?? []).map((item) => {
+        const doc = meshDocs.get(item.meshName);
+        if (!doc) throw new Error(`${item.meshName} is no longer loaded`);
+        return doc;
+      });
       entry.targets.forEach((target, i) => documents[i].restoreState(target[direction]));
+      (entry.loose ?? []).forEach((item, i) => looseDocs[i].setContents(item[direction]));
       return;
     }
     // Resolve everything before writing anything, so a stale entry fails without a partial replay.
@@ -1089,6 +1163,9 @@ export default function App() {
       for (const meshDoc of dirtyMeshDocs) {
         const view = new DataView(meshDoc.bytes.buffer, meshDoc.bytes.byteOffset);
         const savedView = new DataView(meshDoc.savedBytes.buffer, meshDoc.savedBytes.byteOffset);
+        // A slot move rebuilds the piece and already wrote every matching embedded copy; with a new
+        // slot the group count changed and the saved file's table no longer lines up group by group.
+        if (meshDoc.savedBytes.length < 0x8c || savedView.getUint32(0x88, true) !== meshDoc.geometry.groupShaderIds.length) continue;
         const changedGroups = meshDoc.geometry.groupShaderOffsets
           .map((offset, group) => ({ group, changed: view.getUint16(offset, true) !== savedView.getUint16(offset, true) }))
           .filter((entry) => entry.changed)
@@ -1697,7 +1774,7 @@ export default function App() {
       <ResizeHandle variant="resize-editor" onDrag={resizeEditor} />
       <MeshViewer document={document} selected={selected} multiSelected={selectedIndices} meshes={anchorMeshes} visibleAnchors={visibleMeshAnchors} referenceGeometry={referenceGeometry} rimSizeInches={rimSizeInches} revision={revision} onMoveSelection={moveSelection} onRotateSelection={rotateSelection} canRotate={document.rotationEditable && !positionLocked} cameraEdit={cameraMode && garage && cameraPoints ? { camera: garageToPck(cameraPoints.camera), target: garageToPck(cameraPoints.target), handle: cameraHandle, lookThrough, targetPlane, safeAreas, fov: garage.fov, aspect: cameraAspects[cameraAspect], onSelectHandle: setCameraHandle, onToggleLookThrough: () => setLookThrough((value) => !value), onMove: moveShopCamera } : null} />
     </main>)}
-    {workspace === "mesh" && <div className="mesh-editor-shell"><MeshEditorWorkspace document={meshDocument} activeRole={meshRole} slots={slots} onSelectRole={setMeshViewRole} meshes={meshEditorMeshes} onEditPieceId={editPieceId} onEditGroupShader={editGroupShader} onUpdateEmbedded={updateEmbeddedMesh} onRemoveEmbedded={removeEmbeddedPiece} onUpdateAllEmbedded={updateAllEmbeddedMeshes} onConvertObjs={() => void chooseObjFolder()} zeroShellId={zeroShellId} onSetZeroShellId={setZeroShellId} compactStreams={compactStreams} onSetCompactStreams={setCompactStreams} onExportObj={(mesh) => void exportPieceObj(mesh)} embeddedUnreadable={embeddedOnly.unreadable} embeddedEmpty={embeddedOnly.empty} objFolder={objFolder} describeEmbedTarget={describeEmbedTarget} describePieceSize={describePieceSize} onUndo={meshUndo} onRedo={meshRedo} canUndo={pieceIdUndoRef.current.length > 0} canRedo={pieceIdRedoRef.current.length > 0} vehicleBase={vehicleBase} loadedCount={loadedCount} onOpenFolder={() => void openFolder()} recentVehicleFolders={recentVehicleFolders} onOpenRecentFolder={(path) => void openVehicleFolderAtPath(path)} onClearRecentFolders={clearVehicleRecents} listWidth={panelWidths.meshList} onResizeList={resizeMeshList} /></div>}
+    {workspace === "mesh" && <div className="mesh-editor-shell"><MeshEditorWorkspace document={meshDocument} activeRole={meshRole} slots={slots} onSelectRole={setMeshViewRole} meshes={meshEditorMeshes} onEditPieceId={editPieceId} onEditGroupShader={editGroupShader} onAssignShader={assignShader} shaderBank={shaderBank} onUpdateEmbedded={updateEmbeddedMesh} onRemoveEmbedded={removeEmbeddedPiece} onUpdateAllEmbedded={updateAllEmbeddedMeshes} onConvertObjs={() => void chooseObjFolder()} zeroShellId={zeroShellId} onSetZeroShellId={setZeroShellId} compactStreams={compactStreams} onSetCompactStreams={setCompactStreams} onExportObj={(mesh) => void exportPieceObj(mesh)} embeddedUnreadable={embeddedOnly.unreadable} embeddedEmpty={embeddedOnly.empty} objFolder={objFolder} describeEmbedTarget={describeEmbedTarget} describePieceSize={describePieceSize} onUndo={meshUndo} onRedo={meshRedo} canUndo={pieceIdUndoRef.current.length > 0} canRedo={pieceIdRedoRef.current.length > 0} vehicleBase={vehicleBase} loadedCount={loadedCount} onOpenFolder={() => void openFolder()} recentVehicleFolders={recentVehicleFolders} onOpenRecentFolder={(path) => void openVehicleFolderAtPath(path)} onClearRecentFolders={clearVehicleRecents} listWidth={panelWidths.meshList} onResizeList={resizeMeshList} /></div>}
     {workspace === "performance" && <PerformanceWorkspace slots={slots} workingRole={workingRole} vehicleBase={vehicleBase} loadedCount={loadedCount} revision={revision} onApply={applyPerformance} onStatus={setStatus} onOpenFolder={() => void openFolder()} recentVehicleFolders={recentVehicleFolders} onOpenRecentFolder={(path) => void openVehicleFolderAtPath(path)} onClearRecentFolders={clearVehicleRecents} />}
     {workspace === "audio" && <AudioWorkspace slots={slots} workingRole={workingRole} vehicleBase={vehicleBase} loadedCount={loadedCount} revision={revision} onApply={applyAudio} onStatus={setStatus} onOpenFolder={() => void openFolder()} recentVehicleFolders={recentVehicleFolders} onOpenRecentFolder={(path) => void openVehicleFolderAtPath(path)} onClearRecentFolders={clearVehicleRecents} />}
     <div className="workspace-host" style={{ display: workspace === "textures" ? "contents" : "none" }}><TextureWorkspace active={workspace === "textures"} dropped={texturesDrop} onConsumeDrop={() => setTexturesDrop(null)} onStatus={setStatus} isPathBlocked={isVehiclePathBlocked} onPendingChange={setTexturesPending} menuRef={textureMenu} /></div>
