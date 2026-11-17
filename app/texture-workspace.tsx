@@ -1,7 +1,7 @@
 import { tr, Tx, confirmDialog } from "./i18n";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { open, save as saveDialog } from "@tauri-apps/plugin-dialog";
-import { readFile, writeFile } from "@tauri-apps/plugin-fs";
+import { readDir, readFile, writeFile } from "@tauri-apps/plugin-fs";
 import { join } from "@tauri-apps/api/path";
 import {
   buildAllMipImport, buildFlashImport, buildSingleMipImport, decodeTexture, hasMips, paletteOrders, prepareImportSource, REMIX_MIP_LEVELS, REMIX_PALETTE_RELATIVE, textureBytes, unpackPalette8,
@@ -11,12 +11,16 @@ import { decodePng, encodePng } from "../src/png";
 import type { ScanMessage } from "../src/texture-scan.worker";
 import { basename, parentFolder, parentPath, readToolkitFile, sizeLabel, writeVerified } from "./mod-toolkit/toolkit-io";
 import { loadRecent, pushRecent, saveRecent } from "./recent-paths";
+import { carTextureCandidate, listCarTextures, uvTriangles } from "../src/car-textures";
+import { parseEmbeddedMesh, parseMeshPck, type MeshGeometry } from "../src/mesh";
+import { hex, type PckDocument } from "../src/pck";
 
 /**
- * Textures — find, preview, export and replace the PS2 indexed textures inside one PCK: a car PCK
- * (non-remix 256 textures and remix mip chains, found by a scored scan) or a Flash/UI PCK
- * (ds_/ms_/ps_/vs_, whose texture records are read exactly). A port of the Texture Finder script;
- * every byte it computes is produced by `src/ps2-texture.ts`, validated against that script.
+ * Textures — find, preview, export and replace the PS2 indexed textures inside one PCK. A car PCK's
+ * textures are read exactly through its shaders (src/car-textures.ts): the atlas and the 8x8 window,
+ * with what uses each one and its UVs. The Texture Finder's scored scan stays as a manual fallback,
+ * and a Flash/UI PCK (ds_/ms_/ps_/vs_) has its records read exactly. Every byte written is produced by
+ * `src/ps2-texture.ts`, validated against the Texture Finder script.
  *
  * A loose-file tool like the Mod Toolkit: it opens its own file, holds edits in memory with undo,
  * and writes only on Save. Saving goes through `writeVerified`, so a car PCK the vehicle set holds
@@ -37,7 +41,11 @@ const hex8 = (value: number) => `0x${value.toString(16).toUpperCase().padStart(8
 const parseOffset = (text: string) => { const value = text.trim().replace(/_/g, ""); if (!value) return null; const parsed = /^0x[0-9a-f]+$/i.test(value) ? parseInt(value, 16) : /^\d+$/.test(value) ? Number(value) : NaN; return Number.isFinite(parsed) ? parsed : null; };
 const sameBytes = (a: Uint8Array, b: Uint8Array) => a.length === b.length && a.every((value, i) => value === b[i]);
 const layoutName = (candidate: Candidate) => candidate.layout === "flash" ? "Flash / Shop" : candidate.layout === "remix" ? "Remix" : "Non-remix";
-const mipLevels = (candidate: Candidate) => hasMips(candidate) ? REMIX_MIP_LEVELS : REMIX_MIP_LEVELS.slice(0, 1);
+const mipLevels = (candidate: Candidate) => candidate.mips ?? (hasMips(candidate) ? REMIX_MIP_LEVELS : REMIX_MIP_LEVELS.slice(0, 1));
+/** A 4-bit car texture (the 8x8 window) is shown and exported, but the importers only build 8-bit sets. */
+const importable = (candidate: Candidate) => candidate.layout === "flash" || candidate.bpp === 8;
+/** One piece of the car, with the triangles that use the selected texture. */
+type TexturePiece = { key: string; label: string; mesh: MeshGeometry };
 const isTyping = (target: EventTarget | null) => target instanceof HTMLElement && Boolean(target.closest("input, select, textarea"));
 
 /** What the app's File and Edit menus need from this tab while it is the active one: the menus are
@@ -57,7 +65,8 @@ function drawRgba(canvas: HTMLCanvasElement | null, image: RgbaImage | null) {
 
 /** Byte spans a candidate's image comes from: its texture (a remix chain spans every level) and its palette. */
 function candidateSpans(candidate: Candidate): [number, number][] {
-  const texture = candidate.layout === "remix" ? 0x15700 : textureBytes(candidate.width, candidate.height, candidate.bpp);
+  const last = mipLevels(candidate).at(-1)!;
+  const texture = candidate.mips ? last[1] + textureBytes(last[0], last[0], candidate.bpp) : candidate.layout === "remix" ? 0x15700 : textureBytes(candidate.width, candidate.height, candidate.bpp);
   return [[candidate.textureOffset, candidate.textureOffset + texture], [candidate.paletteOffset, candidate.paletteOffset + (candidate.bpp === 8 ? 0x400 : 0x40)]];
 }
 
@@ -75,6 +84,29 @@ function Thumbnail({ data, candidate, version }: { data: Uint8Array; candidate: 
     } catch { drawRgba(ref.current, null); }
   }, [candidate, version]);
   return <canvas ref={ref} className="tex-thumb" />;
+}
+
+/** Every piece of the car, read-only: the copies embedded in the PCK, then the loose mesh.pck files in
+ *  its folder (a piece with both shows once). A file that doesn't parse is skipped. */
+async function loadPieces(path: string, doc: PckDocument): Promise<TexturePiece[]> {
+  const pieces: TexturePiece[] = [];
+  const seen = new Set<string>();
+  const add = (key: string, label: string, mesh: MeshGeometry) => { if (seen.has(key)) return; seen.add(key); pieces.push({ key, label, mesh }); };
+  for (const entry of doc.lodMeshes) {
+    if (entry.meshBlockOffset === null || !entry.name) continue;
+    try { add(`${entry.name.toLowerCase()}`, `${entry.name} · ${entry.lod.toUpperCase()}`, parseEmbeddedMesh(entry, doc)); } catch { /* unreadable or empty */ }
+  }
+  try {
+    const folder = parentPath(path);
+    for (const item of await readDir(folder)) {
+      if (!item.isFile || !/\.mesh\.pck$/i.test(item.name)) continue;
+      try {
+        const bytes = await readFile(await join(folder, item.name));
+        add(item.name.replace(/\.pck$/i, "").toLowerCase(), item.name.replace(/\.pck$/i, ""), parseMeshPck(item.name, bytes.slice().buffer, doc));
+      } catch { /* unreadable or empty */ }
+    }
+  } catch { /* the folder can't be listed: embedded pieces only */ }
+  return pieces.sort((a, b) => a.label.localeCompare(b.label));
 }
 
 export function TextureWorkspace({ active, dropped, onConsumeDrop, onStatus, isPathBlocked, onPendingChange, menuRef }: {
@@ -106,6 +138,13 @@ export function TextureWorkspace({ active, dropped, onConsumeDrop, onStatus, isP
   const [viewport, setViewport] = useState({ width: 0, height: 0 });
   const [error, setError] = useState("");
   const [recents, setRecents] = useState<string[]>(() => loadRecent(RECENTS_KEY));
+  /** The car PCK's own texture list, read through its shaders; null for anything else. */
+  const [exact, setExact] = useState<{ doc: PckDocument; candidates: Candidate[] } | null>(null);
+  /** Every piece of the car (embedded copies, then loose mesh.pck files beside the PCK), for "Used by" and UVs. */
+  const [pieces, setPieces] = useState<TexturePiece[]>([]);
+  const [showUvs, setShowUvs] = useState(true);
+  const [uvPiece, setUvPiece] = useState<string | null>(null);
+  const uvCanvasRef = useRef<HTMLCanvasElement>(null);
   const workerRef = useRef<Worker | null>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const stageRef = useRef<HTMLDivElement>(null);
@@ -145,15 +184,15 @@ export function TextureWorkspace({ active, dropped, onConsumeDrop, onStatus, isP
   const setZoomLevel = (value: number) => setZoom(Math.max(0.1, Math.min(16, value)));
 
   /** Points the decoder at one level of a candidate, the way selecting it in the script does. */
-  const showCandidate = useCallback((next: Candidate, size = 256) => {
-    const level = next.layout === "flash" ? 0 : (mipLevels(next).find(([levelSize]) => levelSize === size) ?? [256, 0])[1];
+  const showCandidate = useCallback((next: Candidate, size = mipLevels(next)[0][0]) => {
+    const level = next.layout === "flash" ? 0 : (mipLevels(next).find(([levelSize]) => levelSize === size) ?? mipLevels(next)[0])[1];
     const width = next.layout === "flash" ? next.width : size; const height = next.layout === "flash" ? next.height : size;
     setMip(next.layout === "flash" ? 256 : size);
     setManual((current) => ({ ...current, texture: hex8(next.textureOffset + level), palette: hex8(next.paletteOffset), width, height, order: next.paletteOrder, layout: next.bpp === 4 ? "4s" : "8s" }));
   }, []);
   const selectCandidate = useCallback((index: number) => {
-    setSelected(index);
-    const next = candidates[index]; if (next) showCandidate(next, 256);
+    setSelected(index); setUvPiece(null);
+    const next = candidates[index]; if (next) showCandidate(next);
   }, [candidates, showCandidate]);
 
   const startScan = useCallback((target: TextureFile | null = file) => {
@@ -185,11 +224,22 @@ export function TextureWorkspace({ active, dropped, onConsumeDrop, onStatus, isP
       const next = { path: opened.path, name: opened.name, bytes: opened.bytes, saved: opened.bytes.slice() };
       setFile(next); setDirty(false); undoStack.current = []; redoStack.current = []; setHistoryTick((tick) => tick + 1);
       setRecents(pushRecent(RECENTS_KEY, opened.path));
-      setZoom("fit");
-      onStatus(`${opened.name} loaded · ${sizeLabel(opened.bytes.length)}`);
-      startScan(next);
+      setZoom("fit"); setPieces([]); setUvPiece(null);
+      const car = listCarTextures(opened.name, opened.bytes);
+      if (car && car.entries.length) {
+        // A car PCK: go straight to the textures its shaders use, no scan.
+        workerRef.current?.terminate(); workerRef.current = null; setScan(null);
+        const list = car.entries.map(carTextureCandidate);
+        setExact({ doc: car.doc, candidates: list }); setCandidates(list); setSelected(0); showCandidate(list[0]);
+        onStatus(`${opened.name} loaded · ${list.length} texture${list.length === 1 ? "" : "s"} read from the car's shaders`);
+        void loadPieces(opened.path, car.doc).then(setPieces);
+      } else {
+        setExact(null);
+        onStatus(`${opened.name} loaded · ${sizeLabel(opened.bytes.length)}`);
+        startScan(next);
+      }
     } catch (caught) { setError(caught instanceof Error ? caught.message : "Could not open that file."); }
-  }, [isPathBlocked, onStatus, startScan]);
+  }, [isPathBlocked, onStatus, showCandidate, startScan]);
 
   const confirmDiscard = useCallback(async () => {
     if (!dirty) return true;
@@ -264,7 +314,7 @@ export function TextureWorkspace({ active, dropped, onConsumeDrop, onStatus, isP
   const close = async () => {
     if (!file || !await confirmDiscard()) return;
     workerRef.current?.terminate(); workerRef.current = null; setScan(null);
-    setFile(null); setDirty(false); setCandidates([]); setSelected(null); setError("");
+    setFile(null); setDirty(false); setCandidates([]); setSelected(null); setError(""); setExact(null); setPieces([]);
     undoStack.current = []; redoStack.current = []; thumbVersions.current.clear(); setHistoryTick((tick) => tick + 1);
     onStatus(`${file.name} closed`);
   };
@@ -275,7 +325,7 @@ export function TextureWorkspace({ active, dropped, onConsumeDrop, onStatus, isP
     return { name: basename(selection), image: prepareImportSource(await decodePng(await readFile(selection))) };
   };
   const importLevel = async () => {
-    if (!file || !candidate) return;
+    if (!file || !candidate || !importable(candidate)) return;
     try {
       const picked = await pickImage(); if (!picked) return;
       const { image, name } = picked; const order = manual.order;
@@ -286,15 +336,16 @@ export function TextureWorkspace({ active, dropped, onConsumeDrop, onStatus, isP
           candidate.paletteOrder = order; onStatus(`Imported ${source} as Flash item #${candidate.sequenceIndex}, ${candidate.width}×${candidate.height} ${candidate.bpp}-bit. Not saved yet.`);
         }
       } else if (hasMips(candidate)) {
-        const level = REMIX_MIP_LEVELS.find(([size]) => size === mip)!;
+        const level = mipLevels(candidate).find(([size]) => size === mip)!;
         const palette = unpackPalette8(file.bytes.subarray(candidate.paletteOffset, candidate.paletteOffset + 0x400), order, false);
         if (applyChanges([[candidate.textureOffset + level[1], buildSingleMipImport(image, mip, palette)]], `Import ${mip}×${mip} mip from ${name}`)) {
           candidate.paletteOrder = order; onStatus(`Imported ${source} into the ${mip}×${mip} mip, keeping the shared palette. Not saved yet.`);
         }
       } else {
-        const built = buildAllMipImport(image, REMIX_MIP_LEVELS.slice(0, 1), order);
-        if (applyChanges([[candidate.textureOffset, built.indices.get(256)!], [candidate.paletteOffset, built.palette]], `Import texture from ${name}`)) {
-          candidate.paletteOrder = order; onStatus(`Imported ${source} as a 256×256 texture with its palette. Not saved yet.`);
+        const size = mipLevels(candidate)[0][0];
+        const built = buildAllMipImport(image, [[size, 0]], order);
+        if (applyChanges([[candidate.textureOffset, built.indices.get(size)!], [candidate.paletteOffset, built.palette]], `Import texture from ${name}`)) {
+          candidate.paletteOrder = order; onStatus(`Imported ${source} as a ${size}×${size} texture with its palette. Not saved yet.`);
         }
       }
     } catch (caught) { setError(caught instanceof Error ? `Import failed: ${caught.message}` : "Import failed."); }
@@ -302,6 +353,7 @@ export function TextureWorkspace({ active, dropped, onConsumeDrop, onStatus, isP
   const importAll = async () => {
     if (!file || !candidate) return;
     if (candidate.layout === "flash") { void importLevel(); return; }
+    if (!importable(candidate)) return;
     try {
       const picked = await pickImage(); if (!picked) return;
       const levels = mipLevels(candidate);
@@ -310,7 +362,7 @@ export function TextureWorkspace({ active, dropped, onConsumeDrop, onStatus, isP
       changes.push([candidate.paletteOffset, built.palette]);
       if (applyChanges(changes, `Import all levels from ${picked.name}`)) {
         candidate.paletteOrder = manual.order;
-        onStatus(`Imported ${picked.name} into ${hasMips(candidate) ? "mips 256/128/64/32 with one shared palette" : "the 256×256 texture and its palette"}. Not saved yet.`);
+        onStatus(`Imported ${picked.name} into ${hasMips(candidate) ? `mips ${levels.map(([size]) => size).join("/")} with one shared palette` : `the ${levels[0][0]}×${levels[0][0]} texture and its palette`}. Not saved yet.`);
       }
     } catch (caught) { setError(caught instanceof Error ? `Import failed: ${caught.message}` : "Import failed."); }
   };
@@ -331,7 +383,7 @@ export function TextureWorkspace({ active, dropped, onConsumeDrop, onStatus, isP
     try {
       const jobs = candidate.layout === "flash"
         ? candidates.filter((item) => item.layout === "flash").map((item) => ({ name: `${stem}_flash_${String(item.sequenceIndex).padStart(3, "0")}_${item.width}x${item.height}_${item.bpp}bit.png`, spec: { textureOffset: item.textureOffset, paletteOffset: item.paletteOffset, width: item.width, height: item.height, order: item.paletteOrder, swizzled: true, flipVertical: manual.flip, bpp: item.bpp } as DecodeSpec }))
-        : mipLevels(candidate).map(([size, relative]) => ({ name: `${stem}_set_${candidate.textureOffset.toString(16).toUpperCase().padStart(8, "0")}_${size}.png`, spec: { textureOffset: candidate.textureOffset + relative, paletteOffset: candidate.paletteOffset, width: size, height: size, order: candidate.paletteOrder, swizzled: true, flipVertical: manual.flip, bpp: 8 } as DecodeSpec }));
+        : mipLevels(candidate).map(([size, relative]) => ({ name: `${stem}_${candidate.exact ? candidate.exact.name : `set_${candidate.textureOffset.toString(16).toUpperCase().padStart(8, "0")}`}_${size}.png`, spec: { textureOffset: candidate.textureOffset + relative, paletteOffset: candidate.paletteOffset, width: size, height: size, order: candidate.paletteOrder, swizzled: true, flipVertical: manual.flip, bpp: candidate.bpp } as DecodeSpec }));
       for (const job of jobs) {
         await writeFile(await join(folder, job.name), await encodePng({ width: job.spec.width, height: job.spec.height, data: decodeTexture(file.bytes, job.spec) }));
         written += 1;
@@ -370,15 +422,44 @@ export function TextureWorkspace({ active, dropped, onConsumeDrop, onStatus, isP
         else if (pressed === "i") { event.preventDefault(); void (event.shiftKey ? importLevel() : importAll()); }
         return;
       }
-      if (event.key === "F5") { event.preventDefault(); startScan(); return; }
+      if (event.key === "F5" && !exact) { event.preventDefault(); startScan(); return; }
       if (isTyping(event.target)) return;
       if (event.key === "ArrowLeft" || event.key === "ArrowRight") { event.preventDefault(); nudge((event.key === "ArrowLeft" ? -1 : 1) * (event.shiftKey ? 0x10 : 1)); return; }
       const number = ["1", "2", "3", "4"].indexOf(event.key);
-      if (number >= 0 && candidate && hasMips(candidate)) { event.preventDefault(); showCandidate(candidate, REMIX_MIP_LEVELS[number][0]); }
+      if (number >= 0 && candidate && hasMips(candidate) && mipLevels(candidate)[number]) { event.preventDefault(); showCandidate(candidate, mipLevels(candidate)[number][0]); }
     };
     window.addEventListener("keydown", key);
     return () => window.removeEventListener("keydown", key);
   });
+
+  // "Used by": the bank entries that draw with the selected texture, and the pieces with triangles in them.
+  const usedShaders = useMemo(() => new Set(candidate?.exact?.usedBy.map((use) => use.shaderId) ?? []), [candidate]);
+  const usingPieces = useMemo(() => pieces.map((piece) => ({ piece, uvs: usedShaders.size ? uvTriangles(piece.mesh, usedShaders) : [] })).filter((item) => item.uvs.length), [pieces, usedShaders]);
+  const atBaseLevel = candidate?.exact ? mip === mipLevels(candidate)[0][0] : false;
+  useEffect(() => {
+    const canvas = uvCanvasRef.current; if (!canvas) return;
+    const image = decoded.image;
+    const width = image ? Math.round(image.width * scale) : 0, height = image ? Math.round(image.height * scale) : 0;
+    canvas.width = width; canvas.height = height;
+    const context = canvas.getContext("2d"); if (!context || !image || !showUvs) return;
+    // UV (0,0) is the texture's first stored row, the one drawn at the top here. A triangle that tiles
+    // past 0..1 is shifted back by whole tiles so it stays in one piece.
+    const draw = (uvs: number[], stroke: string, fill: string) => {
+      context.strokeStyle = stroke; context.fillStyle = fill; context.lineWidth = 1;
+      context.beginPath();
+      for (let i = 0; i + 5 < uvs.length; i += 6) {
+        const shiftU = Math.floor(Math.min(uvs[i], uvs[i + 2], uvs[i + 4])), shiftV = Math.floor(Math.min(uvs[i + 1], uvs[i + 3], uvs[i + 5]));
+        context.moveTo((uvs[i] - shiftU) * width, (uvs[i + 1] - shiftV) * height);
+        context.lineTo((uvs[i + 2] - shiftU) * width, (uvs[i + 3] - shiftV) * height);
+        context.lineTo((uvs[i + 4] - shiftU) * width, (uvs[i + 5] - shiftV) * height);
+        context.closePath();
+      }
+      context.fill(); context.stroke();
+    };
+    const focus = usingPieces.find((item) => item.piece.key === uvPiece);
+    for (const item of usingPieces) if (item !== focus) draw(item.uvs, focus ? "rgba(161,227,4,.25)" : "rgba(161,227,4,.85)", "rgba(161,227,4,.04)");
+    if (focus) draw(focus.uvs, "rgba(255,179,92,1)", "rgba(255,154,31,.22)");
+  }, [decoded.image, scale, showUvs, usingPieces, uvPiece]);
 
   menuRef.current = {
     hasFile: !!file, dirty, canUndo: undoStack.current.length > 0, canRedo: redoStack.current.length > 0,
@@ -425,7 +506,13 @@ export function TextureWorkspace({ active, dropped, onConsumeDrop, onStatus, isP
 
     <div className="tex-body">
       <aside className="tex-list">
-        <div className="tex-scan">
+        {exact && <div className="tex-scan tex-exact">
+          <p>{tr("Read from the car's shaders: only the textures this PCK draws with. Shared textures (lamps, grills, carbon, reflections) live outside it and aren't listed.")}</p>
+          {candidates === exact.candidates
+            ? <button className="link-button" onClick={() => startScan()} title={tr("Run the Texture Finder's scored scan instead, for a file whose textures aren't all reached through its shaders")}>{tr("Manual scan…")}</button>
+            : <button className="link-button" onClick={() => { workerRef.current?.terminate(); workerRef.current = null; setScan(null); setCandidates(exact.candidates); setSelected(0); showCandidate(exact.candidates[0]); }}>{tr("Back to the car's textures")}</button>}
+        </div>}
+        <div className="tex-scan" hidden={Boolean(exact) && candidates === exact?.candidates}>
           <div className="tex-scan-toggles">
             {([["nonremix", "Non-remix"], ["remix", "Remix"], ["flash", "Flash"]] as const).map(([key, label]) => <label key={key} title={tr(`Show or hide ${label} results — filters the list, no rescan`)}><input type="checkbox" checked={filters[key]} onChange={(event) => setFilters((current) => ({ ...current, [key]: event.target.checked }))} />{label}<small>{candidates.filter((item) => item.layout === key).length}</small></label>)}
           </div>
@@ -436,19 +523,19 @@ export function TextureWorkspace({ active, dropped, onConsumeDrop, onStatus, isP
           </div>
           {scan && <div className="tex-progress"><span style={{ width: `${Math.round(scan.fraction * 100)}%` }} /><small>{scan.text}</small></div>}
         </div>
-        <div className="tex-list-head"><span>{isFlashFile ? tr("Flash / UI textures") : tr("Ranked texture sets")}</span><small>{visible.length === candidates.length ? candidates.length : tr(`${visible.length} of ${candidates.length}`)}</small></div>
+        <div className="tex-list-head"><span>{isFlashFile ? tr("Flash / UI textures") : exact && candidates === exact.candidates ? tr("Car textures") : tr("Ranked texture sets")}</span><small>{visible.length === candidates.length ? candidates.length : tr(`${visible.length} of ${candidates.length}`)}</small></div>
         <div className="tex-candidates">
           {!candidates.length && !scan && <p className="tex-list-empty">{tr("No candidates. Adjust the scan options, or point the decoder at an offset by hand.")}</p>}
           {candidates.length > 0 && !visible.length && <p className="tex-list-empty">{tr("Every result is hidden by the filters above.")}</p>}
           {visible.map(({ item, index }) => <button key={`${item.layout}-${item.textureOffset}`} className={`tex-candidate${index === selected ? " active" : ""}`} onClick={() => selectCandidate(index)} title={item.notes.join("; ")}>
             <Thumbnail data={file.bytes} candidate={item} version={thumbVersions.current.get(item) ?? 0} />
             <span className="tex-candidate-copy">
-              <strong>{item.layout === "flash" ? `#${String(item.sequenceIndex).padStart(2, "0")} · ${item.width}×${item.height}` : hex8(item.textureOffset)}</strong>
-              <small>{item.layout === "flash" ? tr(`${item.bpp}-bit · ${hex8(item.textureOffset)}`) : tr(`${hasMips(item) ? "256 + mips" : "256×256"} · 8-bit`)}</small>
+              <strong>{item.exact ? item.exact.name || hex8(item.exact.objectOffset) : item.layout === "flash" ? `#${String(item.sequenceIndex).padStart(2, "0")} · ${item.width}×${item.height}` : hex8(item.textureOffset)}</strong>
+              <small>{item.exact ? `${item.width}×${item.height} · ${item.bpp}-bit${hasMips(item) ? ` · ${mipLevels(item).length} mips` : ""}` : item.layout === "flash" ? tr(`${item.bpp}-bit · ${hex8(item.textureOffset)}`) : tr(`${hasMips(item) ? "256 + mips" : "256×256"} · 8-bit`)}</small>
             </span>
             <span className="tex-candidate-meta">
               <em className={`tex-layout ${item.layout}`}>{layoutName(item)}</em>
-              {item.layout !== "flash" && <small>{Math.max(0, Math.min(100, item.score)).toFixed(1)}</small>}
+              {item.exact ? <small>{tr(`${item.exact.usedBy.length} shader${item.exact.usedBy.length === 1 ? "" : "s"}`)}</small> : item.layout !== "flash" && <small>{Math.max(0, Math.min(100, item.score)).toFixed(1)}</small>}
             </span>
           </button>)}
         </div>
@@ -465,16 +552,20 @@ export function TextureWorkspace({ active, dropped, onConsumeDrop, onStatus, isP
           </div>
           <div className="view-buttons tex-mips">
             <span>{flashCandidate ? tr("Single Flash/UI texture") : tr("Level")}</span>
-            {!flashCandidate && REMIX_MIP_LEVELS.map(([size], index) => <button key={size} className={candidate && mip === size ? "active" : ""} disabled={!levelsAvailable.includes(size)} onClick={() => candidate && showCandidate(candidate, size)} title={`${size}×${size} (${index + 1})`}>{size}</button>)}
+            {!flashCandidate && (candidate?.mips ?? REMIX_MIP_LEVELS).map(([size], index) => <button key={size} className={candidate && mip === size ? "active" : ""} disabled={!levelsAvailable.includes(size)} onClick={() => candidate && showCandidate(candidate, size)} title={`${size}×${size} (${index + 1})`}>{size}</button>)}
           </div>
+          {candidate?.exact && <div className="view-buttons"><button className={showUvs ? "active" : ""} disabled={!usingPieces.length} onClick={() => setShowUvs((value) => !value)} title={tr("Draw the UVs of the pieces that use this texture over it (on the full-size level)")}>{tr("UVs")}</button></div>}
         </div>
         <div className="tex-stage" ref={stageRef} onWheel={(event) => { if (decoded.image) setZoomLevel(event.deltaY < 0 ? scale * 1.25 : scale / 1.25); }}>
           {decoded.image
-            ? <canvas ref={canvasRef} className={`tex-canvas${scale >= 1 ? " pixelated" : ""}`} style={{ width: decoded.image.width * scale, height: decoded.image.height * scale }} />
+            ? <div className="tex-canvas-wrap"><canvas ref={canvasRef} className={`tex-canvas${scale >= 1 ? " pixelated" : ""}`} style={{ width: decoded.image.width * scale, height: decoded.image.height * scale }} />{candidate?.exact && atBaseLevel && <canvas ref={uvCanvasRef} className="tex-uv-overlay" />}</div>
             : <p className="tex-stage-empty">{decoded.error || tr("No decoded image")}</p>}
         </div>
         <div className="tex-details">
-          {candidate ? <>
+          {candidate?.exact ? <>
+            <span><b>{candidate.exact.name || tr("(unnamed)")}</b> · {candidate.width}×{candidate.height} · {candidate.bpp}-bit · <Tx t="object {0}" v={[hex8(candidate.exact.objectOffset)]} /></span>
+            <span><Tx t="pixels {0} · palette {1}{2}" v={[hex8(candidate.textureOffset), hex8(candidate.paletteOffset), hasMips(candidate) ? ` · mips ${mipLevels(candidate).map(([size, relative]) => `${size}@+0x${relative.toString(16).toUpperCase()}`).join(" ")}` : ""]} /></span>
+          </> : candidate ? <>
             <span><b>{selected !== null ? tr(`Rank ${selected + 1}`) : ""}</b>{candidate.layout !== "flash" && tr(` · score ${Math.max(0, Math.min(100, candidate.score)).toFixed(1)}`)} · {layoutName(candidate)}</span>
             <span><Tx t="alpha valid {0}/{1} · palette colours {2} · indices {3} · entropy {4}{5}{6}" v={[candidate.alphaValid, candidate.paletteColors, candidate.paletteUnique, candidate.indexUnique, candidate.entropy.toFixed(3), candidate.edgeMean !== null ? tr(` · edge ${candidate.edgeMean.toFixed(2)}`) : "", candidate.mipError !== null ? tr(` · mip error ${candidate.mipError.toFixed(2)}`) : ""]} /></span>
             {candidate.notes.length > 0 && <span className="tex-notes">{candidate.notes.join("; ")}</span>}
@@ -484,12 +575,21 @@ export function TextureWorkspace({ active, dropped, onConsumeDrop, onStatus, isP
 
       <aside className="tex-inspector">
         {error && <div className="tex-error"><strong>{tr("Action required")}</strong><p>{tr(error)}</p><button className="link-button" onClick={() => setError("")}>{tr("Dismiss")}</button></div>}
+        {candidate?.exact && <div className="tex-card">
+          <header><strong>{tr("Used by")}</strong><span>{tr(`${candidate.exact.usedBy.length} shaders · ${usingPieces.length} pieces`)}</span></header>
+          <div className="tex-used">
+            {candidate.exact.usedBy.map((use) => <span key={use.shaderId} className="tex-used-shader"><b>{hex(use.shaderId, 2)}</b>{use.className}</span>)}
+            {usingPieces.length > 0 && <p>{tr("Click a piece to highlight its UVs:")}</p>}
+            {usingPieces.map(({ piece, uvs }) => <button key={piece.key} className={`tex-used-piece${uvPiece === piece.key ? " active" : ""}`} title={piece.mesh.name} onClick={() => { setUvPiece((current) => current === piece.key ? null : piece.key); setShowUvs(true); if (candidate) showCandidate(candidate); }}><span>{piece.label}</span><small>{uvs.length / 6}</small></button>)}
+            {!pieces.length && <p>{tr("Reading the pieces…")}</p>}
+          </div>
+        </div>}
         <div className="tex-card">
           <header><strong>{tr("Replace")}</strong><span>{tr("PNG")}</span></header>
           <div className="tex-actions">
-            <button className="primary" disabled={!candidate} onClick={() => void importLevel()} title={candidate ? undefined : tr("Select a scanned texture first")}>{flashCandidate ? tr("Import texture…") : candidate && hasMips(candidate) ? tr(`Import ${mip}×${mip} mip…`) : tr("Import texture…")}</button>
-            <button className="secondary" disabled={!candidate || flashCandidate} onClick={() => void importAll()}>{flashCandidate ? tr("Single texture — no mips") : tr("Import all levels…")}</button>
-            <p><Tx t="{0} Nothing is written until you save." v={[!candidate ? tr("Select a scanned texture to replace it.") : flashCandidate ? tr(`Resized to ${candidate.width}×${candidate.height} and reduced to ${candidate.bpp === 4 ? 16 : 256} colours with its own palette.`) : hasMips(candidate) ? tr("One level keeps the shared palette; all levels rebuild it from the 256 master.") : tr("Rebuilds the 256×256 texture and its palette.")]} /></p>
+            <button className="primary" disabled={!candidate || !importable(candidate)} onClick={() => void importLevel()} title={candidate ? undefined : tr("Select a scanned texture first")}>{flashCandidate ? tr("Import texture…") : candidate && hasMips(candidate) ? tr(`Import ${mip}×${mip} mip…`) : tr("Import texture…")}</button>
+            <button className="secondary" disabled={!candidate || flashCandidate || !importable(candidate)} onClick={() => void importAll()}>{flashCandidate ? tr("Single texture — no mips") : tr("Import all levels…")}</button>
+            <p><Tx t="{0} Nothing is written until you save." v={[!candidate ? tr("Select a scanned texture to replace it.") : !importable(candidate) ? tr("4-bit car textures can be viewed and exported, not imported.") : flashCandidate ? tr(`Resized to ${candidate.width}×${candidate.height} and reduced to ${candidate.bpp === 4 ? 16 : 256} colours with its own palette.`) : hasMips(candidate) ? tr("One level keeps the shared palette; all levels rebuild it from the 256 master.") : tr(`Rebuilds the ${candidate.width}×${candidate.height} texture and its palette.`)]} /></p>
           </div>
         </div>
         <div className="tex-card">

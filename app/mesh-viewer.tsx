@@ -8,6 +8,8 @@ import { anchorWorldPosition, nearestMeshAnchor, type MeshGeometry } from "../sr
 import { anchorWorldQuaternion, applyAnchorRotation, localRotationFor } from "./anchor-rotation";
 import type { PpfGeometry, PpfKind } from "../src/ppf";
 import { registerDiagnosticViewer } from "./diagnostics";
+import { ToolMenu, ToolMenuItem } from "./tool-menu";
+import { loadGamePaint, NO_LIGHTS, useGameMaterials, writeShaderGroups } from "./game-look";
 
 type ActiveCamera = THREE.PerspectiveCamera | THREE.OrthographicCamera;
 type ViewDirection = "front" | "back" | "left" | "right" | "top" | "bottom";
@@ -68,6 +70,10 @@ type ViewerRuntime = {
   material: THREE.MeshStandardMaterial;
   selectedMaterial: THREE.MeshStandardMaterial;
   edgesMaterial: THREE.LineBasicMaterial;
+  /** Outlines the selected pieces in the Game look, where they keep the game's materials. */
+  selectedEdgesMaterial: THREE.LineBasicMaterial;
+  keyLight: THREE.DirectionalLight;
+  rimLight: THREE.DirectionalLight;
   referenceMaterials: Record<PpfKind, THREE.MeshStandardMaterial>;
   markerA1: THREE.Mesh;
   markerA2: THREE.Mesh;
@@ -136,7 +142,12 @@ function frameOrthographic(camera: THREE.OrthographicCamera, distance: number, a
 }
 const round5 = (value: number) => Math.round(value * 100000) / 100000;
 
-export function MeshViewer({ document, selected, multiSelected, meshes, visibleAnchors, referenceGeometry, rimSizeInches, revision, onMoveSelection, onRotateSelection, canRotate = false, cameraEdit = null }: { document: PckDocument; selected: number; multiSelected: Set<number>; meshes: MeshGeometry[]; visibleAnchors: Set<number>; referenceGeometry: Partial<Record<PpfKind, PpfGeometry>>; rimSizeInches: number; revision: number; onMoveSelection(moves: { index: number; value: Vec3 }[], mode: "preview" | "scrub-commit", startMoves?: { index: number; value: Vec3 }[]): void; /** Same contract as onMoveSelection, with anchor rotations (radians). */ onRotateSelection?(moves: { index: number; value: Vec3 }[], mode: "preview" | "scrub-commit", startMoves?: { index: number; value: Vec3 }[]): void; /** False for a PSPPCK or a selection of locked wheel followers. */ canRotate?: boolean; cameraEdit?: CameraEdit | null }) {
+const VIEW_LABELS: Record<ViewDirection, { label: string; key: string }> = {
+  front: { label: "Front", key: "Num 1" }, back: { label: "Back", key: "Ctrl+Num 1" }, left: { label: "Left", key: "Num 3" },
+  right: { label: "Right", key: "Ctrl+Num 3" }, top: { label: "Top", key: "Num 7" }, bottom: { label: "Bottom", key: "Num 9" },
+};
+
+export function MeshViewer({ document, selected, multiSelected, meshes, visibleAnchors, referenceGeometry, rimSizeInches, revision, onMoveSelection, onRotateSelection, canRotate = false, cameraEdit = null, assetsRoot = null, textureVersion = 0 }: { document: PckDocument; selected: number; multiSelected: Set<number>; meshes: MeshGeometry[]; visibleAnchors: Set<number>; referenceGeometry: Partial<Record<PpfKind, PpfGeometry>>; rimSizeInches: number; revision: number; onMoveSelection(moves: { index: number; value: Vec3 }[], mode: "preview" | "scrub-commit", startMoves?: { index: number; value: Vec3 }[]): void; /** Same contract as onMoveSelection, with anchor rotations (radians). */ onRotateSelection?(moves: { index: number; value: Vec3 }[], mode: "preview" | "scrub-commit", startMoves?: { index: number; value: Vec3 }[]): void; /** False for a PSPPCK or a selection of locked wheel followers. */ canRotate?: boolean; cameraEdit?: CameraEdit | null; /** The game's ASSETS folder, for the Game look's shared textures. */ assetsRoot?: string | null; /** Bumped when the car's own textures change. */ textureVersion?: number }) {
   const hostRef = useRef<HTMLDivElement>(null);
   const runtimeRef = useRef<ViewerRuntime | null>(null);
   const objectsRef = useRef(new Map<MeshGeometry, THREE.Mesh>());
@@ -155,7 +166,16 @@ export function MeshViewer({ document, selected, multiSelected, meshes, visibleA
   const latestRef = useRef({ document, multiSelected, onMoveSelection, onRotateSelection, cameraEdit });
   const edgesRef = useRef<THREE.LineSegments[]>([]);
   const [gridVisible, setGridVisible] = useState(true);
-  const [renderMode, setRenderMode] = useState<"solid" | "wireframe" | "solid-wire">("solid");
+  // What the pieces are drawn with, the same choices as the Meshes tab minus its shader-color views.
+  const [look, setLook] = useState<"game" | "solid" | "wireframe">("game");
+  const [wireOverlay, setWireOverlay] = useState(false);
+  const renderMode = look === "wireframe" ? "wireframe" : wireOverlay ? "solid-wire" : "solid";
+  const [viewDirection, setViewDirection] = useState<ViewDirection>("front");
+  // Game look, with the paint picked in the Meshes tab; lights off and composites as saved.
+  const gameLook = look === "game";
+  const gameOptions = useMemo(() => ({ paint: gameLook ? loadGamePaint() : "#000000", lights: NO_LIGHTS, composite: {} }), [gameLook]);
+  const getRenderer = useCallback(() => runtimeRef.current?.renderer ?? null, []);
+  const game = useGameMaterials({ enabled: gameLook, document, getRenderer, assetsRoot, options: gameOptions, meshes, textureVersion });
   const [projection, setProjection] = useState<Projection>("perspective");
   const [gizmoVisible, setGizmoVisible] = useState(true);
   const [gizmoSpace, setGizmoSpace] = useState<GizmoSpace>(() => { try { return localStorage.getItem(GIZMO_SPACE_KEY) === "local" ? "local" : "world"; } catch { return "world"; } });
@@ -245,6 +265,7 @@ export function MeshViewer({ document, selected, multiSelected, meshes, visibleA
     const material = new THREE.MeshStandardMaterial({ color: 0x9da69d, roughness: 0.72, metalness: 0.08, side: THREE.DoubleSide });
     const selectedMaterial = new THREE.MeshStandardMaterial({ color: 0xb5beb4, roughness: 0.65, metalness: 0.1, side: THREE.DoubleSide });
     const edgesMaterial = new THREE.LineBasicMaterial({ color: 0x000000 });
+    const selectedEdgesMaterial = new THREE.LineBasicMaterial({ color: 0xa1e304 });
     const referenceMaterials: Record<PpfKind, THREE.MeshStandardMaterial> = {
       exhaust: new THREE.MeshStandardMaterial({ color: 0xaab3ad, roughness: 0.38, metalness: 0.62, side: THREE.DoubleSide }),
       rim: new THREE.MeshStandardMaterial({ color: 0x87938c, roughness: 0.46, metalness: 0.48, side: THREE.DoubleSide }),
@@ -377,7 +398,7 @@ export function MeshViewer({ document, selected, multiSelected, meshes, visibleA
     renderer.domElement.addEventListener("pointerdown", onPointerDown);
     renderer.domElement.addEventListener("pointerup", onPointerUp);
 
-    runtimeRef.current = { renderer, scene, perspectiveCamera, orthographicCamera, camera: perspectiveCamera, controls, transformControls, gizmoTarget, modelGroup, markerGroup, grid, material, selectedMaterial, edgesMaterial, referenceMaterials, markerA1, markerA2, cameraGroup, shopCamera, shopHelper, cameraMarker, targetMarker, cameraLine, targetPlane };
+    runtimeRef.current = { renderer, scene, perspectiveCamera, orthographicCamera, camera: perspectiveCamera, controls, transformControls, gizmoTarget, modelGroup, markerGroup, grid, material, selectedMaterial, edgesMaterial, selectedEdgesMaterial, keyLight: key, rimLight: rim, referenceMaterials, markerA1, markerA2, cameraGroup, shopCamera, shopHelper, cameraMarker, targetMarker, cameraLine, targetPlane };
     const unregisterDiagnostics = registerDiagnosticViewer("Anchors", renderer, () => lookThroughRef.current.active ? shopCamera : runtimeRef.current?.camera ?? perspectiveCamera, modelGroup);
     const resize = () => {
       const width = Math.max(host.clientWidth, 1); const height = Math.max(host.clientHeight, 1);
@@ -432,7 +453,7 @@ export function MeshViewer({ document, selected, multiSelected, meshes, visibleA
       referenceObjectsRef.current = [];
       edgesRef.current = [];
       markerGeometry.dispose(); (markerA1.material as THREE.Material).dispose(); markerA2.geometry.dispose(); (markerA2.material as THREE.Material).dispose();
-      material.dispose(); selectedMaterial.dispose(); edgesMaterial.dispose(); Object.values(referenceMaterials).forEach((item) => item.dispose()); renderer.dispose(); renderer.domElement.remove(); runtimeRef.current = null;
+      material.dispose(); selectedMaterial.dispose(); edgesMaterial.dispose(); selectedEdgesMaterial.dispose(); Object.values(referenceMaterials).forEach((item) => item.dispose()); renderer.dispose(); renderer.domElement.remove(); runtimeRef.current = null;
     };
   }, []);
 
@@ -571,14 +592,20 @@ export function MeshViewer({ document, selected, multiSelected, meshes, visibleA
       geometry.setAttribute("position", new THREE.BufferAttribute(parsed.positions, 3));
       geometry.setAttribute("normal", new THREE.BufferAttribute(parsed.normals, 3));
       geometry.setIndex(new THREE.BufferAttribute(parsed.indices, 1));
+      geometry.setAttribute("uv", new THREE.BufferAttribute(parsed.uvs, 2));
+      writeShaderGroups(geometry, parsed);
       geometry.computeBoundingSphere();
       const isSelected = parsed.anchorIndex !== null && highlightedAnchors.has(parsed.anchorIndex);
-      const object = new THREE.Mesh(geometry, isSelected ? runtime.selectedMaterial : runtime.material);
+      const object = new THREE.Mesh(geometry, game.materials ?? (isSelected ? runtime.selectedMaterial : runtime.material));
       object.userData.source = parsed.name;
       const position = anchorWorldPosition(document, parsed.anchorIndex ?? 0, "a2"); object.position.set(position[0], position[1], position[2]);
       applyAnchorRotation(object, document, parsed.anchorIndex ?? 0);
-      const edges = new THREE.LineSegments(new THREE.EdgesGeometry(geometry, 1), runtime.edgesMaterial);
-      edges.visible = renderMode === "solid-wire";
+      // In the Game look the selection can't be told by a lighter material, so its edges stay drawn. Not
+      // for the root anchor's pieces (selected when a car opens): that's the shell, the outline would cover the car.
+      const outlined = Boolean(game.materials) && isSelected && !document.roots.includes(parsed.anchorIndex ?? 0);
+      const edges = new THREE.LineSegments(new THREE.EdgesGeometry(geometry, 1), outlined ? runtime.selectedEdgesMaterial : runtime.edgesMaterial);
+      edges.userData.outlined = outlined;
+      edges.visible = renderMode === "solid-wire" || outlined;
       object.add(edges); edgesRef.current.push(edges);
       runtime.modelGroup.add(object); objectsRef.current.set(parsed, object);
     }
@@ -595,7 +622,7 @@ export function MeshViewer({ document, selected, multiSelected, meshes, visibleA
       runtime.modelGroup.add(object); referenceObjectsRef.current.push({ placement, object });
     }
     if ((newMeshSet || !fittedRef.current) && (visible.length || referencePlacements.length)) { fittedRef.current = true; requestAnimationFrame(fitCamera); }
-  }, [document, fitCamera, meshes, referenceGeometry, referencePlacements, highlightedAnchors, visible]);
+  }, [document, fitCamera, meshes, referenceGeometry, referencePlacements, highlightedAnchors, visible, game.materials]);
 
   useEffect(() => {
     for (const { placement, object } of referenceObjectsRef.current) object.scale.setScalar(referenceScale(placement, rimSizeInches));
@@ -630,27 +657,40 @@ export function MeshViewer({ document, selected, multiSelected, meshes, visibleA
   }, [document, revision, selected, visible, cameraEdit, gizmoSpace, effectiveGizmoMode]);
 
   useEffect(() => { if (runtimeRef.current) runtimeRef.current.grid.visible = gridVisible; }, [gridVisible]);
+  // The grey view's lime rim light would tint real materials; the Game look is lit like the Meshes tab.
+  useEffect(() => {
+    const runtime = runtimeRef.current; if (!runtime) return;
+    runtime.rimLight.visible = !game.materials;
+    runtime.keyLight.intensity = game.materials ? 1.4 : 2.8;
+  }, [game.materials]);
   useEffect(() => {
     const runtime = runtimeRef.current; if (!runtime) return;
     const wireframeOn = renderMode === "wireframe";
     runtime.material.wireframe = wireframeOn; runtime.selectedMaterial.wireframe = wireframeOn;
+    for (const material of game.materials ?? []) (material as THREE.MeshStandardMaterial).wireframe = wireframeOn;
     const showEdges = renderMode === "solid-wire";
-    for (const edges of edgesRef.current) edges.visible = showEdges;
-  }, [renderMode]);
+    for (const edges of edgesRef.current) edges.visible = showEdges || edges.userData.outlined;
+  }, [renderMode, game.materials]);
 
   return <section className="viewer-pane">
-    <header className="viewer-header"><div><p className="eyebrow">{tr("03 · LIVE PREVIEW")}</p><strong>{tr("Geometry viewer")}</strong></div><div className="viewer-tools"><button className={renderMode !== "solid" ? "active" : ""} onClick={() => setRenderMode((current) => current === "solid" ? "wireframe" : current === "wireframe" ? "solid-wire" : "solid")} title={tr("Cycle shading mode")}>{renderMode === "solid" ? tr("Solid") : renderMode === "wireframe" ? tr("Wireframe") : tr("Solid+Wire")}</button><button onClick={() => setGridVisible((value) => !value)}>{gridVisible ? tr("Hide grid") : tr("Show grid")}</button><button onClick={fitCamera}>{tr("Frame model")}</button></div></header>
+    <header className="viewer-header"><div><p className="eyebrow">{tr("03 · LIVE PREVIEW")}</p><strong>{tr("Geometry viewer")}</strong></div><div className="viewer-tools"><button onClick={() => setGridVisible((value) => !value)}>{gridVisible ? tr("Hide grid") : tr("Show grid")}</button><button onClick={fitCamera}>{tr("Frame model")}</button></div></header>
     <div className="view-controls">
       <div className="view-buttons">
-        <button onClick={() => applyView("front")} title={tr("Front (Numpad 1)")}>{tr("Front")}</button>
-        <button onClick={() => applyView("back")} title={tr("Back (Ctrl+Numpad 1)")}>{tr("Back")}</button>
-        <button onClick={() => applyView("left")} title={tr("Left (Numpad 3)")}>{tr("Left")}</button>
-        <button onClick={() => applyView("right")} title={tr("Right (Ctrl+Numpad 3)")}>{tr("Right")}</button>
-        <button onClick={() => applyView("top")} title={tr("Top (Numpad 7)")}>{tr("Top")}</button>
-        <button onClick={() => applyView("bottom")} title={tr("Bottom (Numpad 9)")}>{tr("Bottom")}</button>
+        <ToolMenu label={tr(VIEW_LABELS[viewDirection].label)} title={tr("Point the camera along an axis")}>
+          {(Object.keys(VIEW_LABELS) as ViewDirection[]).map((direction) => <ToolMenuItem key={direction} checked={viewDirection === direction} hint={VIEW_LABELS[direction].key} onClick={() => { setViewDirection(direction); applyView(direction); }}>{tr(VIEW_LABELS[direction].label)}</ToolMenuItem>)}
+        </ToolMenu>
+        <ToolMenu label={projection === "orthographic" ? tr("Ortho") : tr("Persp")} title={tr("Camera projection (Numpad 5 toggles)")}>
+          <ToolMenuItem checked={projection === "perspective"} onClick={() => setProjection("perspective")}>{tr("Perspective")}</ToolMenuItem>
+          <ToolMenuItem checked={projection === "orthographic"} onClick={() => setProjection("orthographic")}>{tr("Orthographic")}</ToolMenuItem>
+        </ToolMenu>
+        <ToolMenu label={look === "game" && game.shaders ? tr("Game look") : look === "wireframe" ? tr("Wireframe") : tr("Solid")} title={tr("How the pieces are drawn")}>
+          <ToolMenuItem checked={look === "game" && Boolean(game.shaders)} disabled={!game.shaders} title={game.shaders ? tr("Draw each shader like the game, with the paint picked in the Meshes tab. View only.") : tr("This car's shader list wasn't found")} onClick={() => setLook("game")}>{tr("Game look")}</ToolMenuItem>
+          <ToolMenuItem checked={look === "solid" || (look === "game" && !game.shaders)} onClick={() => setLook("solid")}>{tr("Solid")}</ToolMenuItem>
+          <ToolMenuItem checked={look === "wireframe"} onClick={() => setLook("wireframe")}>{tr("Wireframe")}</ToolMenuItem>
+        </ToolMenu>
+        <label className="toolbar-check" title={tr("Draw the piece edges over them")}><input type="checkbox" checked={wireOverlay} disabled={look === "wireframe"} onChange={(event) => setWireOverlay(event.target.checked)} />{tr("Wireframe overlay")}</label>
       </div>
       <div className="view-toggles">
-        <button className={projection === "orthographic" ? "active" : ""} onClick={toggleProjection} title={tr("Toggle orthographic / perspective (Numpad 5)")}>{projection === "orthographic" ? tr("Ortho") : tr("Persp")}</button>
         <button className={gizmoVisible ? "active" : ""} onClick={toggleGizmo} title={tr("Toggle move gizmo (Ctrl+G)")}>{tr("Gizmo")}</button>
         {!cameraEdit && <button className={effectiveGizmoMode === "rotate" ? "active" : ""} disabled={!canRotate} onClick={toggleGizmoMode} title={canRotate ? tr("Gizmo mode: move or rotate the selected anchor(s) · R · Shift while rotating snaps to 15°") : tr("Rotation isn't editable for this selection")}>{gizmoMode === "rotate" && canRotate ? tr("Rotate") : tr("Move")}</button>}
         <button className={gizmoSpace === "local" ? "active" : ""} onClick={toggleGizmoSpace} title={cameraEdit ? tr("Gizmo axes: global, or the shop camera's own (Z along the line of sight) · Ctrl+L") : tr("Gizmo axes: global, or the selected anchor's own rotation · Ctrl+L")}>{gizmoSpace === "local" ? tr("Local") : tr("Global")}</button>

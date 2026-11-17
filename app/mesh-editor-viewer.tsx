@@ -9,11 +9,18 @@ import { hexToRgb, rgbToHex, shaderColorRgb } from "./shader-color";
 import { PieceIdChip, ShaderIdChip } from "./piece-id-chip";
 import { registerDiagnosticViewer } from "./diagnostics";
 import { countOf, flagsOf, triangleCount, type SelectMode, type SimilarScope, type TriangleCommand, type TriangleFlags } from "./mesh-selection";
+import { ContextMenu, type ContextMenuState } from "./context-menu";
+import { ToolMenu, ToolMenuItem } from "./tool-menu";
+import { loadGamePaint, NO_LIGHTS, saveGamePaint, useGameMaterials, writeShaderGroups, type GameLights } from "./game-look";
 
 type ActiveCamera = THREE.PerspectiveCamera | THREE.OrthographicCamera;
 type ViewDirection = "front" | "back" | "left" | "right" | "top" | "bottom";
 type Projection = "perspective" | "orthographic";
 type RenderMode = "solid" | "wireframe" | "solid-wire";
+/** What the pieces are drawn with. Random colors are the per-shader colors, with no relation to the material. */
+type Look = "game" | "random" | "uv" | "wireframe";
+const LOOK_LABELS: Record<Look, string> = { game: "Game look", random: "Random colors", uv: "UV Checker", wireframe: "Wireframe" };
+const VIEW_LABELS: Record<ViewDirection, string> = { front: "Front", back: "Back", left: "Left", right: "Right", top: "Top", bottom: "Bottom" };
 export type MeshSelection = { meshName: string; meshId: number; shaderId: number | null; group: number | null; triangleIndex: number | null };
 type Rgba = [number, number, number, number];
 
@@ -67,6 +74,11 @@ const CHECKERBOARD = "repeating-conic-gradient(#3a4038 0% 25%,#20241e 0% 50%) 0 
 const PICK_VERTEX_SHADER = "attribute vec3 pickColor; varying vec3 vPickColor; void main() { vPickColor = pickColor; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }";
 const PICK_FRAGMENT_SHADER = "varying vec3 vPickColor; void main() { gl_FragColor = vec4(vPickColor, 1.0); }";
 const DRAG_THRESHOLD = 4;
+/** Composite shaders whose child the Game look lets you pick, by the local that selects it. */
+const COMPOSITE_CHOICES: Record<string, { label: string; options: string[] }> = {
+  HoodShaderIdx: { label: "Hood", options: ["Paint", "Carbon"] },
+  TaillightCasingShaderIdx: { label: "Light casing", options: ["Paint", "Carbon", "Chrome"] },
+};
 
 /** Writes the piece's visible triangles (in order) into the front of the geometry's index and limits
  *  the draw range to them; returns which triangle each drawn face is. The index buffer keeps its full
@@ -91,7 +103,8 @@ function writeVisibleIndex(geometry: THREE.BufferGeometry, parsed: MeshGeometry,
 function disposePieceObject(object: THREE.Mesh) {
   for (const child of object.children) (child as THREE.Mesh).geometry?.dispose();
   object.geometry?.dispose();
-  (object.material as THREE.Material)?.dispose?.();
+  // The piece's own material; the Game look materials are shared by every piece and owned by the viewer.
+  (object.userData.baseMaterial as THREE.Material | undefined)?.dispose();
 }
 
 /**
@@ -121,7 +134,7 @@ function AssignShaderMenu({ bank, used, selectedCount, getColor, onPick }: { ban
   </div>;
 }
 
-function ShaderChip({ id, name, rgba, active, onRgbChange, onAlphaChange, onSelectTriangles }: { id: number; name: string; rgba: Rgba; active: boolean; onRgbChange(hex: string): void; onAlphaChange(alpha: number): void; onSelectTriangles(deselect: boolean): void }) {
+function ShaderChip({ id, name, rgba, active, onRgbChange, onAlphaChange, onSelectTriangles, onOpenMenu }: { id: number; name: string; rgba: Rgba; active: boolean; onRgbChange(hex: string): void; onAlphaChange(alpha: number): void; onSelectTriangles(deselect: boolean): void; onOpenMenu(x: number, y: number): void }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => { const close = (event: MouseEvent) => { if (!ref.current?.contains(event.target as Node)) setOpen(false); }; window.addEventListener("mousedown", close); return () => window.removeEventListener("mousedown", close); }, []);
@@ -130,7 +143,7 @@ function ShaderChip({ id, name, rgba, active, onRgbChange, onAlphaChange, onSele
   const solidCss = `rgb(${r255} ${g255} ${b255})`;
   const rgbaCss = `rgba(${r255}, ${g255}, ${b255}, ${a})`;
   const alphaTrack = { "--alpha-track": `linear-gradient(to right, transparent, ${solidCss}), ${CHECKERBOARD}` } as React.CSSProperties;
-  return <div className={`shader-legend-chip ${active ? "active" : ""}`} ref={ref}>
+  return <div className={`shader-legend-chip ${active ? "active" : ""}`} ref={ref} onContextMenu={(event) => { event.preventDefault(); onOpenMenu(event.clientX, event.clientY); }}>
     {/* `background`, not backgroundImage: the checkerboard carries its position/size, which only the shorthand accepts. */}
     <button type="button" className="shader-swatch" style={{ background: `linear-gradient(${rgbaCss}, ${rgbaCss}), ${CHECKERBOARD}` }} onClick={(event) => { if (event.shiftKey) onSelectTriangles(event.ctrlKey || event.metaKey); else setOpen((value) => !value); }} title={tr(`Shader ${hex(id, 2)}${name ? ` ${name}` : ""} — click to recolor, Shift-click to select its triangles (Ctrl+Shift to deselect)`)} />
     <span>{hex(id, 2)}</span>
@@ -142,7 +155,7 @@ function ShaderChip({ id, name, rgba, active, onRgbChange, onAlphaChange, onSele
   </div>;
 }
 
-export function MeshEditorViewer({ meshes, visibleNames, document, selection, onSelect, onPieceContextMenu, onRevealPiece, onEditPieceId, onEditGroupShader, onUndo, onRedo, canUndo, canRedo, selectedTriangles, hiddenTriangles, onTriangleCommand, shaderBank, onAssignShader }: {
+export function MeshEditorViewer({ meshes, visibleNames, document, selection, onSelect, onPieceContextMenu, onRevealPiece, onEditPieceId, onEditGroupShader, onUndo, onRedo, canUndo, canRedo, selectedTriangles, hiddenTriangles, onTriangleCommand, shaderBank, onAssignShader, assetsRoot, textureVersion = 0, onExportMaterials }: {
   meshes: MeshGeometry[];
   visibleNames: Set<string>;
   document: PckDocument | null;
@@ -161,6 +174,11 @@ export function MeshEditorViewer({ meshes, visibleNames, document, selection, on
   onTriangleCommand(command: TriangleCommand): void;
   shaderBank: { id: number; name: string }[] | null;
   onAssignShader(shaderId: number): void;
+  /** The game's ASSETS folder for the shown car, where the Game look finds shared textures; null when unknown. */
+  assetsRoot: string | null;
+  /** Bumped when the car's own textures change (Update atlas), so the Game look redraws them. */
+  textureVersion?: number;
+  onExportMaterials(): void;
 }) {
   const hostRef = useRef<HTMLDivElement>(null);
   const marqueeRef = useRef<HTMLDivElement>(null);
@@ -181,9 +199,25 @@ export function MeshEditorViewer({ meshes, visibleNames, document, selection, on
   const selectedRef = useRef(selectedTriangles);
   const hiddenRef = useRef(hiddenTriangles);
   const [projection, setProjection] = useState<Projection>("perspective");
-  const [renderMode, setRenderMode] = useState<RenderMode>("solid");
+  const [viewDirection, setViewDirection] = useState<ViewDirection>("front");
+  // Game look: each shader drawn like the game's (textures, paint, chrome, glass, lights).
+  const [look, setLook] = useState<Look>("game");
+  const [wireOverlay, setWireOverlay] = useState(false);
+  const renderMode: RenderMode = look === "wireframe" ? "wireframe" : wireOverlay ? "solid-wire" : "solid";
   const renderModeRef = useRef(renderMode);
-  const [uvChecker, setUvChecker] = useState(false);
+  const uvChecker = look === "uv";
+  const [materialMenu, setMaterialMenu] = useState<ContextMenuState | null>(null);
+  const [paint, setPaint] = useState(loadGamePaint);
+  const [lights, setLights] = useState<GameLights>(NO_LIGHTS);
+  const [composite, setComposite] = useState<Record<string, number>>({});
+  const gameOptions = useMemo(() => ({ paint, lights, composite }), [paint, lights, composite]);
+  const getRenderer = useCallback(() => runtimeRef.current?.renderer ?? null, []);
+  const game = useGameMaterials({ enabled: look === "game", document, getRenderer, assetsRoot, options: gameOptions, meshes, textureVersion });
+  const carShaders = game.shaders;
+  // Without a shader list there's nothing to draw the Game look from.
+  const shownLook: Look = look === "game" && !carShaders ? "random" : look;
+  /** Material per shader ID while the Game look is on, shared by every piece (see writeShaderGroups). */
+  const gameMaterialsRef = useRef<THREE.Material[] | null>(null);
   // Selection tool on the left button: none (orbit), box or brush.
   const [tool, setTool] = useState<SelectTool>("none");
   const [xray, setXray] = useState(false);
@@ -264,6 +298,7 @@ export function MeshEditorViewer({ meshes, visibleNames, document, selection, on
     const runtime = runtimeRef.current; if (!runtime) return;
     const hidden = flagsOf(hiddenRef.current, parsed);
     const faceMap = writeVisibleIndex(object.geometry, parsed, hidden);
+    writeShaderGroups(object.geometry, parsed, faceMap);
     faceMapsRef.current.set(object, faceMap);
     appliedHiddenRef.current.set(object, hidden);
     const previous = edgesRef.current.get(object);
@@ -300,8 +335,6 @@ export function MeshEditorViewer({ meshes, visibleNames, document, selection, on
     overlay.visible = drawn.length > 0;
   };
 
-  const toggleProjection = useCallback(() => setProjection((current) => current === "perspective" ? "orthographic" : "perspective"), []);
-  const cycleRenderMode = useCallback(() => setRenderMode((current) => current === "solid" ? "wireframe" : current === "wireframe" ? "solid-wire" : "solid"), []);
 
   useEffect(() => {
     const host = hostRef.current;
@@ -686,7 +719,8 @@ export function MeshEditorViewer({ meshes, visibleNames, document, selection, on
       geometry.setIndex(new THREE.BufferAttribute(parsed.indices.slice(), 1));
       geometry.computeBoundingSphere();
       const material = new THREE.MeshStandardMaterial({ vertexColors: !uvChecker, map: uvChecker ? runtime.uvChecker : null, transparent: true, wireframe: renderMode === "wireframe", roughness: 0.7, metalness: 0.05, side: THREE.DoubleSide });
-      const object = new THREE.Mesh(geometry, material);
+      const object = new THREE.Mesh(geometry, gameMaterialsRef.current ?? material);
+      object.userData.baseMaterial = material;
       object.userData.source = parsed.name;
       const position = document ? anchorWorldPosition(document, parsed.anchorIndex ?? 0, "a2") : [0, 0, 0];
       object.position.set(position[0], position[1], position[2]);
@@ -741,7 +775,8 @@ export function MeshEditorViewer({ meshes, visibleNames, document, selection, on
 
   useEffect(() => {
     const wireframeOn = renderMode === "wireframe";
-    for (const object of objectsRef.current.keys()) ((object as THREE.Mesh).material as THREE.MeshStandardMaterial).wireframe = wireframeOn;
+    for (const object of objectsRef.current.keys()) (object.userData.baseMaterial as THREE.MeshStandardMaterial).wireframe = wireframeOn;
+    for (const material of gameMaterialsRef.current ?? []) (material as THREE.MeshStandardMaterial).wireframe = wireframeOn;
     const showEdges = renderMode === "solid-wire";
     for (const edges of edgesRef.current.values()) edges.visible = showEdges;
   }, [renderMode]);
@@ -749,28 +784,62 @@ export function MeshEditorViewer({ meshes, visibleNames, document, selection, on
   useEffect(() => {
     const runtime = runtimeRef.current; if (!runtime) return;
     for (const object of objectsRef.current.keys()) {
-      const material = (object as THREE.Mesh).material as THREE.MeshStandardMaterial;
+      const material = object.userData.baseMaterial as THREE.MeshStandardMaterial;
       material.vertexColors = !uvChecker; material.map = uvChecker ? runtime.uvChecker : null; material.needsUpdate = true;
     }
   }, [uvChecker]);
 
+  // The Game look's per-shader materials replace each piece's own while it's on.
+  useEffect(() => {
+    const materials = game.materials;
+    if (materials && renderModeRef.current === "wireframe") for (const material of materials) (material as THREE.MeshStandardMaterial).wireframe = true;
+    gameMaterialsRef.current = materials;
+    for (const object of objectsRef.current.keys()) (object as THREE.Mesh).material = materials ?? object.userData.baseMaterial;
+  }, [game.materials]);
+  useEffect(() => { saveGamePaint(paint); }, [paint]);
+  /** Triangles per shader in the visible pieces, for the Materials list. */
+  const materialCounts = useMemo(() => {
+    const counts = new Map<number, number>();
+    for (const mesh of visible) for (let at = 0; at + 2 < mesh.indices.length; at += 3) { const id = mesh.vertexShaderIds[mesh.indices[at]]; counts.set(id, (counts.get(id) ?? 0) + 1); }
+    return counts;
+  }, [visible]);
+  const materialRows = useMemo(() => {
+    const rows = new Map<number, string>((shaderBank ?? []).map((entry) => [entry.id, entry.name]));
+    for (const id of materialCounts.keys()) if (!rows.has(id)) rows.set(id, "");
+    return [...rows].map(([id, name]) => ({ id, name, triangles: materialCounts.get(id) ?? 0 })).sort((a, b) => Number(b.triangles > 0) - Number(a.triangles > 0) || a.id - b.id);
+  }, [shaderBank, materialCounts]);
+  const openMaterialMenu = useCallback((id: number, x: number, y: number) => {
+    const triangles = materialCounts.get(id) ?? 0;
+    const name = shaderBank?.[id]?.name;
+    setMaterialMenu({ x, y, heading: `${hex(id, 2)}${name ? ` · ${name}` : ""}`, items: [
+      { label: "Select triangles", disabled: !triangles, title: triangles ? undefined : "No visible part uses this shader", onSelect: () => onTriangleCommand({ kind: "shader", shaderId: id, deselect: false }) },
+      { label: "Remove from selection", disabled: !triangles, title: triangles ? undefined : "No visible part uses this shader", onSelect: () => onTriangleCommand({ kind: "shader", shaderId: id, deselect: true }) },
+    ] });
+  }, [materialCounts, onTriangleCommand, shaderBank]);
+  const closeMaterialMenu = useCallback(() => setMaterialMenu(null), []);
+  const compositeSelectors = useMemo(() => [...new Set((carShaders?.shaders ?? []).map((shader) => shader.selector?.name).filter((name): name is string => Boolean(name && COMPOSITE_CHOICES[name])))], [carShaders]);
+
   return <section className="viewer-pane mesh-editor-3d">
     <header className="viewer-header"><div><p className="eyebrow">{tr("SHADER MAP")}</p><strong>{tr("Triangle picking · shader colors")}</strong></div><div className="viewer-tools"><button disabled={!canUndo} onClick={onUndo} title={tr("Undo")}>{tr("↶ Undo")}</button><button disabled={!canRedo} onClick={onRedo} title={tr("Redo")}>{tr("↷ Redo")}</button></div></header>
-    {/* Two rows so what moves the camera or changes the look is never mixed with what selects. */}
+    {/* One block each for view, selection and look: side by side, and a block that no longer fits moves to the next line whole. */}
     <div className="view-controls mesh-toolbar">
       <div className="mesh-toolbar-row">
         <span className="mesh-toolbar-label">{tr("VIEW")}</span>
-        <button onClick={() => applyView("front")}>{tr("Front")}</button>
-        <button onClick={() => applyView("back")}>{tr("Back")}</button>
-        <button onClick={() => applyView("left")}>{tr("Left")}</button>
-        <button onClick={() => applyView("right")}>{tr("Right")}</button>
-        <button onClick={() => applyView("top")}>{tr("Top")}</button>
-        <button onClick={() => applyView("bottom")}>{tr("Bottom")}</button>
+        <ToolMenu label={tr(VIEW_LABELS[viewDirection])} title={tr("Point the camera along an axis")}>
+          {(Object.keys(VIEW_LABELS) as ViewDirection[]).map((direction) => <ToolMenuItem key={direction} checked={viewDirection === direction} onClick={() => { setViewDirection(direction); applyView(direction); }}>{tr(VIEW_LABELS[direction])}</ToolMenuItem>)}
+        </ToolMenu>
+        <ToolMenu label={projection === "orthographic" ? tr("Ortho") : tr("Persp")} title={tr("Camera projection")}>
+          <ToolMenuItem checked={projection === "perspective"} onClick={() => setProjection("perspective")}>{tr("Perspective")}</ToolMenuItem>
+          <ToolMenuItem checked={projection === "orthographic"} onClick={() => setProjection("orthographic")}>{tr("Orthographic")}</ToolMenuItem>
+        </ToolMenu>
         <i />
-        <button className={projection === "orthographic" ? "active" : ""} onClick={toggleProjection}>{projection === "orthographic" ? tr("Ortho") : tr("Persp")}</button>
-        <i />
-        <button className={renderMode !== "solid" ? "active" : ""} onClick={cycleRenderMode} title={tr("Cycle shading mode")}>{renderMode === "solid" ? tr("Solid") : renderMode === "wireframe" ? tr("Wireframe") : tr("Solid+Wire")}</button>
-        <button className={uvChecker ? "active" : ""} onClick={() => setUvChecker((current) => !current)} title={tr("Show a numbered test texture on the UVs instead of the shader colors")}>{tr("UV Checker")}</button>
+        <ToolMenu label={tr(LOOK_LABELS[shownLook])} title={tr("How the pieces are drawn")}>
+          <ToolMenuItem checked={shownLook === "game"} disabled={!carShaders} title={carShaders ? tr("Draw each shader like the game: its textures, car paint, chrome, glass and lights. View only.") : tr("This car's shader list wasn't found")} onClick={() => setLook("game")}>{tr("Game look")}</ToolMenuItem>
+          <ToolMenuItem checked={shownLook === "random"} title={tr("One arbitrary color per shader, to tell them apart. Unrelated to the real material.")} onClick={() => setLook("random")}>{tr("Random colors")}</ToolMenuItem>
+          <ToolMenuItem checked={shownLook === "uv"} title={tr("Show a numbered test texture on the UVs instead of the shader colors")} onClick={() => setLook("uv")}>{tr("UV Checker")}</ToolMenuItem>
+          <ToolMenuItem checked={shownLook === "wireframe"} onClick={() => setLook("wireframe")}>{tr("Wireframe")}</ToolMenuItem>
+        </ToolMenu>
+        <label className="toolbar-check" title={tr("Draw every triangle edge over the pieces")}><input type="checkbox" checked={wireOverlay} disabled={look === "wireframe"} onChange={(event) => setWireOverlay(event.target.checked)} />{tr("Wireframe overlay")}</label>
         <i />
         <button onClick={fitCamera}>{tr("Frame model")}</button>
       </div>
@@ -780,33 +849,65 @@ export function MeshEditorViewer({ meshes, visibleNames, document, selection, on
         <button className={tool === "brush" ? "active" : ""} onClick={() => setTool((current) => current === "brush" ? "none" : "brush")} title={tr("Brush select (C): left-drag paints the selection, Ctrl-drag removes. Shift+wheel resizes the circle; orbit with the middle button meanwhile; Esc leaves the tool.")}>{tr("Brush")}</button>
         <button className={xray ? "active" : ""} onClick={() => setXray((current) => !current)} title={tr("X-ray: the box and the brush also take the triangles behind others, not only what you see")}>{tr("X-ray")}</button>
         <i />
-        <button onClick={() => onTriangleCommand({ kind: "all" })} title={tr("Select every visible triangle (A)")}>{tr("All")}</button>
-        <button onClick={() => onTriangleCommand({ kind: "clear" })} title={tr("Clear the selection (Alt+A)")}>{tr("None")}</button>
-        <button onClick={() => onTriangleCommand({ kind: "invert" })} title={tr("Invert the selection among the visible triangles (Ctrl+I)")}>{tr("Invert")}</button>
+        <ToolMenu label={tr("Selection")}>
+          <ToolMenuItem hint="A" title={tr("Select every visible triangle (A)")} onClick={() => onTriangleCommand({ kind: "all" })}>{tr("All")}</ToolMenuItem>
+          <ToolMenuItem hint="Alt+A" title={tr("Clear the selection (Alt+A)")} onClick={() => onTriangleCommand({ kind: "clear" })}>{tr("None")}</ToolMenuItem>
+          <ToolMenuItem hint="Ctrl+I" title={tr("Invert the selection among the visible triangles (Ctrl+I)")} onClick={() => onTriangleCommand({ kind: "invert" })}>{tr("Invert")}</ToolMenuItem>
+        </ToolMenu>
+        <ToolMenu label={tr("Linked")}>
+          <ToolMenuItem hint="Ctrl+L" title={tr("Grow the selection to the triangles connected to it by the geometry (Ctrl+L). L selects the connected triangles under the cursor, Shift+L deselects them.")} onClick={() => onTriangleCommand({ kind: "grow", delimitShader })}>{tr("Select linked")}</ToolMenuItem>
+          <ToolMenuItem keepOpen checked={delimitShader} title={tr("Linked stops where the shader changes, so it only takes the connected patch of the same shader. Off: it follows the geometry across every shader.")} onClick={() => setDelimitShader((current) => !current)}>{tr("Stop at shader")}</ToolMenuItem>
+        </ToolMenu>
+        <ToolMenu label={tr("Same shader")}>
+          <ToolMenuItem hint="Shift+G" title={tr("Select every triangle with the same shader as the selection, connected or not (Shift+G)")} onClick={() => onTriangleCommand({ kind: "similar", scope: similarScope })}>{tr("Select same shader")}</ToolMenuItem>
+          <ToolMenuItem keepOpen checked={similarScope === "part"} title={tr("Same shader looks only in the parts that already have something selected")} onClick={() => setSimilarScope("part")}>{tr("This part")}</ToolMenuItem>
+          <ToolMenuItem keepOpen checked={similarScope === "all"} title={tr("Same shader looks in every visible part")} onClick={() => setSimilarScope("all")}>{tr("All parts")}</ToolMenuItem>
+        </ToolMenu>
+        <ToolMenu label={tr("Visibility")}>
+          <ToolMenuItem hint="H" title={tr("Hide the selected triangles (H). View only — the file doesn't change.")} onClick={() => onTriangleCommand({ kind: "hide" })}>{tr("Hide")}</ToolMenuItem>
+          <ToolMenuItem hint="Shift+H" title={tr("Hide everything except the selection (Shift+H)")} onClick={() => onTriangleCommand({ kind: "isolate" })}>{tr("Isolate")}</ToolMenuItem>
+          <ToolMenuItem hint="Alt+H" title={tr("Show every hidden triangle again (Alt+H)")} onClick={() => onTriangleCommand({ kind: "reveal" })}>{tr("Reveal")}</ToolMenuItem>
+        </ToolMenu>
         <i />
-        <button onClick={() => onTriangleCommand({ kind: "grow", delimitShader })} title={tr("Grow the selection to the triangles connected to it by the geometry (Ctrl+L). L selects the connected triangles under the cursor, Shift+L deselects them.")}>{tr("Linked")}</button>
-        <button className={delimitShader ? "active" : ""} onClick={() => setDelimitShader((current) => !current)} title={tr("Linked stops where the shader changes, so it only takes the connected patch of the same shader. Off: it follows the geometry across every shader.")}>{tr("Stop at shader")}</button>
-        <i />
-        <button onClick={() => onTriangleCommand({ kind: "similar", scope: similarScope })} title={tr("Select every triangle with the same shader as the selection, connected or not (Shift+G)")}>{tr("Same shader")}</button>
-        <span className="segmented" role="group">
-          <button className={similarScope === "part" ? "active" : ""} onClick={() => setSimilarScope("part")} title={tr("Same shader looks only in the parts that already have something selected")}>{tr("This part")}</button>
-          <button className={similarScope === "all" ? "active" : ""} onClick={() => setSimilarScope("all")} title={tr("Same shader looks in every visible part")}>{tr("All parts")}</button>
-        </span>
-        <i />
-        <button onClick={() => onTriangleCommand({ kind: "hide" })} title={tr("Hide the selected triangles (H). View only — the file doesn't change.")}>{tr("Hide")}</button>
-        <button onClick={() => onTriangleCommand({ kind: "isolate" })} title={tr("Hide everything except the selection (Shift+H)")}>{tr("Isolate")}</button>
-        <button onClick={() => onTriangleCommand({ kind: "reveal" })} title={tr("Show every hidden triangle again (Alt+H)")}>{tr("Reveal")}</button>
-        <i />
+        <ToolMenu wide label={tr("Materials")} title={tr("Every shader of this car. Click or right-click one to select its triangles.")}>
+          <div className="material-list">
+            {materialRows.map((row) => {
+              const [r, g, b] = getColor(row.id);
+              const open = (event: React.MouseEvent) => { event.preventDefault(); openMaterialMenu(row.id, event.clientX, event.clientY); };
+              return <button key={row.id} type="button" className={`material-row tool-menu-keep${row.triangles ? "" : " unused"}`} onClick={open} onContextMenu={open}>
+                <i style={{ background: `rgb(${Math.round(r * 255)} ${Math.round(g * 255)} ${Math.round(b * 255)})` }} /><span>{hex(row.id, 2)}</span><em>{row.name || tr("(unnamed)")}</em><small>{row.triangles ? row.triangles.toLocaleString() : "—"}</small>
+              </button>;
+            })}
+          </div>
+          <ToolMenuItem disabled={!carShaders} onClick={onExportMaterials}>{tr("Export list (TXT)…")}</ToolMenuItem>
+        </ToolMenu>
         {/* The one control here that changes the file, set apart at the end. */}
         <AssignShaderMenu bank={shaderBank} used={selectedPartShaders} selectedCount={selectedCount} getColor={getColor} onPick={onAssignShader} />
       </div>
+      {shownLook === "game" && <div className="mesh-toolbar-row game-look-tools">
+        <span className="mesh-toolbar-label">{tr("LOOK")}</span>
+        <label className="game-paint" title={tr("Car paint color. The game sets it in the garage; it isn't stored in the PCK.")}>{tr("Paint")}<input type="color" value={paint} onChange={(event) => setPaint(event.target.value)} /></label>
+        <ToolMenu label={tr("Lights")} active={Object.values(lights).some(Boolean)}>
+          {([["head", "Headlights"], ["tail", "Tail"], ["brake", "Brake"], ["reverse", "Reverse"]] as const).map(([key, label]) => <ToolMenuItem key={key} keepOpen checked={lights[key]} onClick={() => setLights((current) => ({ ...current, [key]: !current[key] }))}>{tr(label)}</ToolMenuItem>)}
+        </ToolMenu>
+        {compositeSelectors.map((selector) => {
+          const choice = COMPOSITE_CHOICES[selector];
+          const saved = carShaders?.shaders.find((shader) => shader.selector?.name === selector)?.selector?.value ?? 0;
+          const current = composite[selector] ?? saved;
+          return <ToolMenu key={selector} label={`${tr(choice.label)}: ${tr(choice.options[current] ?? choice.options[0])}`} title={tr("Which of its shaders to show. The game picks it from the garage.")}>
+            {choice.options.map((option, index) => <ToolMenuItem key={option} checked={current === index} onClick={() => setComposite((values) => ({ ...values, [selector]: index }))}>{tr(option)}</ToolMenuItem>)}
+          </ToolMenu>;
+        })}
+        <span className="game-look-note">{game.loading ? tr("Loading textures…") : !assetsRoot ? tr("ASSETS folder not found above this car: only its own textures are shown") : game.missing.length ? tr("Missing shared textures:") + " " + game.missing.join(", ") : ""}</span>
+      </div>}
     </div>
+    {materialMenu && <ContextMenu menu={materialMenu} onClose={closeMaterialMenu} />}
     <div className={`viewer-stage ${tool !== "none" ? "select-tool" : ""}`} ref={hostRef}>
       <div className="selection-marquee" ref={marqueeRef} hidden />
       <div className="selection-brush" ref={brushRef} hidden />
       {!visible.length && <div className="viewer-empty"><span>3D</span><strong>{tr("No visible geometry")}</strong><p>{tr("Show some parts in the pieces list to see them colored by shader here.")}</p></div>}
       <div className="viewer-stats"><span><Tx t="{0} parts" v={[visible.length]} /></span><span><Tx t="{0} tris" v={[visibleTriangleCount.toLocaleString()]} /></span><span><Tx t="{0} shaders" v={[shaderLegend.length]} /></span>{selectedCount > 0 && <span className="stat-selected"><Tx t="{0} selected in {1} parts" v={[selectedCount.toLocaleString(), selectedPieces]} /></span>}{hiddenCount > 0 && <span className="stat-hidden"><Tx t="{0} hidden" v={[hiddenCount.toLocaleString()]} /></span>}</div>
-      <div className="shader-legend">{shaderLegend.map((id) => <ShaderChip key={id} id={id} name={shaderBank?.[id]?.name ?? ""} rgba={getColor(id)} active={selection?.shaderId === id} onRgbChange={(value) => setShaderRgb(id, value)} onAlphaChange={(value) => setShaderAlpha(id, value)} onSelectTriangles={(deselect) => onTriangleCommand({ kind: "shader", shaderId: id, deselect })} />)}</div>
+      <div className="shader-legend">{shaderLegend.map((id) => <ShaderChip key={id} id={id} name={shaderBank?.[id]?.name ?? ""} rgba={getColor(id)} active={selection?.shaderId === id} onRgbChange={(value) => setShaderRgb(id, value)} onAlphaChange={(value) => setShaderAlpha(id, value)} onSelectTriangles={(deselect) => onTriangleCommand({ kind: "shader", shaderId: id, deselect })} onOpenMenu={(x, y) => openMaterialMenu(id, x, y)} />)}</div>
       {selection && (() => {
         const shaderRgba = selection.shaderId !== null ? getColor(selection.shaderId) : null;
         const standaloneRaw = meshes.find((mesh) => mesh.name === selection.meshName)?.meshId;
@@ -830,6 +931,12 @@ export function MeshEditorViewer({ meshes, visibleNames, document, selection, on
               {shaderInfo && <ShaderIdChip shaderId={shaderInfo.displayId} editable={shaderInfo.editable} dirty={shaderInfo.dirty} onCommit={(newId) => onEditGroupShader(selection.group!, newId)} />}
               {selection.triangleIndex !== null && <span><Tx t="Triangle #{0}" v={[selection.triangleIndex]} /></span>}
             </span>
+            {(() => {
+              // The shader's own name from the car's bank (pending edits included), e.g. emissive_reverselight.
+              const shaderId = shaderInfo?.displayId ?? selection.shaderId;
+              const name = shaderId !== null ? shaderBank?.[shaderId]?.name : undefined;
+              return shaderId !== null && <span className="pick-readout-shader">{hex(shaderId, 2)} · {name || tr("(unnamed)")}</span>;
+            })()}
             <span>{lodLine}</span>
           </div>
         </div>;

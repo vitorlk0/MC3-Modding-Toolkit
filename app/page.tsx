@@ -21,7 +21,11 @@ import { parseFirstPpfModel, type PpfGeometry, type PpfKind } from "../src/ppf";
 import { MeshViewer, type CameraHandle, type ShopCameraPoints } from "./mesh-viewer";
 import { DEFAULT_GARAGE_FOV, McGarageDocument, cameraOrbit, decodeLatin1, garageToPck, orbitPosition, parseGarageSharedFov, pckToGarage, shopCameraLabel, type CameraOrbit, type ShopCameraId } from "../src/mcgarage";
 import { MeshEditorWorkspace } from "./mesh-editor-workspace";
+import { assetsRootOf } from "./game-look";
+import { listCarTextures } from "../src/car-textures";
 import { defaultCarpaintShaderId, readCarShaders, shaderListText, type CarShaderSet } from "../src/car-shaders";
+import { buildAllMipImport, prepareImportSource } from "../src/ps2-texture";
+import { decodePng } from "../src/png";
 import { ModToolkitWorkspace } from "./mod-toolkit/toolkit-workspace";
 import { onFileWritten } from "./mod-toolkit/toolkit-io";
 import { PerformanceWorkspace, type PerfWrite } from "./performance-workspace";
@@ -107,7 +111,9 @@ type MeshBlobAction = {
 // A change of the Meshes tab's triangle selection or hidden triangles. View state, not a file edit,
 // but on the same timeline so Ctrl+Z walks back through both in the order they happened.
 type SelectionAction = { kind: "selection"; meshName: string; before: TriangleState; after: TriangleState };
-type MeshEditAction = PieceIdAction | ShaderIdAction | MeshBlobAction | SelectionAction;
+// "Update atlas…": the new texture and palette bytes written over each loaded PCK's atlas, in place.
+type AtlasAction = { kind: "atlas"; meshName: string; writes: { role: VehicleRole; offset: number; before: Uint8Array; after: Uint8Array }[] };
+type MeshEditAction = PieceIdAction | ShaderIdAction | MeshBlobAction | SelectionAction | AtlasAction;
 // Selection steps are cheap and frequent; file edits can hold whole-PCK snapshots, so fewer are kept.
 const MESH_HISTORY_STEPS = 200;
 const MESH_HISTORY_FILE_EDITS = 20;
@@ -687,6 +693,64 @@ export default function App() {
     const limit = Math.min(bank.length, ...sizes);
     return bank.slice(0, limit);
   }, [meshDocument, slots, revision]);
+  /** Bumped whenever an atlas changes, so the Game look decodes the car's own textures again. */
+  const [atlasVersion, setAtlasVersion] = useState(0);
+  /**
+   * "Update atlas…": one PNG into the atlas of every loaded PCK, each in the format it already has
+   * (256 or 128, one mip or the Remix chain of four with one palette), found through the shaders.
+   * Same conversion as the Textures tab; held in memory as one Meshes undo step until Save.
+   */
+  const updateAtlas = useCallback(async () => {
+    const loaded = roles.flatMap((role) => (slots[role] ? [{ role, doc: slots[role]!.document }] : []));
+    if (!loaded.length) return;
+    const selection = await open({ multiple: false, filters: [{ name: "PNG image", extensions: ["png"] }] });
+    if (typeof selection !== "string") return;
+    try {
+      const plans = loaded.map(({ role, doc }) => {
+        const eight = listCarTextures(doc.name, doc.bytes)?.entries.filter((entry) => entry.bpp === 8) ?? [];
+        // The car's own atlas: <car>_trim, else any *_trim, else the largest 8-bit texture.
+        const atlas = eight.find((entry) => entry.name.toLowerCase() === `${vehicleBase.toLowerCase()}_trim`) ?? eight.find((entry) => /_trim$/i.test(entry.name)) ?? eight[0] ?? null;
+        return { role, doc, atlas, others: eight.filter((entry) => entry !== atlas).map((entry) => entry.name || hex(entry.objectOffset)) };
+      });
+      const usable = plans.filter((plan) => plan.atlas);
+      if (!usable.length) { setStatus("No atlas found in the loaded PCKs: their shader lists couldn't be followed."); return; }
+      const describe = (plan: typeof plans[number]) => `${roleLabels[plan.role]}: ${plan.atlas!.name || hex(plan.atlas!.objectOffset)} (${plan.atlas!.width}×${plan.atlas!.height}${plan.atlas!.mips.length > 1 ? ` + ${plan.atlas!.mips.length - 1} mips` : ""})`;
+      if (plans.some((plan) => plan.others.length) && !await confirmDialog(`These PCKs have more than one 8-bit texture. The atlas will be updated as:\n\n${usable.map(describe).join("\n")}\n\nLeft as they are: ${plans.flatMap((plan) => plan.others).join(", ")}. Continue?`, { title: "Update atlas", kind: "warning" })) return;
+      const image = prepareImportSource(await decodePng(await readFile(selection)));
+      const writes: AtlasAction["writes"] = [];
+      for (const plan of usable) {
+        const atlas = plan.atlas!;
+        const built = buildAllMipImport(image, atlas.mips, "RGBA");
+        const changes: [number, Uint8Array][] = [...atlas.mips.map(([size, relative]) => [atlas.textureOffset + relative, built.indices.get(size)!] as [number, Uint8Array]), [atlas.paletteOffset, built.palette]];
+        for (const [offset, bytes] of changes) {
+          const before = plan.doc.writeFieldBytes(offset, bytes);
+          if (!before.every((value, i) => value === bytes[i])) writes.push({ role: plan.role, offset, before, after: bytes });
+        }
+      }
+      if (!writes.length) { setStatus("The atlas already holds this image: nothing changed."); return; }
+      pushMeshHistory({ kind: "atlas", meshName: `Atlas from ${basename(selection)}`, writes });
+      setAtlasVersion((value) => value + 1);
+      refresh();
+      const skipped = plans.filter((plan) => !plan.atlas).map((plan) => roleLabels[plan.role]);
+      setStatus(`Atlas updated from ${basename(selection)} · ${usable.map(describe).join(" · ")}${skipped.length ? ` · no atlas in ${skipped.join(", ")}` : ""} · not saved yet`);
+    } catch (error) { setStatus(error instanceof Error ? `Atlas update failed · ${error.message}` : "Atlas update failed."); }
+  }, [pushMeshHistory, refresh, slots, vehicleBase]);
+  /** The viewed PCK's shader list as a text file, written where the user picks. */
+  const exportMaterials = useCallback(async () => {
+    if (!meshDocument || !meshRole) return;
+    const set = readCarShaders(meshDocument);
+    if (!set) { setStatus("This car's shader list wasn't found."); return; }
+    try {
+      const path = await saveDialog({ defaultPath: await join(dirname(slots[meshRole]!.path), `${meshDocument.name.replace(/\.[^.]+$/, "")}_materials.txt`), filters: [{ name: "Text", extensions: ["txt"] }] });
+      if (!path) return;
+      await writeFile(path, new TextEncoder().encode(shaderListText(meshDocument.name, set)));
+      setStatus(`Exported ${basename(path)} · ${set.shaders.length} shaders`);
+    } catch (error) { setStatus(error instanceof Error ? `Export failed · ${error.message}` : "Export failed."); }
+  }, [meshDocument, meshRole, slots]);
+  /** Where the Anchor Editor's Game look finds them, for the working PCK. */
+  const anchorAssetsRoot = useMemo(() => assetsRootOf(workingRole ? slots[workingRole]?.path : null), [workingRole, slots]);
+  /** Where the Meshes Game look finds the shared textures the viewed car names. */
+  const meshAssetsRoot = useMemo(() => assetsRootOf(meshRole ? slots[meshRole]?.path : null), [meshRole, slots]);
   const updateEmbeddedMesh = useCallback((meshName: string) => {
     updateEmbeddedMeshes([meshName], meshName.replace(/\.mesh\.pck$/i, ""));
   }, [updateEmbeddedMeshes]);
@@ -891,6 +955,13 @@ export default function App() {
     if (entry.kind === "selection") {
       if (!selectionApplierRef.current) throw new Error("the Meshes tab isn't open");
       selectionApplierRef.current(entry[direction]);
+      return;
+    }
+    if (entry.kind === "atlas") {
+      const documents = entry.writes.map((write) => documentFor(write.role));
+      const order = direction === "before" ? [...entry.writes.keys()].reverse() : [...entry.writes.keys()];
+      for (const i of order) documents[i].writeFieldBytes(entry.writes[i].offset, entry.writes[i][direction]);
+      setAtlasVersion((value) => value + 1);
       return;
     }
     if (entry.kind === "meshBlob") {
@@ -1710,7 +1781,7 @@ export default function App() {
   return <div className="app-shell">
     <header className="titlebar"><div className="brand-mark">{tr("MC3")}</div><div className="brand-copy"><strong>{tr("MC3 Modding Toolkit")}</strong><span>{tr("Midnight Club 3 desktop workspace")}</span></div><nav className="workspace-tabs">{workspaceTabs.map((tab) => <button key={tab.id} className={workspace === tab.id ? "active" : ""} onClick={() => setWorkspace(tab.id)}>{tr(tab.label)}</button>)}</nav><div className="document-title">{workspace === "anchor" ? (document && workingRole ? <><Tx t="{0}{1} · Editing {2}{3}" v={[<span className={document.dirty ? "dirty-dot" : "clean-dot"} />, vehicleBase, roleLabels[workingRole], document.dirty && tr(" — Modified")]} /></> : tr("No vehicle set open")) : workspace === "mesh" ? tr("Meshes") : workspace === "performance" ? tr("Performance") : workspace === "audio" ? tr("Audio") : workspace === "textures" ? tr("Textures") : workspace === "iso" ? tr("ISO Install") : tr("Tools")}</div>{workspace !== "toolkit" && workspace !== "textures" && workspace !== "iso" && document && <div className={`local-badge ${anySlotDirty ? "unsaved" : ""}`} title={anySlotDirty ? tr("Edits are held in memory — nothing on disk has changed yet") : tr("Everything is written to disk")}><span /> {anySlotDirty ? (pendingCount > 0 ? tr(`${pendingCount} pending change${pendingCount === 1 ? "" : "s"}`) : tr("Unsaved changes")) : tr("Saved")}</div>}<div className="language-switch" title={tr("Interface language")}>{(["en", "pt"] as const).map((code) => <button key={code} className={language === code ? "active" : ""} onClick={() => setLanguage(code)}>{code.toUpperCase()}</button>)}</div></header>
     <div className="menubar" ref={menuRef}>
-      <div className="menu-wrap"><button className={menu === "file" ? "active" : ""} onClick={() => setMenu(menu === "file" ? null : "file")}>{tr("File")}</button>{menu === "file" && (workspace === "textures" ? <div className="dropdown"><MenuItem shortcut="Ctrl+O" onClick={() => textureAction("open")}>{tr("Open PCK…")}</MenuItem><div className="separator" /><MenuItem shortcut="Ctrl+S" disabled={!textureMenu.current?.dirty} onClick={() => textureAction("save")}>{tr("Save")}</MenuItem><MenuItem shortcut="Ctrl+Shift+S" disabled={!textureMenu.current?.hasFile} onClick={() => textureAction("saveAs")}>{tr("Save as…")}</MenuItem><div className="separator" /><MenuItem disabled={!textureMenu.current?.hasFile} onClick={() => textureAction("close")}>{tr("Close PCK")}</MenuItem></div> : <div className="dropdown"><MenuItem onClick={() => void openFolder()}>{tr("Open vehicle folder…")}</MenuItem><MenuItem shortcut="Ctrl+O" onClick={() => void openFiles()}>{tr("Open PCK file(s)…")}</MenuItem><MenuItem disabled={!document} onClick={() => void reload()}>{tr("Reload vehicle set")}</MenuItem><div className="separator" /><MenuItem shortcut="Ctrl+S" disabled={!document} onClick={() => void save(false)}>{tr("Save vehicle set")}</MenuItem><MenuItem shortcut="Ctrl+Shift+S" disabled={!document} onClick={() => void save(true)}>{tr("Save vehicle set as…")}</MenuItem><div className="separator" /><MenuItem disabled={!document} onClick={() => void closeVehicle()}>{tr("Close vehicle set")}</MenuItem></div>)}</div>
+      <div className="menu-wrap"><button className={menu === "file" ? "active" : ""} onClick={() => setMenu(menu === "file" ? null : "file")}>{tr("File")}</button>{menu === "file" && (workspace === "textures" ? <div className="dropdown"><MenuItem shortcut="Ctrl+O" onClick={() => textureAction("open")}>{tr("Open PCK…")}</MenuItem><div className="separator" /><MenuItem shortcut="Ctrl+S" disabled={!textureMenu.current?.dirty} onClick={() => textureAction("save")}>{tr("Save")}</MenuItem><MenuItem shortcut="Ctrl+Shift+S" disabled={!textureMenu.current?.hasFile} onClick={() => textureAction("saveAs")}>{tr("Save as…")}</MenuItem><div className="separator" /><MenuItem disabled={!textureMenu.current?.hasFile} onClick={() => textureAction("close")}>{tr("Close PCK")}</MenuItem></div> : <div className="dropdown"><MenuItem onClick={() => void openFolder()}>{tr("Open vehicle folder…")}</MenuItem><MenuItem shortcut="Ctrl+O" onClick={() => void openFiles()}>{tr("Open PCK file(s)…")}</MenuItem><MenuItem disabled={!document} onClick={() => void reload()}>{tr("Reload vehicle set")}</MenuItem><div className="submenu-wrap"><button className="menu-item" disabled={!recentVehicleFolders.length}><span>{tr("Recent folders")}</span><kbd>▸</kbd></button>{recentVehicleFolders.length > 0 && <div className="dropdown submenu">{recentVehicleFolders.map((path) => <button key={path} className="menu-item" title={path} onClick={() => { setMenu(null); void openVehicleFolderAtPath(path); }}><span>{basename(path)}</span></button>)}<div className="separator" /><MenuItem onClick={() => { setMenu(null); clearVehicleRecents(); }}>{tr("Clear list")}</MenuItem></div>}</div><div className="separator" /><MenuItem shortcut="Ctrl+S" disabled={!document} onClick={() => void save(false)}>{tr("Save vehicle set")}</MenuItem><MenuItem shortcut="Ctrl+Shift+S" disabled={!document} onClick={() => void save(true)}>{tr("Save vehicle set as…")}</MenuItem><div className="separator" /><MenuItem disabled={!document} onClick={() => void closeVehicle()}>{tr("Close vehicle set")}</MenuItem></div>)}</div>
       {cameraMode
         ? <div className="menu-wrap"><button className={menu === "edit" ? "active" : ""} onClick={() => setMenu(menu === "edit" ? null : "edit")}>{tr("Edit")}</button>{menu === "edit" && <div className="dropdown"><MenuItem shortcut="Ctrl+Z" disabled={!garage?.document.undoStack.length} onClick={() => { setMenu(null); cameraUndo(); }}>{tr("Undo")}</MenuItem><MenuItem shortcut="Ctrl+Y" disabled={!garage?.document.redoStack.length} onClick={() => { setMenu(null); cameraRedo(); }}>{tr("Redo")}</MenuItem><div className="separator" /><MenuItem disabled={!garage} onClick={() => { setMenu(null); resetCamera(); }}>{tr("Reset this camera to saved")}</MenuItem><MenuItem onClick={() => { setMenu(null); void openGarageFile(); }}>{tr("Open .mcgarage…")}</MenuItem></div>}</div>
         : workspace === "anchor"
@@ -1812,9 +1883,9 @@ export default function App() {
         </div>
       </section>}
       <ResizeHandle variant="resize-editor" onDrag={resizeEditor} />
-      <MeshViewer document={document} selected={selected} multiSelected={selectedIndices} meshes={anchorMeshes} visibleAnchors={visibleMeshAnchors} referenceGeometry={referenceGeometry} rimSizeInches={rimSizeInches} revision={revision} onMoveSelection={moveSelection} onRotateSelection={rotateSelection} canRotate={document.rotationEditable && !positionLocked} cameraEdit={cameraMode && garage && cameraPoints ? { camera: garageToPck(cameraPoints.camera), target: garageToPck(cameraPoints.target), handle: cameraHandle, lookThrough, targetPlane, safeAreas, fov: garage.fov, aspect: cameraAspects[cameraAspect], onSelectHandle: setCameraHandle, onToggleLookThrough: () => setLookThrough((value) => !value), onMove: moveShopCamera } : null} />
+      <MeshViewer document={document} assetsRoot={anchorAssetsRoot} textureVersion={atlasVersion} selected={selected} multiSelected={selectedIndices} meshes={anchorMeshes} visibleAnchors={visibleMeshAnchors} referenceGeometry={referenceGeometry} rimSizeInches={rimSizeInches} revision={revision} onMoveSelection={moveSelection} onRotateSelection={rotateSelection} canRotate={document.rotationEditable && !positionLocked} cameraEdit={cameraMode && garage && cameraPoints ? { camera: garageToPck(cameraPoints.camera), target: garageToPck(cameraPoints.target), handle: cameraHandle, lookThrough, targetPlane, safeAreas, fov: garage.fov, aspect: cameraAspects[cameraAspect], onSelectHandle: setCameraHandle, onToggleLookThrough: () => setLookThrough((value) => !value), onMove: moveShopCamera } : null} />
     </main>)}
-    {workspace === "mesh" && <div className="mesh-editor-shell"><MeshEditorWorkspace document={meshDocument} activeRole={meshRole} slots={slots} onSelectRole={setMeshViewRole} meshes={meshEditorMeshes} onEditPieceId={editPieceId} onEditGroupShader={editGroupShader} onAssignShader={assignShader} shaderBank={shaderBank} onRecordSelection={recordSelection} onRegisterSelectionApplier={registerSelectionApplier} onUpdateEmbedded={updateEmbeddedMesh} onRemoveEmbedded={removeEmbeddedPiece} onUpdateAllEmbedded={updateAllEmbeddedMeshes} onConvertObjs={() => void chooseObjFolder()} zeroShellId={zeroShellId} onSetZeroShellId={setZeroShellId} compactStreams={compactStreams} onSetCompactStreams={setCompactStreams} onExportObj={(mesh) => void exportPieceObj(mesh)} embeddedUnreadable={embeddedOnly.unreadable} embeddedEmpty={embeddedOnly.empty} objFolder={objFolder} describeEmbedTarget={describeEmbedTarget} describePieceSize={describePieceSize} onUndo={meshUndo} onRedo={meshRedo} canUndo={pieceIdUndoRef.current.length > 0} canRedo={pieceIdRedoRef.current.length > 0} vehicleBase={vehicleBase} loadedCount={loadedCount} onOpenFolder={() => void openFolder()} recentVehicleFolders={recentVehicleFolders} onOpenRecentFolder={(path) => void openVehicleFolderAtPath(path)} onClearRecentFolders={clearVehicleRecents} listWidth={panelWidths.meshList} onResizeList={resizeMeshList} /></div>}
+    {workspace === "mesh" && <div className="mesh-editor-shell"><MeshEditorWorkspace document={meshDocument} activeRole={meshRole} slots={slots} onSelectRole={setMeshViewRole} meshes={meshEditorMeshes} onEditPieceId={editPieceId} onEditGroupShader={editGroupShader} onAssignShader={assignShader} shaderBank={shaderBank} assetsRoot={meshAssetsRoot} textureVersion={atlasVersion} onUpdateAtlas={() => void updateAtlas()} onExportMaterials={() => void exportMaterials()} onRecordSelection={recordSelection} onRegisterSelectionApplier={registerSelectionApplier} onUpdateEmbedded={updateEmbeddedMesh} onRemoveEmbedded={removeEmbeddedPiece} onUpdateAllEmbedded={updateAllEmbeddedMeshes} onConvertObjs={() => void chooseObjFolder()} zeroShellId={zeroShellId} onSetZeroShellId={setZeroShellId} compactStreams={compactStreams} onSetCompactStreams={setCompactStreams} onExportObj={(mesh) => void exportPieceObj(mesh)} embeddedUnreadable={embeddedOnly.unreadable} embeddedEmpty={embeddedOnly.empty} objFolder={objFolder} describeEmbedTarget={describeEmbedTarget} describePieceSize={describePieceSize} onUndo={meshUndo} onRedo={meshRedo} canUndo={pieceIdUndoRef.current.length > 0} canRedo={pieceIdRedoRef.current.length > 0} vehicleBase={vehicleBase} loadedCount={loadedCount} onOpenFolder={() => void openFolder()} recentVehicleFolders={recentVehicleFolders} onOpenRecentFolder={(path) => void openVehicleFolderAtPath(path)} onClearRecentFolders={clearVehicleRecents} listWidth={panelWidths.meshList} onResizeList={resizeMeshList} /></div>}
     {workspace === "performance" && <PerformanceWorkspace slots={slots} workingRole={workingRole} vehicleBase={vehicleBase} loadedCount={loadedCount} revision={revision} onApply={applyPerformance} onStatus={setStatus} onOpenFolder={() => void openFolder()} recentVehicleFolders={recentVehicleFolders} onOpenRecentFolder={(path) => void openVehicleFolderAtPath(path)} onClearRecentFolders={clearVehicleRecents} />}
     {workspace === "audio" && <AudioWorkspace slots={slots} workingRole={workingRole} vehicleBase={vehicleBase} loadedCount={loadedCount} revision={revision} onApply={applyAudio} onStatus={setStatus} onOpenFolder={() => void openFolder()} recentVehicleFolders={recentVehicleFolders} onOpenRecentFolder={(path) => void openVehicleFolderAtPath(path)} onClearRecentFolders={clearVehicleRecents} />}
     <div className="workspace-host" style={{ display: workspace === "textures" ? "contents" : "none" }}><TextureWorkspace active={workspace === "textures"} dropped={texturesDrop} onConsumeDrop={() => setTexturesDrop(null)} onStatus={setStatus} isPathBlocked={isVehiclePathBlocked} onPendingChange={setTexturesPending} menuRef={textureMenu} /></div>

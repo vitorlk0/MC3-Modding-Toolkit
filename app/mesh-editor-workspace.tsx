@@ -26,7 +26,7 @@ function defaultVisibleNames(meshes: MeshGeometry[], document: PckDocument | nul
   return new Set(meshes.filter((mesh) => !defaultHiddenReason(mesh, document, rules)).map((mesh) => mesh.name));
 }
 
-export function MeshEditorWorkspace({ document, activeRole, slots, onSelectRole, meshes, onEditPieceId, onEditGroupShader, onAssignShader, shaderBank, onRecordSelection, onRegisterSelectionApplier, onUpdateEmbedded, onRemoveEmbedded, onUpdateAllEmbedded, onConvertObjs, zeroShellId, onSetZeroShellId, compactStreams, onSetCompactStreams, onExportObj, embeddedUnreadable, embeddedEmpty, objFolder, describeEmbedTarget, describePieceSize, onUndo, onRedo, canUndo, canRedo, vehicleBase, loadedCount, onOpenFolder, recentVehicleFolders, onOpenRecentFolder, onClearRecentFolders, listWidth, onResizeList }: {
+export function MeshEditorWorkspace({ document, activeRole, slots, onSelectRole, meshes, onEditPieceId, onEditGroupShader, onAssignShader, shaderBank, assetsRoot, textureVersion, onUpdateAtlas, onExportMaterials, onRecordSelection, onRegisterSelectionApplier, onUpdateEmbedded, onRemoveEmbedded, onUpdateAllEmbedded, onConvertObjs, zeroShellId, onSetZeroShellId, compactStreams, onSetCompactStreams, onExportObj, embeddedUnreadable, embeddedEmpty, objFolder, describeEmbedTarget, describePieceSize, onUndo, onRedo, canUndo, canRedo, vehicleBase, loadedCount, onOpenFolder, recentVehicleFolders, onOpenRecentFolder, onClearRecentFolders, listWidth, onResizeList }: {
   document: PckDocument | null;
   activeRole: VehicleRole | null;
   slots: VehicleSlots;
@@ -38,6 +38,10 @@ export function MeshEditorWorkspace({ document, activeRole, slots, onSelectRole,
   onAssignShader(pieces: { meshName: string; triangles: number[] }[], shaderId: number): void;
   /** The car's shader bank (index = shader ID), limited to what every loaded PCK defines; null when not found. */
   shaderBank: { id: number; name: string }[] | null;
+  assetsRoot: string | null;
+  textureVersion: number;
+  onUpdateAtlas(): void;
+  onExportMaterials(): void;
   /** Puts a selection change on the shared Meshes undo history (`merge`: same brush stroke as the last step). */
   onRecordSelection(before: TriangleState, after: TriangleState, merge: boolean): void;
   /** Hands the page the function that restores a recorded selection (null when the tab closes). */
@@ -197,6 +201,7 @@ export function MeshEditorWorkspace({ document, activeRole, slots, onSelectRole,
           </button>;
         })}</div>
         <button className="folder-button" onClick={onConvertObjs} title={objFolder ? tr(`Convert the OBJs in ${objFolder} into mesh.pck pieces and embed them. Last used folder is remembered; nothing is written until you save.`) : tr("Pick a folder of OBJs to convert into mesh.pck pieces and embed in one pass. Nothing is written until you save.")}>{tr("Convert OBJs…")}</button>
+        <button className="folder-button" disabled={!loadedCount} onClick={onUpdateAtlas} title={tr("Replace the car's atlas with a PNG in Player, Garage and Opponent at once, each in the format it already has (256 or 128, with or without mips). Nothing is written until you save.")}>{tr("Update atlas…")}</button>
         <button className="folder-button" onClick={onUpdateAllEmbedded} title={tr("Bring every loose mesh.pck in line at once: update the ones already baked in, and insert the ones that only have an empty table row waiting. Stays in memory until you save.")}>{tr("Sync all")}</button>
         <label className="sync-option" title={tr("When syncing or converting OBJs, pieces with 'shell' in their name get ID 0 in every loaded PCK and in the embedded copy. Clears an ID a shell borrowed to preview.")}>
           <input type="checkbox" checked={zeroShellId} onChange={(event) => onSetZeroShellId(event.target.checked)} />
@@ -211,7 +216,7 @@ export function MeshEditorWorkspace({ document, activeRole, slots, onSelectRole,
       <div className="mesh-editor-body">
         <MeshPieceList key={vehicleBase} meshes={meshes} document={document} visibleNames={visibleNames} onSetVisible={setVisible} selection={selection} onSelect={setSelection} onEditPieceId={onEditPieceId} onEditGroupShader={onEditGroupShader} onUpdateEmbedded={onUpdateEmbedded} describeEmbedTarget={describeEmbedTarget} describePieceSize={describePieceSize} onPieceContextMenu={openPieceMenu} revealRequest={revealRequest} width={listWidth} describeTriangles={describeTriangles} />
         <ResizeHandle variant="resize-mesh-list" onDrag={onResizeList} />
-        <MeshEditorViewer meshes={meshes} visibleNames={visibleNames} document={document} selection={selection} onSelect={setSelection} onPieceContextMenu={openPieceMenu} onRevealPiece={(meshName) => setRevealRequest({ meshName })} onEditPieceId={editSelectedPieceId} onEditGroupShader={editSelectedGroupShader} onUndo={onUndo} onRedo={onRedo} canUndo={canUndo} canRedo={canRedo} selectedTriangles={triangles.selected} hiddenTriangles={triangles.hidden} onTriangleCommand={runTriangleCommand} shaderBank={shaderBank} onAssignShader={assignSelectionShader} />
+        <MeshEditorViewer meshes={meshes} visibleNames={visibleNames} document={document} selection={selection} onSelect={setSelection} onPieceContextMenu={openPieceMenu} onRevealPiece={(meshName) => setRevealRequest({ meshName })} onEditPieceId={editSelectedPieceId} onEditGroupShader={editSelectedGroupShader} onUndo={onUndo} onRedo={onRedo} canUndo={canUndo} canRedo={canRedo} selectedTriangles={triangles.selected} hiddenTriangles={triangles.hidden} onTriangleCommand={runTriangleCommand} shaderBank={shaderBank} onAssignShader={assignSelectionShader} assetsRoot={assetsRoot} textureVersion={textureVersion} onExportMaterials={onExportMaterials} />
       </div>
       {contextMenu && <ContextMenu menu={contextMenu} onClose={closeContextMenu} />}
     </main>
