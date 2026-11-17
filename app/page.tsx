@@ -9,7 +9,7 @@ import { join } from "@tauri-apps/api/path";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { formatClipboard, hex, parseClipboard, PckDocument, type LodMeshEntry, type MeshBlobSnapshot, type Vec3 } from "../src/pck";
-import { EmptyMeshError, MeshPckDocument, defaultHiddenReason, hasStockVariants, isLowLodOnly, isShadowPlane, isShellFamily, matchLodEntries, parseEmbeddedMesh, resolveGroupShaderId, resolvePieceId, sameMeshGeometry, type MeshGeometry } from "../src/mesh";
+import { EmptyMeshError, MeshPckDocument, defaultHiddenReason, visibilityRules, isLowLodOnly, isShadowPlane, isShellFamily, matchLodEntries, parseEmbeddedMesh, resolveGroupShaderId, resolvePieceId, sameMeshGeometry, type MeshGeometry } from "../src/mesh";
 import { moveTrianglesToShader } from "../src/mesh-slots";
 import type { TriangleState } from "./mesh-selection";
 import { isShellPiece } from "../src/mesh-inject";
@@ -1043,13 +1043,15 @@ export default function App() {
       const meshEntries = entries.filter((entry) => isMeshPck(entry.name));
       const parsedMeshes = await Promise.allSettled(meshEntries.map(async (entry) => new MeshPckDocument(entry.path, entry.name, toArrayBuffer(await readFile(entry.path)), source)));
       const docs = parsedMeshes.filter((result): result is PromiseFulfilledResult<MeshPckDocument> => result.status === "fulfilled").map((result) => result.value);
-      const failures = parsedMeshes.length - docs.length;
+      // An empty mesh.pck is a placeholder some ports ship, reported apart: it isn't a failure.
+      const failures = parsedMeshes.filter((result) => result.status === "rejected" && !(result.reason instanceof EmptyMeshError)).length;
       parsedMeshes.forEach((result, index) => { if (result.status === "rejected") trace.meshFailures.push({ name: meshEntries[index].name, error: result.reason instanceof Error ? result.reason.message : String(result.reason) }); });
       recordVehicleLoad(trace);
       const nextMeshDocs = new Map(docs.map((doc) => [doc.name, doc]));
-      const customizable = hasStockVariants(docs.map((doc) => doc.geometry));
-      const defaultVisible = new Set(docs.filter((doc) => doc.geometry.anchorIndex !== null && !defaultHiddenReason(doc.geometry, source, customizable)).map((doc) => doc.geometry.anchorIndex!));
-      for (const piece of readEmbeddedOnly(source, nextMeshDocs).pieces) if (piece.anchorIndex !== null && !defaultHiddenReason(piece, source, customizable)) defaultVisible.add(piece.anchorIndex);
+      const embeddedPieces = readEmbeddedOnly(source, nextMeshDocs).pieces;
+      const rules = visibilityRules([...docs.map((doc) => doc.geometry), ...embeddedPieces], source);
+      const defaultVisible = new Set(docs.filter((doc) => doc.geometry.anchorIndex !== null && !defaultHiddenReason(doc.geometry, source, rules)).map((doc) => doc.geometry.anchorIndex!));
+      for (const piece of embeddedPieces) if (piece.anchorIndex !== null && !defaultHiddenReason(piece, source, rules)) defaultVisible.add(piece.anchorIndex);
       setMeshDocs(nextMeshDocs); setVisibleMeshAnchors(defaultVisible); setMeshErrors(failures);
       const count = roles.filter((role) => next[role]).length;
       installVehicle(next, nextRole, group.base, `${group.base} loaded · ${count}/3 vehicle PCKs · ${docs.length} mesh files${failures ? ` · ${failures} unsupported` : ""}`);

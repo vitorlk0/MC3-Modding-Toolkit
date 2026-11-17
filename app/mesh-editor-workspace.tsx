@@ -1,7 +1,7 @@
 import { tr, Tx } from "./i18n";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { LodMeshEntry, PckDocument } from "../src/pck";
-import { defaultHiddenReason, hasStockVariants, matchLodEntries, type MeshGeometry, type MeshPckDocument } from "../src/mesh";
+import { defaultHiddenReason, matchLodEntries, visibilityRules, type MeshGeometry, type MeshPckDocument } from "../src/mesh";
 import { registerDiagnosticSource } from "./diagnostics";
 import { roleLabels, roles, sizeLabel, type VehicleRole, type VehicleSlots } from "./vehicle-types";
 import { MeshEditorViewer, type MeshSelection } from "./mesh-editor-viewer";
@@ -22,8 +22,8 @@ const plannedFeatures = [
 // loose "stk" files — so the M/L copies of the same shell don't sit on top of it; the shadow planes
 // (neonglow, Shadow_Neon) are flat sheets under the car and would just cover the grid.
 function defaultVisibleNames(meshes: MeshGeometry[], document: PckDocument | null) {
-  const customizable = hasStockVariants(meshes);
-  return new Set(meshes.filter((mesh) => !defaultHiddenReason(mesh, document, customizable)).map((mesh) => mesh.name));
+  const rules = visibilityRules(meshes, document);
+  return new Set(meshes.filter((mesh) => !defaultHiddenReason(mesh, document, rules)).map((mesh) => mesh.name));
 }
 
 export function MeshEditorWorkspace({ document, activeRole, slots, onSelectRole, meshes, onEditPieceId, onEditGroupShader, onAssignShader, shaderBank, onRecordSelection, onRegisterSelectionApplier, onUpdateEmbedded, onRemoveEmbedded, onUpdateAllEmbedded, onConvertObjs, zeroShellId, onSetZeroShellId, compactStreams, onSetCompactStreams, onExportObj, embeddedUnreadable, embeddedEmpty, objFolder, describeEmbedTarget, describePieceSize, onUndo, onRedo, canUndo, canRedo, vehicleBase, loadedCount, onOpenFolder, recentVehicleFolders, onOpenRecentFolder, onClearRecentFolders, listWidth, onResizeList }: {

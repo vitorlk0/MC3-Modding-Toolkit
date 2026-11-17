@@ -261,13 +261,81 @@ export const hasStockVariants = (meshes: MeshGeometry[]) => meshes.some((mesh) =
  *  viewer they are a big plane under the car rather than part of it. */
 export const isShadowPlane = (name: string) => /neonglow|shadow/i.test(name);
 
+/**
+ * The game's own customization lists: skeleton node IDs per category, in menu order, kept in
+ * rmcCarModelType (file 0x88) as u32[capacity] arrays with their counts further on. A selection of 0
+ * is the first entry. Blowers and wheelie bars are extras a stock car goes without.
+ */
+const PART_LISTS: { name: string; ids: number; capacity: number; count: number; extra?: boolean }[] = [
+  { name: "front bumper", ids: 0x2afc, capacity: 24, count: 0x3174 }, { name: "rear bumper", ids: 0x2b5c, capacity: 24, count: 0x3178 },
+  { name: "side skirt", ids: 0x2bbc, capacity: 24, count: 0x317c }, { name: "spoiler", ids: 0x2c1c, capacity: 24, count: 0x3180 },
+  { name: "hood", ids: 0x2c7c, capacity: 24, count: 0x3184 }, { name: "blower", ids: 0x2cdc, capacity: 24, count: 0x3188, extra: true },
+  { name: "headlights", ids: 0x2dd4, capacity: 24, count: 0x318c }, { name: "taillights", ids: 0x2e34, capacity: 24, count: 0x3190 },
+  { name: "exhaust", ids: 0x2f54, capacity: 24, count: 0x3198 }, { name: "body", ids: 0x2fb4, capacity: 8, count: 0x31a0 },
+  { name: "brush guard", ids: 0x2fd4, capacity: 24, count: 0x31a4 }, { name: "grille", ids: 0x3034, capacity: 24, count: 0x31a8 },
+  { name: "one-shot kit", ids: 0x3094, capacity: 24, count: 0x31ac }, { name: "wheelie bar", ids: 0x30f4, capacity: 24, count: 0x31b0, extra: true },
+];
+
+/** Anchor -> its place in the customization lists; null when the PCK holds no such lists (PSP files). */
+function readPartLists(document: PckDocument) {
+  if (document.format !== "pck") return null;
+  const view = document.view; const length = document.bytes.length;
+  const model = 0x80 + ((view.getUint32(0x88, true) - document.rootPointer) >>> 0);
+  if (model + 0x31b4 > length) return null;
+  const places = new Map<number, { list: typeof PART_LISTS[number]; index: number }>();
+  for (const list of PART_LISTS) {
+    const count = view.getUint32(model + list.count, true);
+    if (count > list.capacity) continue;
+    for (let index = 0; index < count; index += 1) {
+      const id = view.getUint32(model + list.ids + index * 4, true);
+      if (id < document.pieces.length && !places.has(id)) places.set(id, { list, index });
+    }
+  }
+  return places.size ? places : null;
+}
+
+export type VisibilityRules = { customizable: boolean; places: ReturnType<typeof readPartLists>; stockIndex: Map<string, number> };
+
+/** A piece's place in the lists: its anchor's, or the nearest ancestor's (a variant's sub-parts). */
+function listPlace(mesh: MeshGeometry, document: PckDocument, places: NonNullable<VisibilityRules["places"]>) {
+  const seen = new Set<number>();
+  for (let anchor = mesh.anchorIndex; anchor !== null && !seen.has(anchor); anchor = document.pieces[anchor]?.parentIndex ?? null) {
+    seen.add(anchor);
+    const place = places.get(anchor);
+    if (place) return place;
+  }
+  return null;
+}
+
+/** What decides the stock car for a set of pieces: every piece of the set, loose and embedded. */
+export function visibilityRules(meshes: MeshGeometry[], document: PckDocument | null): VisibilityRules {
+  const places = document ? readPartLists(document) : null;
+  const stockIndex = new Map<string, number>();
+  // Where a list has a variant named `stk`, that is the stock one (the El Camino's body is second).
+  if (document && places) for (const mesh of meshes) {
+    if (!/(?:^|_)stk(?:_|\.)/i.test(mesh.name)) continue;
+    const place = listPlace(mesh, document, places);
+    if (place && !(stockIndex.get(place.list.name)! <= place.index)) stockIndex.set(place.list.name, place.index);
+  }
+  return { customizable: hasStockVariants(meshes), places, stockIndex };
+}
+
 /** Why a piece starts hidden in the 3D views, or null when it starts shown: the close-up car only,
- *  so no shadow planes, no MLOD/LLOD copies and, on a car with `stk` variants, no non-stock variant.
- *  `customizable` is hasStockVariants() of the set. The diagnostic report prints the reason. */
-export function defaultHiddenReason(mesh: MeshGeometry, document: PckDocument | null, customizable: boolean) {
+ *  so no shadow planes, no MLOD/LLOD copies and no customization variant but the stock one. Variants
+ *  come from the PCK's own lists, since ported cars don't all follow the `stk` naming; on a file with
+ *  no lists it falls back to the name. The diagnostic report prints the reason. */
+export function defaultHiddenReason(mesh: MeshGeometry, document: PckDocument | null, rules: VisibilityRules) {
   if (isShadowPlane(mesh.name)) return "shadow plane";
   if (isLowLodOnly(mesh, document)) return "MLOD/LLOD only";
-  if (mesh.origin === "loose" && customizable && !mesh.stock && mesh.category !== "lodgroup") return "customization variant (not stk, not lodgroup) on a car with stk variants";
+  if (document && rules.places) {
+    const place = listPlace(mesh, document, rules.places);
+    if (!place) return null;
+    const stock = rules.stockIndex.get(place.list.name);
+    if (stock !== undefined) return place.index === stock ? null : `${place.list.name} variant ${place.index} (stock is ${stock})`;
+    if (place.list.extra) return `${place.list.name}: an extra, not on the stock car`;
+    return place.index ? `${place.list.name} variant ${place.index} (stock is 0)` : null;
+  }
+  if (mesh.origin === "loose" && rules.customizable && !mesh.stock && mesh.category !== "lodgroup") return "customization variant (not stk, not lodgroup) on a car with stk variants";
   return null;
 }
 

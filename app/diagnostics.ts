@@ -2,7 +2,7 @@ import * as THREE from "three";
 import { getTauriVersion, getVersion } from "@tauri-apps/api/app";
 import { homeDir } from "@tauri-apps/api/path";
 import { hex, type LodMeshEntry, type PckDocument } from "../src/pck";
-import { anchorWorldPosition, defaultHiddenReason, hasStockVariants, isShellFamily, matchLodEntries, type MeshGeometry, type MeshPckDocument } from "../src/mesh";
+import { anchorWorldPosition, defaultHiddenReason, hasStockVariants, isShellFamily, visibilityRules, matchLodEntries, type MeshGeometry, type MeshPckDocument } from "../src/mesh";
 import { getLanguage } from "./i18n";
 import { roleLabels, roles, type VehicleRole, type VehicleSlots } from "./vehicle-types";
 
@@ -288,7 +288,6 @@ async function pieceSections(set: VehicleSetSnapshot, drawn: Map<string, string[
   const working = set.workingRole ? set.slots[set.workingRole]?.document ?? null : null;
   const meshEditor = readSource("meshEditor");
   const loose = [...set.meshDocs.values()];
-  const customizable = hasStockVariants(loose.map((doc) => doc.geometry));
   // Embedded-only pieces, each once: the working PCK's reading first, as the Anchors tab draws it.
   const embedded = new Map<string, { geometry: MeshGeometry; roles: VehicleRole[] }>();
   for (const role of [set.workingRole, ...roles].filter((item): item is VehicleRole => Boolean(item))) {
@@ -302,6 +301,7 @@ async function pieceSections(set: VehicleSetSnapshot, drawn: Map<string, string[
     ...loose.map((doc) => ({ geometry: doc.geometry, doc, embeddedRoles: [] as VehicleRole[] })),
     ...[...embedded.values()].map(({ geometry, roles: embeddedRoles }) => ({ geometry, doc: null, embeddedRoles })),
   ].sort((a, b) => a.geometry.name.localeCompare(b.geometry.name));
+  const rules = visibilityRules(pieces.map((piece) => piece.geometry), working);
   const sections: DiagnosticSection[] = [];
   for (const { geometry, doc, embeddedRoles } of pieces) {
     const rows: [string, string][] = [];
@@ -326,7 +326,7 @@ async function pieceSections(set: VehicleSetSnapshot, drawn: Map<string, string[
     rows.push(["Geometry", `${geometry.triangles} tris · ${geometry.packetVertices} packet vertices · ${geometry.packets.length} packets · ${geometry.materialGroups} groups`]);
     rows.push(["Local bounds", bounds(geometry.positions)]);
     rows.push(["Shaders", geometry.groupShaderIds.map((id) => hex(id, 2)).join(" ") || "none"]);
-    const hidden = defaultHiddenReason(geometry, working, customizable);
+    const hidden = defaultHiddenReason(geometry, working, rules);
     rows.push(["Default view", hidden ? `hidden · ${hidden}` : geometry.anchorIndex === null ? "hidden in Anchors · no anchor" : "shown"]);
     rows.push(["Anchors tab now", geometry.anchorIndex === null ? "not drawn (no anchor)" : set.anchorVisible.has(geometry.anchorIndex) ? "shown" : "hidden"]);
     if (meshEditor) rows.push(["Meshes tab now", meshEditor.visibleNames.has(geometry.name) ? "shown" : "hidden"]);
