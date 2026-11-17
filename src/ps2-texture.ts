@@ -51,6 +51,10 @@ export type Candidate = {
   headerOffset: number | null;
   sequenceIndex: number | null;
   paletteColors: number;
+  /** Set for a texture read through the car's shaders (src/car-textures.ts), not scanned: its real
+   *  [size, offset from mip 0] levels, which also cover the 128x128 _o atlas the scan layouts don't. */
+  mips?: [number, number][];
+  exact?: { name: string; objectOffset: number; usedBy: { shaderId: number; className: string }[] };
 };
 export const hasMips = (candidate: Candidate) => candidate.layout === "remix";
 
@@ -545,4 +549,59 @@ export function buildAllMipImport(source: RgbaImage, levels: [number, number][],
 /** `build_single_mip_import`: one level against the palette already in the file. */
 export function buildSingleMipImport(source: RgbaImage, size: number, palette: Rgba[]) {
   return swizzle8(remapToPalette(resizePs2Alpha(source, size, size), palette), size, size);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Exact reads (no scan): a texture object the car's shaders point to, and loose .tex files
+
+/**
+ * Decodes an rmcTexturePS2 object (0xA0 bytes) at `offset`: TEX0 at +0x10 (PSMT8 or PSMT4), one page
+ * pointer per mip at +0x48 / +0x54 / +0x60 / +0x6C with the pixels 0x90 bytes into the page, the mip
+ * count at +0x86, and the palette `u16 @+0x80 * 16` bytes past the last mip's pixels. That gives the
+ * Texture Finder's two car layouts exactly: one mip = "non-remix" (palette at +0x10000), four mips =
+ * "remix" (palette at +0x15700). Mip 0 only; rows in stored order (row 0 is what the GS samples at
+ * v = 0). Null when the object doesn't hold together.
+ */
+export function readCarTexture(data: Uint8Array, pointerBase: number, offset: number): RgbaImage | null {
+  if (offset < 0x80 || offset + 0xa0 > data.length || data[offset + 4] !== 0) return null;
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  const tex0Low = view.getUint32(offset + 0x10, true), tex0High = view.getUint32(offset + 0x14, true);
+  const psm = (tex0Low >>> 20) & 63;
+  const width = 1 << ((tex0Low >>> 26) & 15), height = 1 << (((tex0Low >>> 30) | (tex0High << 2)) & 15);
+  const bpp = psm === 19 ? 8 : psm === 20 ? 4 : 0;
+  const mips = data[offset + 0x86];
+  if (!bpp || mips < 1 || mips > 4 || width > 1024 || height > 1024) return null;
+  const pixelsOf = (mip: number) => { const page = (view.getUint32(offset + 0x48 + mip * 12, true) - pointerBase) >>> 0; return page >= 0x80 && page + 0x90 < data.length ? page + 0x90 : -1; };
+  const textureOffset = pixelsOf(0), last = pixelsOf(mips - 1);
+  if (textureOffset < 0 || last < 0) return null;
+  const paletteOffset = last + view.getUint16(offset + 0x80, true) * 16;
+  try {
+    return { width, height, data: decodeTexture(data, { textureOffset, paletteOffset, width, height, order: "RGBA", swizzled: true, flipVertical: false, bpp }) };
+  } catch { return null; }
+}
+
+/**
+ * Decodes a loose `.tex` (ASSETS/texture, ASSETS/vehicle/shared_texture/texture): a 14-byte header
+ * (u16 width, u16 height, …, u16 mip count at +6), then a BGRA palette (256 or 16 entries, alpha
+ * already 0..255) and linear indices, mips after. The bit depth is the one whose sizes add up to the
+ * file length. Rows in stored order, like `readCarTexture`: row 0 is what the GS samples at v = 0
+ * (the Lancer's tl3 reverse-light UVs land exactly on tl1elgte_05's white reflector this way).
+ */
+export function decodeTexFile(file: Uint8Array): RgbaImage | null {
+  if (file.length < 14 + 64) return null;
+  const view = new DataView(file.buffer, file.byteOffset, file.byteLength);
+  const width = view.getUint16(0, true), height = view.getUint16(2, true), mips = Math.max(1, view.getUint16(6, true));
+  if (!width || !height || width > 2048 || height > 2048) return null;
+  const sizeFor = (bpp: 4 | 8) => 14 + (bpp === 8 ? 1024 : 64) + Array.from({ length: mips }, (_, mip) => Math.max(1, Math.ceil((width >> mip) * (height >> mip) * bpp / 8))).reduce((a, b) => a + b, 0);
+  const bpp: 4 | 8 = sizeFor(8) === file.length ? 8 : sizeFor(4) === file.length ? 4 : 14 + 1024 + width * height <= file.length ? 8 : 4;
+  const paletteSize = bpp === 8 ? 1024 : 64;
+  const pixels = 14 + paletteSize;
+  if (pixels + textureBytes(width, height, bpp) > file.length) return null;
+  const rgba = new Uint8Array(width * height * 4);
+  for (let i = 0; i < width * height; i += 1) {
+    const index = bpp === 8 ? file[pixels + i] : (file[pixels + (i >> 1)] >> ((i & 1) * 4)) & 15;
+    const at = 14 + index * 4;
+    rgba[i * 4] = file[at + 2]; rgba[i * 4 + 1] = file[at + 1]; rgba[i * 4 + 2] = file[at]; rgba[i * 4 + 3] = file[at + 3];
+  }
+  return { width, height, data: rgba };
 }
