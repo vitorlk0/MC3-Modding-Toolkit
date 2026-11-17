@@ -21,6 +21,7 @@ import { parseFirstPpfModel, type PpfGeometry, type PpfKind } from "../src/ppf";
 import { MeshViewer, type CameraHandle, type ShopCameraPoints } from "./mesh-viewer";
 import { DEFAULT_GARAGE_FOV, McGarageDocument, cameraOrbit, decodeLatin1, garageToPck, orbitPosition, parseGarageSharedFov, pckToGarage, shopCameraLabel, type CameraOrbit, type ShopCameraId } from "../src/mcgarage";
 import { MeshEditorWorkspace } from "./mesh-editor-workspace";
+import { defaultCarpaintShaderId, readCarShaders, shaderListText, type CarShaderSet } from "../src/car-shaders";
 import { ModToolkitWorkspace } from "./mod-toolkit/toolkit-workspace";
 import { onFileWritten } from "./mod-toolkit/toolkit-io";
 import { PerformanceWorkspace, type PerfWrite } from "./performance-workspace";
@@ -726,7 +727,8 @@ export default function App() {
    * The OBJs are expected to come out of Blender production-ready — this only does the format work
    * needed to become a PCK (V flip, stripification into the winding the engine reads, s16
    * quantization), never anything that would change the model itself. The piece ID comes from each
-   * filename's hex prefix and the shader IDs from its material names.
+   * filename's hex prefix and the shader IDs from its material names; a material without one gets
+   * the car's carpaint shader (0x03 when none is found), listed in the conversion dialog.
    *
    * Like every other edit here, nothing reaches disk: converted pieces replace their loose
    * documents in memory and the embedded copies are updated, all pending until Save. Reopening the
@@ -741,6 +743,13 @@ export default function App() {
       const objFiles = entries.filter((entry) => !entry.isDirectory && entry.name.toLowerCase().endsWith(".obj")).map((entry) => entry.name).sort();
       if (!objFiles.length) { setStatus(`No .obj files found in ${basename(folderPath)}.`); return; }
 
+      // A material without a shader ID gets the car's paint: the lowest plain carpaint ID that every
+      // loaded PCK agrees on, else 0x03 (0x00-0x02 are often black or invisible).
+      const shaderSets = roles.flatMap((role) => { const set = slots[role] ? readCarShaders(slots[role]!.document) : null; return set ? [set] : [] as CarShaderSet[]; });
+      const carpaint = defaultCarpaintShaderId(shaderSets);
+      const fallbackShaderId = carpaint?.id ?? 0x03;
+      const fallbackLabel = carpaint ? carpaint.className : "fallback, no carpaint shader found";
+
       setStatus(`Converting ${objFiles.length} OBJ${objFiles.length === 1 ? "" : "s"}…`);
       const nextMeshDocs = new Map(meshDocs);
       const convertedNames: string[] = [];
@@ -752,7 +761,7 @@ export default function App() {
       for (const objName of objFiles) {
         try {
           const text = new TextDecoder().decode(await readFile(await join(folderPath, objName)));
-          const result = convertObjToMeshPck(text, objName, { compactStreams });
+          const result = convertObjToMeshPck(text, objName, { compactStreams, fallbackShaderId });
           converted.push({ objName, result });
           const existing = nextMeshDocs.get(result.name);
           if (existing) {
@@ -789,17 +798,21 @@ export default function App() {
       const reference = references.reduce<{ id: number; meshName: string } | null>((best, item) => (!best || item.id > best.id ? item : best), null);
       const shaderWarnings: string[] = [];
       if (reference) for (const { objName, result } of converted) result.shaderIds.forEach((id, group) => {
-        if (id > reference.id) shaderWarnings.push(`${objName}: "${result.groupNames[group]}" → shader 0x${id.toString(16).toUpperCase().padStart(2, "0")}`);
+        if (id > reference.id && id !== fallbackShaderId) shaderWarnings.push(`${objName}: "${result.groupNames[group]}" → shader 0x${id.toString(16).toUpperCase().padStart(2, "0")}`);
       });
 
       // The embed status below replaces this one, so a failed OBJ (e.g. a piece too far from the
-      // origin for the s16 grid, or a material name without a shader ID) gets a dialog instead of
+      // origin for the s16 grid), or a material that took the default shader, gets a dialog instead of
       // a note that would scroll away.
-      if (failures.length || shaderWarnings.length) {
+      const fallbackHex = `0x${fallbackShaderId.toString(16).toUpperCase().padStart(2, "0")}`;
+      const defaulted = converted.flatMap(({ objName, result }) => result.defaultedMaterials.map((material) => `${objName}: ${material ? `"${material}"` : tr("(no material)")} → ${fallbackHex}`));
+      if (failures.length || shaderWarnings.length || defaulted.length) {
         if (failures.length) console.warn("OBJ conversion failures:", failures);
         if (shaderWarnings.length) console.warn("OBJ shader IDs above the car's own:", shaderWarnings);
+        if (defaulted.length) console.warn("OBJ materials without a shader ID:", defaulted);
         const sections = [
           failures.length ? `Could not convert (these pieces were left unchanged):\n\n${failures.join("\n")}` : null,
+          defaulted.length ? `These materials have no shader ID, so they got shader ${fallbackHex} (${fallbackLabel}):\n\n${defaulted.join("\n")}` : null,
           shaderWarnings.length && reference ? `Converted, but with a shader ID above 0x${reference.id.toString(16).toUpperCase().padStart(2, "0")}, the highest the car's own pieces use (${reference.meshName}). Check that this car has these shaders:\n\n${shaderWarnings.join("\n")}` : null,
         ].filter(Boolean);
         void messageDialog(sections.join("\n\n"), { title: "OBJ conversion", kind: "warning" });

@@ -9,7 +9,8 @@
  * The pipeline is self-describing — nothing has to be supplied alongside the OBJ:
  * - the filename's hex prefix (`5D - name.mesh.obj`) becomes the piece ID at `0x86`;
  * - each material name's leading two hex characters (`05 - Carpaint`) become that group's shader ID,
- *   and a name without an explicit ID fails the conversion (see parseShaderIdFromMaterial);
+ *   and a name without an explicit ID (or faces before the first `usemtl`) gets `fallbackShaderId`,
+ *   or fails the conversion when none is given (see parseShaderIdFromMaterial);
  * - `usemtl` groups become the mesh's material groups, in first-seen order.
  */
 
@@ -47,6 +48,9 @@ export type ObjConvertOptions = {
   /** Writes the damage stream as the game's masked constant (no payload) and UVs as V2-8 deltas
    *  where that is smaller (modding KB §10.5.2). Off: the precedent tool's layout, byte for byte. */
   compactStreams: boolean;
+  /** Shader ID for a material without an explicit ID and for faces before the first `usemtl`.
+   *  Null: those are refused, as before. */
+  fallbackShaderId: number | null;
 };
 
 export const defaultObjConvertOptions: ObjConvertOptions = {
@@ -62,6 +66,7 @@ export const defaultObjConvertOptions: ObjConvertOptions = {
   maxEmittedVerticesPerMesh: 0,
   virtualOffset: VIRTUAL_OFFSET,
   compactStreams: false,
+  fallbackShaderId: null,
 };
 
 export type ConvertedMesh = {
@@ -72,6 +77,8 @@ export type ConvertedMesh = {
   shaderIds: number[];
   groupNames: string[];
   triangles: number;
+  /** Materials that got `fallbackShaderId` ("" = the faces before the first `usemtl`). */
+  defaultedMaterials: string[];
 };
 
 type VertexRef = { v: number; vt: number | null; vn: number | null };
@@ -920,13 +927,28 @@ export function convertObjToMeshPck(objText: string, fileName: string, options?:
   const names: string[] = [];
   const shaderIds: number[] = [];
   const streams: MeshStream[] = [];
+  const defaultedMaterials: string[] = [];
   let triangles = 0;
+  const fallback = t.fallbackShaderId;
   for (const [groupName, faces] of obj.groups) {
     // Parsed before the geometry so a bad name fails fast, and from the material name itself: the
     // reference tool parses the `__part001` names of a split group, which turns spellings such as
-    // `0x0A06` or `6` into errors there.
-    if (groupName === NO_MATERIAL) throw new Error(`${faces.length} triangle${faces.length === 1 ? " comes" : "s come"} before the first usemtl, so they have no material and no shader ID. Assign them a material such as "02 - Carpaint" before exporting.`);
-    const shaderId = parseShaderIdFromMaterial(groupName);
+    // `0x0A06` or `6` into errors there. A name without an ID takes the fallback when there is one;
+    // a name that is not an ID is never guessed from (the "ac" in "Black" stays out).
+    let shaderId: number;
+    if (groupName === NO_MATERIAL) {
+      if (fallback === null) throw new Error(`${faces.length} triangle${faces.length === 1 ? " comes" : "s come"} before the first usemtl, so they have no material and no shader ID. Assign them a material such as "02 - Carpaint" before exporting.`);
+      shaderId = fallback;
+      defaultedMaterials.push(groupName);
+    } else {
+      try {
+        shaderId = parseShaderIdFromMaterial(groupName);
+      } catch (error) {
+        if (fallback === null) throw error;
+        shaderId = fallback;
+        defaultedMaterials.push(groupName);
+      }
+    }
     const split = buildAutoSplitStreams(groupName, faces, obj, t);
     names.push(...split.names);
     shaderIds.push(...split.names.map(() => shaderId));
@@ -945,5 +967,5 @@ export function convertObjToMeshPck(objText: string, fileName: string, options?:
   if (materialTable < 0 || materialTable + streams.length * 2 > bytes.byteLength) throw new Error("The generated material table is out of bounds.");
   shaderIds.forEach((id, index) => view.setUint16(materialTable + index * 2, id & 0xffff, true));
 
-  return { name: `${stem}.pck`, bytes, meshId, shaderIds, groupNames: names, triangles };
+  return { name: `${stem}.pck`, bytes, meshId, shaderIds, groupNames: names, triangles, defaultedMaterials };
 }
