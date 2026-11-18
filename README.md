@@ -31,7 +31,7 @@ dropped onto the window. Keep a backup of your files anyway.
 | **Anchors** | Anchor positions and rotations with a 3D preview and move/rotate gizmo, multi-select, mirroring and wheel/exhaust sync, plus the garage shop cameras |
 | **Meshes** | Triangle selection and moving triangles to another shader, piece IDs, shader IDs, OBJ conversion (compact by default), re-embedding loose `mesh.pck` files, removing an embedded copy, and OBJ export |
 | **Performance** | Vehicle physics and performance values across all three PCKs at once |
-| **Textures** | Finds, previews and replaces PS2 textures in a PCK |
+| **Textures** | Reads a car PCK's textures through its shaders (with the pieces and UVs that use each), previews, exports and replaces them; the scored scan stays as a fallback |
 | **Audio** | Engine audio curves and values, with an audible preview from the game's sound banks; RPM ranges rescale to a new top RPM, and curves copy across levels |
 | **ISO Install** | Installs the finished cars straight into the game's ISO, into the slot each was made for or any other; can rename the slot and change its dealership card, icon and special ability |
 
@@ -95,6 +95,12 @@ before the document is marked as saved.
 
 - Colors the model by shader ID and identifies the piece, material group and shader behind any
   triangle you click.
+- **Game look** draws each shader like the game does (the car's own textures, paint, chrome, glass,
+  lights), with a paint color you pick; view only. The Anchors viewer has it too.
+- The pieces shown at first are the stock car, read from the PCK's own customization lists, so
+  ported cars that don't name their parts `stk` open without every variant on top of each other.
+- **Update atlas…** replaces the car's atlas with one PNG in Player, Garage and Opponent at once,
+  each in the format it already has (256 or 128, with or without mips). Not tested in game yet.
 - **Selects triangles** Blender-style: click / Shift-click, linked (L, Ctrl+L, stopping at the
   shader by default), same shader (Shift+G) in this part or all parts, box (B) and brush (C, Shift+wheel
   sizes it), with X-ray, select all / none / invert, and hide / isolate / reveal. Selection steps are
@@ -119,11 +125,12 @@ before the document is marked as saved.
   each group's shader ID from its material name (`05 - Carpaint`; also `06`, `06 00`, `0x0006`,
   `shader_0006`, `slot_000_shader_0006`, `bytes_06_00`). Output is byte for byte that of
   `mc3_obj_to_pck.py`, with one deliberate difference: a material name without an explicit ID is
-  refused instead of guessed. The Python tool reads hex letters out of ordinary words
+  never guessed from. The Python tool reads hex letters out of ordinary words
   (`M_Opaque_PlasticSmoothBlack_Max` → 0xAC from "Black", `Default` → 0xDE, `Material.001` → 0x0E,
-  `Chrome_02` → 0x02) and gives faces before the first `usemtl` shader 0xDE; here those OBJs fail
-  and are listed in a dialog. Every name both accept gets the same ID. The same dialog flags any
-  converted shader ID above the highest one the car's own pieces use.
+  `Chrome_02` → 0x02) and gives faces before the first `usemtl` shader 0xDE; here those materials
+  get the car's carpaint shader (0x03 when none is found) and are listed in a dialog. Every name
+  both accept gets the same ID. The same dialog flags any converted shader ID above the highest one
+  the car's own pieces use.
 
 ## ISO Install
 
