@@ -127,10 +127,12 @@ function sphereToEquirect(sphere: RgbaImage) {
  */
 export class GameTextureSet {
   private readonly cache = new Map<string, THREE.Texture | null>();
-  readonly environment: THREE.Texture;
+  /** Null without a renderer: a set made for exporting has no reflections to light. */
+  readonly environment: THREE.Texture | null;
   /** True when the reflections come from the game's own __envmap__. */
   readonly gameEnvironment: boolean;
-  constructor(private readonly renderer: THREE.WebGLRenderer, private readonly doc: PckDocument, private readonly external: Map<string, RgbaImage | null>) {
+  constructor(private readonly renderer: THREE.WebGLRenderer | null, private readonly doc: PckDocument, private readonly external: Map<string, RgbaImage | null>) {
+    if (!renderer) { this.environment = null; this.gameEnvironment = false; return; }
     const pmrem = new THREE.PMREMGenerator(renderer);
     const sphere = external.get("__envmap__");
     if (sphere) {
@@ -152,7 +154,7 @@ export class GameTextureSet {
     texture.magFilter = THREE.LinearFilter;
     texture.minFilter = THREE.LinearMipmapLinearFilter;
     texture.generateMipmaps = true;
-    texture.anisotropy = this.renderer.capabilities.getMaxAnisotropy();
+    texture.anisotropy = this.renderer?.capabilities.getMaxAnisotropy() ?? 1;
     texture.needsUpdate = true;
     return texture;
   }
@@ -164,7 +166,13 @@ export class GameTextureSet {
   color(texture: CarTexture | null | undefined) {
     if (!texture) return null;
     const key = texture.kind === "internal" ? `i:${texture.offset}` : `e:${texture.name}`;
-    if (!this.cache.has(key)) { const image = this.image(texture); this.cache.set(key, image ? this.make(image) : null); }
+    if (!this.cache.has(key)) {
+      const image = this.image(texture);
+      const made = image ? this.make(image) : null;
+      // The texture's own name (atlas, shared texture) — what an export names its image after.
+      if (made) made.name = texture.name;
+      this.cache.set(key, made);
+    }
     return this.cache.get(key)!;
   }
   /** Only the texture's alpha, over a flat color: masks (masked_chrome) and the drop shadow. */
@@ -177,7 +185,9 @@ export class GameTextureSet {
       else {
         const data = new Uint8Array(image.data.length);
         for (let i = 0; i < data.length; i += 4) { data[i] = rgb[0]; data[i + 1] = rgb[1]; data[i + 2] = rgb[2]; data[i + 3] = image.data[i + 3]; }
-        this.cache.set(key, this.make({ width: image.width, height: image.height, data }));
+        const made = this.make({ width: image.width, height: image.height, data });
+        made.name = `${texture.name}_mask`;
+        this.cache.set(key, made);
       }
     }
     return this.cache.get(key)!;
@@ -201,6 +211,7 @@ export class GameTextureSet {
           data[i + 3] = 255;
         }
         const made = this.make({ width: image.width, height: image.height, data });
+        made.name = `${texture.name}_carbon`;
         made.repeat.set(scale, scale); made.offset.set(0.5, 0.5);
         this.cache.set(key, made);
       }
@@ -214,7 +225,7 @@ export class GameTextureSet {
   dispose() {
     for (const texture of this.cache.values()) texture?.dispose();
     this.cache.clear();
-    this.environment.dispose();
+    this.environment?.dispose();
   }
 }
 

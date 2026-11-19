@@ -21,7 +21,8 @@ import { parseFirstPpfModel, type PpfGeometry, type PpfKind } from "../src/ppf";
 import { MeshViewer, type CameraHandle, type ShopCameraPoints } from "./mesh-viewer";
 import { DEFAULT_GARAGE_FOV, McGarageDocument, cameraOrbit, decodeLatin1, garageToPck, orbitPosition, parseGarageSharedFov, pckToGarage, shopCameraLabel, type CameraOrbit, type ShopCameraId } from "../src/mcgarage";
 import { MeshEditorWorkspace } from "./mesh-editor-workspace";
-import { assetsRootOf } from "./game-look";
+import { assetsRootOf, loadGamePaint } from "./game-look";
+import { buildCarExport, exportCarGlb, exportCarObj } from "./car-export";
 import { listCarTextures } from "../src/car-textures";
 import { defaultCarpaintShaderId, readCarShaders, shaderListText, type CarShaderSet } from "../src/car-shaders";
 import { buildAllMipImport, prepareImportSource } from "../src/ps2-texture";
@@ -1036,6 +1037,38 @@ export default function App() {
       setStatus(`Exported ${basename(path)} · ${result.triangles.toLocaleString()} tris · ${result.groups} material group${result.groups === 1 ? "" : "s"}${uvNote}`);
     } catch (error) { setStatus(error instanceof Error ? `OBJ export failed · ${error.message}` : "OBJ export failed."); }
   }, [meshDocument, objFolder, slots]);
+  // File > Export: the pieces the Anchor Editor draws (high LOD, no shadow planes), placed by their
+  // anchors, pending edits included. Writes only the files the user picks (plus the OBJ's MTL/PNGs).
+  const exportCar = useCallback(async (format: "obj" | "glb") => {
+    setMenu(null);
+    if (!document) return;
+    const pieces = anchorMeshes.filter((mesh) => mesh.indices.length > 0);
+    if (!pieces.length) { setStatus("Nothing to export: this vehicle set has no readable high-LOD pieces."); return; }
+    try {
+      const slot = workingRole ? slots[workingRole] : null;
+      const folder = objFolder || (slot ? dirname(slot.path) : "");
+      const fileName = `${vehicleBase || document.name.replace(/\.pck$/i, "")}.${format}`;
+      const path = await saveDialog({ defaultPath: folder ? await join(folder, fileName) : fileName, filters: [format === "obj" ? { name: "Wavefront OBJ", extensions: ["obj"] } : { name: "glTF binary", extensions: ["glb"] }] });
+      if (!path) return;
+      setStatus(`Exporting ${basename(path)}…`);
+      const car = await buildCarExport({ document, meshes: pieces, assetsRoot: anchorAssetsRoot, paint: loadGamePaint() });
+      let extra = "";
+      try {
+        if (format === "glb") await writeFile(path, await exportCarGlb(car));
+        else {
+          const stem = basename(path).replace(/\.obj$/i, "");
+          const result = await exportCarObj(car, stem);
+          const folderOut = dirname(path);
+          await writeFile(path, new TextEncoder().encode(result.obj));
+          await writeFile(await join(folderOut, result.mtlName), new TextEncoder().encode(result.mtl));
+          for (const image of result.images) await writeFile(await join(folderOut, image.fileName), image.bytes);
+          extra = ` · ${result.mtlName} + ${result.images.length} PNG${result.images.length === 1 ? "" : "s"}`;
+        }
+      } finally { car.dispose(); }
+      const missing = car.missingTextures.length ? ` · shared textures not found: ${car.missingTextures.join(", ")}${anchorAssetsRoot ? "" : " (open the car from its ASSETS folder to include them)"}` : "";
+      setStatus(`Exported ${basename(path)}${extra} · ${car.pieces.length} pieces · ${car.triangles.toLocaleString()} tris · ${car.materials.size} material${car.materials.size === 1 ? "" : "s"}${missing}`);
+    } catch (error) { setStatus(error instanceof Error ? `Car export failed · ${error.message}` : "Car export failed."); }
+  }, [document, anchorMeshes, workingRole, slots, objFolder, vehicleBase, anchorAssetsRoot]);
   const referenceGeometry = useMemo(() => Object.fromEntries(ppfKinds.flatMap((kind) => ppfSlots[kind] ? [[kind, ppfSlots[kind]!.geometry]] : [])) as Partial<Record<PpfKind, PpfGeometry>>, [ppfSlots]);
 
   const installVehicle = useCallback((nextSlots: VehicleSlots, nextRole: VehicleRole, base: string, message: string) => {
@@ -1781,7 +1814,7 @@ export default function App() {
   return <div className="app-shell">
     <header className="titlebar"><div className="brand-mark">{tr("MC3")}</div><div className="brand-copy"><strong>{tr("MC3 Modding Toolkit")}</strong><span>{tr("Midnight Club 3 desktop workspace")}</span></div><nav className="workspace-tabs">{workspaceTabs.map((tab) => <button key={tab.id} className={workspace === tab.id ? "active" : ""} onClick={() => setWorkspace(tab.id)}>{tr(tab.label)}</button>)}</nav><div className="document-title">{workspace === "anchor" ? (document && workingRole ? <><Tx t="{0}{1} · Editing {2}{3}" v={[<span className={document.dirty ? "dirty-dot" : "clean-dot"} />, vehicleBase, roleLabels[workingRole], document.dirty && tr(" — Modified")]} /></> : tr("No vehicle set open")) : workspace === "mesh" ? tr("Meshes") : workspace === "performance" ? tr("Performance") : workspace === "audio" ? tr("Audio") : workspace === "textures" ? tr("Textures") : workspace === "iso" ? tr("ISO Install") : tr("Tools")}</div>{workspace !== "toolkit" && workspace !== "textures" && workspace !== "iso" && document && <div className={`local-badge ${anySlotDirty ? "unsaved" : ""}`} title={anySlotDirty ? tr("Edits are held in memory — nothing on disk has changed yet") : tr("Everything is written to disk")}><span /> {anySlotDirty ? (pendingCount > 0 ? tr(`${pendingCount} pending change${pendingCount === 1 ? "" : "s"}`) : tr("Unsaved changes")) : tr("Saved")}</div>}<div className="language-switch" title={tr("Interface language")}>{(["en", "pt"] as const).map((code) => <button key={code} className={language === code ? "active" : ""} onClick={() => setLanguage(code)}>{code.toUpperCase()}</button>)}</div></header>
     <div className="menubar" ref={menuRef}>
-      <div className="menu-wrap"><button className={menu === "file" ? "active" : ""} onClick={() => setMenu(menu === "file" ? null : "file")}>{tr("File")}</button>{menu === "file" && (workspace === "textures" ? <div className="dropdown"><MenuItem shortcut="Ctrl+O" onClick={() => textureAction("open")}>{tr("Open PCK…")}</MenuItem><div className="separator" /><MenuItem shortcut="Ctrl+S" disabled={!textureMenu.current?.dirty} onClick={() => textureAction("save")}>{tr("Save")}</MenuItem><MenuItem shortcut="Ctrl+Shift+S" disabled={!textureMenu.current?.hasFile} onClick={() => textureAction("saveAs")}>{tr("Save as…")}</MenuItem><div className="separator" /><MenuItem disabled={!textureMenu.current?.hasFile} onClick={() => textureAction("close")}>{tr("Close PCK")}</MenuItem></div> : <div className="dropdown"><MenuItem onClick={() => void openFolder()}>{tr("Open vehicle folder…")}</MenuItem><MenuItem shortcut="Ctrl+O" onClick={() => void openFiles()}>{tr("Open PCK file(s)…")}</MenuItem><MenuItem disabled={!document} onClick={() => void reload()}>{tr("Reload vehicle set")}</MenuItem><div className="submenu-wrap"><button className="menu-item" disabled={!recentVehicleFolders.length}><span>{tr("Recent folders")}</span><kbd>▸</kbd></button>{recentVehicleFolders.length > 0 && <div className="dropdown submenu">{recentVehicleFolders.map((path) => <button key={path} className="menu-item" title={path} onClick={() => { setMenu(null); void openVehicleFolderAtPath(path); }}><span>{basename(path)}</span></button>)}<div className="separator" /><MenuItem onClick={() => { setMenu(null); clearVehicleRecents(); }}>{tr("Clear list")}</MenuItem></div>}</div><div className="separator" /><MenuItem shortcut="Ctrl+S" disabled={!document} onClick={() => void save(false)}>{tr("Save vehicle set")}</MenuItem><MenuItem shortcut="Ctrl+Shift+S" disabled={!document} onClick={() => void save(true)}>{tr("Save vehicle set as…")}</MenuItem><div className="separator" /><MenuItem disabled={!document} onClick={() => void closeVehicle()}>{tr("Close vehicle set")}</MenuItem></div>)}</div>
+      <div className="menu-wrap"><button className={menu === "file" ? "active" : ""} onClick={() => setMenu(menu === "file" ? null : "file")}>{tr("File")}</button>{menu === "file" && (workspace === "textures" ? <div className="dropdown"><MenuItem shortcut="Ctrl+O" onClick={() => textureAction("open")}>{tr("Open PCK…")}</MenuItem><div className="separator" /><MenuItem shortcut="Ctrl+S" disabled={!textureMenu.current?.dirty} onClick={() => textureAction("save")}>{tr("Save")}</MenuItem><MenuItem shortcut="Ctrl+Shift+S" disabled={!textureMenu.current?.hasFile} onClick={() => textureAction("saveAs")}>{tr("Save as…")}</MenuItem><div className="separator" /><MenuItem disabled={!textureMenu.current?.hasFile} onClick={() => textureAction("close")}>{tr("Close PCK")}</MenuItem></div> : <div className="dropdown"><MenuItem onClick={() => void openFolder()}>{tr("Open vehicle folder…")}</MenuItem><MenuItem shortcut="Ctrl+O" onClick={() => void openFiles()}>{tr("Open PCK file(s)…")}</MenuItem><MenuItem disabled={!document} onClick={() => void reload()}>{tr("Reload vehicle set")}</MenuItem><div className="submenu-wrap"><button className="menu-item" disabled={!recentVehicleFolders.length}><span>{tr("Recent folders")}</span><kbd>▸</kbd></button>{recentVehicleFolders.length > 0 && <div className="dropdown submenu">{recentVehicleFolders.map((path) => <button key={path} className="menu-item" title={path} onClick={() => { setMenu(null); void openVehicleFolderAtPath(path); }}><span>{basename(path)}</span></button>)}<div className="separator" /><MenuItem onClick={() => { setMenu(null); clearVehicleRecents(); }}>{tr("Clear list")}</MenuItem></div>}</div><div className="separator" /><MenuItem shortcut="Ctrl+S" disabled={!document} onClick={() => void save(false)}>{tr("Save vehicle set")}</MenuItem><MenuItem shortcut="Ctrl+Shift+S" disabled={!document} onClick={() => void save(true)}>{tr("Save vehicle set as…")}</MenuItem><div className="separator" /><div className="submenu-wrap"><button className="menu-item" disabled={!document}><span>{tr("Export")}</span><kbd>▸</kbd></button>{document && <div className="dropdown submenu"><MenuItem onClick={() => void exportCar("obj")}>OBJ…</MenuItem><MenuItem onClick={() => void exportCar("glb")}>GLB…</MenuItem></div>}</div><div className="separator" /><MenuItem disabled={!document} onClick={() => void closeVehicle()}>{tr("Close vehicle set")}</MenuItem></div>)}</div>
       {cameraMode
         ? <div className="menu-wrap"><button className={menu === "edit" ? "active" : ""} onClick={() => setMenu(menu === "edit" ? null : "edit")}>{tr("Edit")}</button>{menu === "edit" && <div className="dropdown"><MenuItem shortcut="Ctrl+Z" disabled={!garage?.document.undoStack.length} onClick={() => { setMenu(null); cameraUndo(); }}>{tr("Undo")}</MenuItem><MenuItem shortcut="Ctrl+Y" disabled={!garage?.document.redoStack.length} onClick={() => { setMenu(null); cameraRedo(); }}>{tr("Redo")}</MenuItem><div className="separator" /><MenuItem disabled={!garage} onClick={() => { setMenu(null); resetCamera(); }}>{tr("Reset this camera to saved")}</MenuItem><MenuItem onClick={() => { setMenu(null); void openGarageFile(); }}>{tr("Open .mcgarage…")}</MenuItem></div>}</div>
         : workspace === "anchor"
