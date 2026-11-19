@@ -64,6 +64,21 @@ editing, undoing and switching between tabs never touch a file; the only writes 
 application happen inside the save action, and every destination is read back and byte-compared
 before the document is marked as saved.
 
+## Exporting the car
+
+**File ▸ Export ▸ OBJ…** or **GLB…** writes the whole car to one file: every high-LOD piece the
+Anchors view draws (no MLOD/LLOD copies, no ground shadow), pending edits included, each piece its
+own object placed by its anchor. Materials come one per shader ID, named the way **Convert OBJs**
+reads them back (`05 - carpaint`), with the Game look's colors and the car's textures.
+
+- **GLB**: one file with the textures inside. Each object's origin sits on its anchor, rotation
+  included, and carries its piece ID and anchor as custom properties.
+- **OBJ**: an `.mtl` and the textures as PNGs are written next to it. OBJ has no object origins, so
+  every object's origin is the world origin.
+
+Every customization variant is exported, stacked in place (all the bumpers, spoilers, hoods…).
+Wheels are not included: they live in the shared `rim.ppf` / `tire.ppf`.
+
 ## Anchor Editor
 
 ![The Anchors tab: the Toyota Supra in the 3D preview with the move gizmo, and the anchor hierarchy](docs/screenshots/anchors.webp)
