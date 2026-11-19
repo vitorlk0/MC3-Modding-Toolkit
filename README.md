@@ -8,6 +8,8 @@ works on a vehicle as a whole: the Player, Garage (`_g`) and Opponent (`_o`) PCK
 > Midnight Club is their trademark. This repository contains no game files: you need your own copy
 > of the game to use it.
 
+![The Meshes tab showing the Chrysler 300C in the Game look](docs/screenshots/meshes-300c.png)
+
 ## Download
 
 Get the latest build from the **Releases** page. There are two:
@@ -35,6 +37,8 @@ dropped onto the window. Keep a backup of your files anyway.
 | **Audio** | Engine audio curves and values, with an audible preview from the game's sound banks; RPM ranges rescale to a new top RPM, and curves copy across levels |
 | **ISO Install** | Installs the finished cars straight into the game's ISO, into the slot each was made for or any other; can rename the slot and change its dealership card, icon and special ability |
 
+![The Tools tab with the Flash Parts Mapper open](docs/screenshots/tools.png)
+
 ## Reporting a problem
 
 If the tool shows something it shouldn't (a car opening without its shell, say), open the car the
@@ -61,6 +65,8 @@ application happen inside the save action, and every destination is read back an
 before the document is marked as saved.
 
 ## Anchor Editor
+
+![The Anchors tab: the Toyota Supra in the 3D preview with the move gizmo, and the anchor hierarchy](docs/screenshots/anchors.webp)
 
 - Detects PS2 `0x44` and PSP `0x60` anchor layouts, reading the parent/child/next hierarchy.
 - Edits A1 and A2 as little-endian `float32` values, with undo/redo, clipboard actions and
@@ -92,6 +98,8 @@ before the document is marked as saved.
   synchronized 13–30 inch rim-size selector. PPFs are never modified.
 
 ## Mesh Editor
+
+![The Meshes tab: the Nissan 350Z in the Game look, with its pieces by category and the shader legend](docs/screenshots/meshes-350z.webp)
 
 - Colors the model by shader ID and identifies the piece, material group and shader behind any
   triangle you click.
@@ -132,7 +140,46 @@ before the document is marked as saved.
   both accept gets the same ID. The same dialog flags any converted shader ID above the highest one
   the car's own pieces use.
 
+## Performance
+
+![The Performance tab: the Nissan 350Z's VehSim values in Base mode](docs/screenshots/performance.png)
+
+- Edits the car's physics and performance blocks, grouped as in the game's data: chassis (VehSim,
+  burnout, TBC), front and rear wheels, powertrain (engine, transmission, drivetrain, axles),
+  dynamics (aero, fluid, hydraulics), boost (nitro, turbo), handling (VehGyro, AI info) and VehZone,
+  the values the car uses during the Zone ability.
+- **Base** is the stock car and **Mods** the fully upgraded one; VehZone is a single block for both.
+- Every edit goes to the Player, Garage and Opponent PCKs at once.
+- **Import from PCK…** copies another car's Base, Mods and VehZone, previewed before anything changes.
+
+## Textures
+
+![The Textures tab: a car's texture atlas with the UVs of the pieces that use it](docs/screenshots/textures.webp)
+
+- Opens a car PCK on its own and lists the textures its shaders draw with (the car's atlas, the
+  window texture), with the shaders and pieces that use each; click a piece to see its UVs.
+- Shows every mip level, exports any of them as PNG, and replaces them from a PNG: one level keeping
+  the shared palette, or all levels rebuilt from the 256 master. Nothing is written until you save.
+- Shared textures (lamps, grills, carbon, reflections) live outside the car PCK and aren't listed;
+  a manual scan stays available for PCKs the shaders don't cover.
+
+## Audio
+
+![The Audio tab: engine volume, pitch and gear-change curves of the Nissan 350Z](docs/screenshots/audio.png)
+
+- Edits the engine, exhaust and turbo blower levels and the auxiliary sounds (backfire, big air,
+  fire…): bank names, RPM limits and the volume, pitch, upshift and downshift curves, by dragging
+  points and handles.
+- Plays the samples from the game's own sound banks, so a change can be heard before saving.
+- Rescales every RPM range to a new top RPM, and copies curves to another level or to every engine
+  or exhaust level at once.
+- Renaming a bank also renames the prefix of its samples, so the two never point at different banks.
+- **Import from PCK…** brings in another car's audio. Player and Garage stay in sync; the Opponent
+  can be edited on its own.
+
 ## ISO Install
+
+![The ISO Install tab: a car mod added to the ISO, with its slot and the install plan](docs/screenshots/iso-install.png)
 
 - Each car goes into the slot it was made for, or into another slot you pick. A car the ISO doesn't
   have (a VIP or DLC car) has to be given one. Moving a car converts its package the way
